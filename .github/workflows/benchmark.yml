@@ -1,23 +1,19 @@
 # Benchmark run: bring a Lambda GPU server up, serve the model, run the harness, tear down.
-# The teardown step runs ALWAYS — a red run must never leave a $54/hr node alive.
+# Teardown discovers the instance BY NAME TAG (ci-<model>-<run_id>), not only by step output,
+# so a launch that dies mid-wait still gets cleaned up. (Per codex architecture review.)
 #
-# Repo secrets needed: LAMBDA_API_KEY, LAMBDA_SSH_PRIVATE_KEY
-# Repo variables:      LAMBDA_SSH_KEY (key name in Lambda), LAMBDA_FS (persistent filesystem name)
+# Repo secrets: LAMBDA_API_KEY, LAMBDA_SSH_PRIVATE_KEY
+# Repo variables: LAMBDA_SSH_KEY (key name in Lambda), LAMBDA_FS (persistent filesystem), VLLM_VERSION (pinned)
 name: benchmark-run
 
 on:
   workflow_dispatch:
     inputs:
       model:
-        description: "model name (must exist in models.d/)"
+        description: "model name (must exist in models.d/; instance type derives from its INSTANCE_TYPE)"
         required: true
         type: choice
-        options: [qwen3-coder-next, minimax-m3, deepseek-v4-flash, glm-5.3, kimi-k3, qwen3.8-max]
-      instance_type:
-        description: "Lambda instance type"
-        required: true
-        type: choice
-        options: [gpu_1x_h100_pcie, gpu_8x_h100_sxm5, gpu_8x_b200_sxm6]
+        options: [qwen3-coder-next, minimax-m3, deepseek-v4-flash, glm-5.3, kimi-k3]
       suite:
         description: "benchmark suite"
         required: true
@@ -37,6 +33,7 @@ jobs:
       LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
       LAMBDA_SSH_KEY: ${{ vars.LAMBDA_SSH_KEY }}
       LAMBDA_FS: ${{ vars.LAMBDA_FS }}
+      VLLM_VERSION: ${{ vars.VLLM_VERSION }}
       INSTANCE_NAME: ci-${{ inputs.model }}-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
@@ -47,37 +44,57 @@ jobs:
           echo "${{ secrets.LAMBDA_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
+      - name: Derive instance type from model profile
+        id: profile
+        run: |
+          source "models.d/${{ inputs.model }}.env"
+          [[ -n "${INSTANCE_TYPE:-}" ]] || { echo "models.d/${{ inputs.model }}.env has no INSTANCE_TYPE"; exit 1; }
+          [[ "${MULTINODE:-0}" == "1" ]] && { echo "multi-node models are not CI-supported yet"; exit 1; }
+          echo "instance_type=$INSTANCE_TYPE" >> "$GITHUB_OUTPUT"
+
       - name: Bring GPU server up
         id: up
         run: |
-          read -r ID IP < <(./lambdactl up "${{ inputs.instance_type }}" | tail -n1)
+          echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
+          # lambdactl prints the id immediately after the launch API accepts; even if the
+          # readiness wait fails after that, teardown finds the instance by INSTANCE_NAME.
+          read -r ID IP < <(./lambdactl up "${{ steps.profile.outputs.instance_type }}" | tail -n1)
           echo "id=$ID" >> "$GITHUB_OUTPUT"
           echo "ip=$IP" >> "$GITHUB_OUTPUT"
-          echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Provision + serve model
         run: |
           IP=${{ steps.up.outputs.ip }}
           scp -o StrictHostKeyChecking=accept-new -r modelctl models.d "ubuntu@$IP:~/"
-          ssh "ubuntu@$IP" 'pip install -q vllm hf_transfer'
-          # weights persist on the attached filesystem across runs
+          ssh "ubuntu@$IP" "pip install -q 'vllm==${VLLM_VERSION}' hf_transfer"
           ssh "ubuntu@$IP" "WEIGHTS_DIR=/home/ubuntu/$LAMBDA_FS/models ./modelctl serve ${{ inputs.model }}"
 
       - name: Run harness
         run: |
           IP=${{ steps.up.outputs.ip }}
-          # harness lives in this repo (AI-2957); talks to localhost:8000/v1 on the box
           ssh "ubuntu@$IP" "./harness/run.sh --model ${{ inputs.model }} --suite ${{ inputs.suite }} --passes 3 --out ~/results"
           mkdir -p results && scp -r "ubuntu@$IP:~/results/*" results/
 
-      - name: Record instance-hours (cost log)
+      - name: Tear GPU server down (ALWAYS, by name tag)
+        if: always()
+        id: down
+        run: |
+          # primary: the step output; fallback: discover by name tag
+          ./lambdactl down "${{ steps.up.outputs.id || env.INSTANCE_NAME }}" \
+            && echo "confirmed=true" >> "$GITHUB_OUTPUT" \
+            || echo "confirmed=false" >> "$GITHUB_OUTPUT"
+          ./lambdactl ls   # visible post-teardown state in the log
+
+      - name: Record cost ledger entry
         if: always()
         run: |
           [[ -n "${{ steps.up.outputs.started_at }}" ]] || exit 0
           SECS=$(( $(date +%s) - ${{ steps.up.outputs.started_at }} ))
-          printf '{"model":"%s","instance_type":"%s","seconds":%d,"run_id":"%s"}\n' \
-            "${{ inputs.model }}" "${{ inputs.instance_type }}" "$SECS" "${{ github.run_id }}" \
-            | tee -a results/cost-log.jsonl
+          mkdir -p results
+          printf '{"model":"%s","instance_type":"%s","instance_id":"%s","seconds":%d,"termination_confirmed":%s,"run_id":"%s","note":"workflow-elapsed; reconcile against Lambda billing"}\n' \
+            "${{ inputs.model }}" "${{ steps.profile.outputs.instance_type }}" \
+            "${{ steps.up.outputs.id }}" "$SECS" "${{ steps.down.outputs.confirmed || 'false' }}" \
+            "${{ github.run_id }}" | tee -a results/cost-log.jsonl
 
       - name: Upload results
         if: always()
@@ -86,8 +103,3 @@ jobs:
           name: results-${{ inputs.model }}-${{ github.run_id }}
           path: results/
           if-no-files-found: ignore
-
-      - name: Tear GPU server down (ALWAYS)
-        if: always()
-        run: |
-          [[ -n "${{ steps.up.outputs.id }}" ]] && ./lambdactl down "${{ steps.up.outputs.id }}" || true

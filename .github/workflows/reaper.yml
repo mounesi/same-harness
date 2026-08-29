@@ -1,9 +1,10 @@
-# Safety net: every 6 hours, terminate any Lambda instance alive longer than 24h.
-# Protects the credit from a workflow that died before its teardown step.
+# Safety net (two tiers, per codex review):
+#  - every 2h: kill ci-* instances older than 14h (12h job ceiling + 2h grace)
+#  - every 2h: kill ANY instance older than 24h
 name: instance-reaper
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch: {}
 jobs:
   reap:
@@ -13,4 +14,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./lambdactl ls
-      - run: ./lambdactl reap 24
+      - run: ./lambdactl reap 14 ci-    # CI-tagged, tighter TTL
+      - run: ./lambdactl reap 24        # everything, standing net

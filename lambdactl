@@ -8,7 +8,7 @@
 #   ./lambdactl ip <id|name>                public IP of an instance
 #   ./lambdactl down <id|name>              terminate one instance
 #   ./lambdactl down --all                  terminate EVERYTHING (CI safety net)
-#   ./lambdactl reap [hours]                terminate instances older than N hours (default 24)
+#   ./lambdactl reap [hours] [name-prefix]  terminate instances older than N hours (default 24)
 #
 # Env:
 #   LAMBDA_API_KEY   required — https://cloud.lambdalabs.com/api-keys
@@ -84,7 +84,9 @@ print(rs[0]['name'] if rs else '')
     \"file_system_names\": $fs_json,
     \"name\": \"$name\"
   }" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['instance_ids'][0])")"
-  echo "==> instance $id — waiting for active" >&2
+  # emit the id IMMEDIATELY — if the wait below fails, the caller still knows what to terminate
+  echo "==> instance $id (name: $name) — waiting for active" >&2
+  echo "launched_id=$id" >&2
 
   local ip="" status=""
   for _ in $(seq 1 90); do
@@ -145,26 +147,28 @@ cmd_down() {
 }
 
 cmd_reap() {
-  local max_h="${1:-24}"
+  local max_h="${1:-24}" prefix="${2:-}"
   local ids
   ids="$(req GET /instances | python3 -c "
 import json,sys,datetime
 max_s=$max_h*3600
+prefix='$prefix'
 now=datetime.datetime.now(datetime.timezone.utc)
 old=[]
 for i in json.load(sys.stdin)['data']:
     ts=i.get('launched_at')
     if not ts: continue
+    if prefix and not (i.get('name') or '').startswith(prefix): continue
     age=(now-datetime.datetime.fromisoformat(ts.replace('Z','+00:00'))).total_seconds()
     if age>max_s: old.append(i['id'])
 print(' '.join(old))
 ")"
   if [[ -n "$ids" ]]; then
-    echo "==> reaping instances older than ${max_h}h: $ids"
+    echo "==> reaping instances older than ${max_h}h${prefix:+ (name prefix: $prefix)}: $ids"
     # shellcheck disable=SC2086
     terminate_ids $ids
   else
-    echo "==> nothing older than ${max_h}h"
+    echo "==> nothing older than ${max_h}h${prefix:+ (name prefix: $prefix)}"
   fi
 }
 
@@ -174,6 +178,6 @@ case "${1:-}" in
   ls)    cmd_ls ;;
   ip)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl ip <id|name>" >&2; exit 1; }; cmd_ip "$2" ;;
   down)  [[ $# -ge 2 ]] || { echo "usage: ./lambdactl down <id|name|--all>" >&2; exit 1; }; cmd_down "$2" ;;
-  reap)  cmd_reap "${2:-}" ;;
+  reap)  cmd_reap "${2:-}" "${3:-}" ;;
   *) sed -n '2,13p' "$0"; exit 1 ;;
 esac
