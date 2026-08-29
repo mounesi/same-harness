@@ -12,7 +12,7 @@ on:
         description: "model name (must exist in models.d/)"
         required: true
         type: choice
-        options: [qwen3-coder-next, minimax-m3, deepseek-v4-flash, glm-5.2, kimi-k3, qwen3.8-max]
+        options: [qwen3-coder-next, minimax-m3, deepseek-v4-flash, glm-5.3, kimi-k3, qwen3.8-max]
       instance_type:
         description: "Lambda instance type"
         required: true

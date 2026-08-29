@@ -24,7 +24,7 @@ vLLM args). Add a model = add a file. Current lineup:
 | qwen3-coder-next | 1× H100 | cheap anchor |
 | minimax-m3 | 4–8× H100 | verify specs on HF card before reserving |
 | deepseek-v4-flash | 8× H100 | use the retrained agentic checkpoint |
-| glm-5.2 | 8× B200 | swap to 5.3 if weights drop before run day |
+| glm-5.3 | 8× B200 | BLOCKED on Zhipu weights release — no 5.2 fallback; if not out by run day, defer to reserve |
 | kimi-k3 | 8× B200 (single node) | native MXFP4; accept HF license first |
 | qwen3.8-max | 2× 8× B200 (multi-node) | native FP8; needs Ray cluster; accept HF license first |
 
