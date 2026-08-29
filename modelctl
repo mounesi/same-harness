@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# modelctl — download / serve / switch open-weight models behind one OpenAI-compatible
+# endpoint, for "The Harness Variable" benchmark (AI-P144).
+#
+#   ./modelctl list                    show registered models + which one is live
+#   ./modelctl download <model>        pull weights from HF into $WEIGHTS_DIR
+#   ./modelctl serve <model>           serve it with vLLM on $PORT (downloads if needed)
+#   ./modelctl switch <model>          stop whatever is running, serve <model>
+#   ./modelctl stop                    stop the running server
+#   ./modelctl status                  server health + GPU memory
+#   ./modelctl logs [-f]               tail the vLLM log
+#   ./modelctl test                    one real completion through the endpoint
+#
+# Config via env (all optional):
+#   WEIGHTS_DIR   where weights live        (default: /persistent/models, else ~/models)
+#   PORT          vLLM port                 (default: 8000)
+#   VLLM_BIN      vllm executable           (default: vllm)
+#
+# Every model is a file in models.d/<name>.env defining:
+#   HF_REPO (required), TP, PP, MAX_MODEL_LEN, EXTRA_ARGS, MULTINODE, VLLM_DOCKER_IMAGE
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MODELS_D="$BASE_DIR/models.d"
+STATE_DIR="${STATE_DIR:-$BASE_DIR/.state}"
+PORT="${PORT:-8000}"
+VLLM_BIN="${VLLM_BIN:-vllm}"
+mkdir -p "$STATE_DIR"
+
+if [[ -z "${WEIGHTS_DIR:-}" ]]; then
+  if [[ -d /persistent ]]; then WEIGHTS_DIR=/persistent/models; else WEIGHTS_DIR="$HOME/models"; fi
+fi
+
+PIDFILE="$STATE_DIR/vllm.pid"
+CURFILE="$STATE_DIR/current"
+LOGFILE="$STATE_DIR/vllm.log"
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+
+load_model() {
+  local name="$1"
+  local f="$MODELS_D/$name.env"
+  [[ -f "$f" ]] || die "unknown model '$name' — run: ./modelctl list"
+  # defaults, then let the env file override
+  TP=1 PP=1 MAX_MODEL_LEN=262144 EXTRA_ARGS="" MULTINODE=0 VLLM_DOCKER_IMAGE=""
+  # shellcheck source=/dev/null
+  source "$f"
+  [[ -n "${HF_REPO:-}" ]] || die "$f does not define HF_REPO"
+  MODEL_NAME="$name"
+  MODEL_DIR="$WEIGHTS_DIR/$name"
+}
+
+running_pid() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid; pid="$(cat "$PIDFILE")"
+  kill -0 "$pid" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+cmd_list() {
+  local cur=""; [[ -f "$CURFILE" ]] && running_pid >/dev/null && cur="$(cat "$CURFILE")"
+  echo "registered models (models.d/):"
+  local f name mark size
+  for f in "$MODELS_D"/*.env; do
+    name="$(basename "$f" .env)"
+    mark=" "; [[ "$name" == "$cur" ]] && mark="*"
+    size="not downloaded"
+    [[ -d "$WEIGHTS_DIR/$name" ]] && size="$(du -sh "$WEIGHTS_DIR/$name" 2>/dev/null | cut -f1) on disk"
+    printf " %s %-22s %s\n" "$mark" "$name" "$size"
+  done
+  if [[ -n "$cur" ]]; then echo "(* = live on port $PORT)"; fi
+}
+
+cmd_download() {
+  load_model "$1"
+  mkdir -p "$MODEL_DIR"
+  info "downloading $HF_REPO -> $MODEL_DIR (hf_transfer on)"
+  HF_HUB_ENABLE_HF_TRANSFER=1 hf download "$HF_REPO" --local-dir "$MODEL_DIR"
+  info "done: $(du -sh "$MODEL_DIR" | cut -f1)"
+}
+
+wait_healthy() {
+  local tries="${1:-180}" i
+  for ((i=0; i<tries; i++)); do
+    if curl -sf "http://localhost:$PORT/v1/models" >/dev/null 2>&1; then return 0; fi
+    running_pid >/dev/null || { echo; die "server died during startup — see: ./modelctl logs"; }
+    sleep 10; printf '.'
+  done
+  echo; die "server not healthy after $((tries*10))s — see: ./modelctl logs"
+}
+
+cmd_serve() {
+  load_model "$1"
+  if pid="$(running_pid)"; then
+    die "'$(cat "$CURFILE" 2>/dev/null || echo '?')' is already running (pid $pid) — use: ./modelctl switch $MODEL_NAME"
+  fi
+  [[ -d "$MODEL_DIR" && -n "$(ls -A "$MODEL_DIR" 2>/dev/null)" ]] || cmd_download "$MODEL_NAME"
+
+  if [[ "$MULTINODE" == "1" ]]; then
+    cat >&2 <<MN
+NOTE: $MODEL_NAME is a MULTI-NODE model (tp=$TP, pp=$PP across nodes).
+  1. on the head node : ray start --head --port 6379
+  2. on the worker    : ray start --address <head-ip>:6379
+  3. re-run this command on the head node — vLLM picks up the Ray cluster.
+Proceeding with the launch (it will fail fast if the Ray cluster is missing).
+MN
+  fi
+
+  local args=(serve "$MODEL_DIR" --served-model-name "$MODEL_NAME"
+              --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
+              --port "$PORT")
+  [[ "$PP" != "1" ]] && args+=(--pipeline-parallel-size "$PP")
+  # shellcheck disable=SC2206
+  [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
+
+  info "launching: $VLLM_BIN ${args[*]}"
+  if [[ -n "$VLLM_DOCKER_IMAGE" ]]; then
+    docker run -d --name modelctl-vllm --gpus all --ipc=host -p "$PORT:$PORT" \
+      -v "$WEIGHTS_DIR:$WEIGHTS_DIR" "$VLLM_DOCKER_IMAGE" "${args[@]}" >"$STATE_DIR/docker.cid"
+    docker logs -f modelctl-vllm >"$LOGFILE" 2>&1 & echo $! >"$PIDFILE"
+  else
+    nohup "$VLLM_BIN" "${args[@]}" >"$LOGFILE" 2>&1 & echo $! >"$PIDFILE"
+  fi
+  echo "$MODEL_NAME" >"$CURFILE"
+  info "waiting for health on :$PORT (large models take many minutes to load)"
+  wait_healthy
+  echo; info "$MODEL_NAME live — endpoint: http://localhost:$PORT/v1  (./modelctl test)"
+}
+
+cmd_stop() {
+  if [[ -f "$STATE_DIR/docker.cid" ]]; then
+    docker rm -f modelctl-vllm >/dev/null 2>&1 || true
+    rm -f "$STATE_DIR/docker.cid"
+  fi
+  if pid="$(running_pid)"; then
+    info "stopping $(cat "$CURFILE" 2>/dev/null || echo server) (pid $pid)"
+    kill "$pid" 2>/dev/null || true
+    for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 2; done
+    kill -9 "$pid" 2>/dev/null || true
+  else
+    info "nothing running"
+  fi
+  rm -f "$PIDFILE" "$CURFILE"
+}
+
+cmd_switch() { cmd_stop; cmd_serve "$1"; }
+
+cmd_status() {
+  if pid="$(running_pid)"; then
+    echo "model : $(cat "$CURFILE" 2>/dev/null || echo '?') (pid $pid)"
+    if curl -sf "http://localhost:$PORT/v1/models" >/dev/null 2>&1; then
+      echo "health: OK — http://localhost:$PORT/v1"
+    else
+      echo "health: STARTING/UNHEALTHY — see ./modelctl logs"
+    fi
+  else
+    echo "model : none running"
+  fi
+  if command -v nvidia-smi >/dev/null; then
+    nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv
+  fi
+}
+
+cmd_logs() { [[ "${1:-}" == "-f" ]] && tail -f "$LOGFILE" || tail -n 100 "$LOGFILE"; }
+
+cmd_test() {
+  local model; model="$(cat "$CURFILE" 2>/dev/null)" || die "nothing running"
+  curl -sf "http://localhost:$PORT/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"Write a one-line Python hello world.\"}],\"max_tokens\":64}" \
+    | python3 -m json.tool
+}
+
+case "${1:-}" in
+  list)     cmd_list ;;
+  download) [[ $# -ge 2 ]] || die "usage: ./modelctl download <model>"; cmd_download "$2" ;;
+  serve)    [[ $# -ge 2 ]] || die "usage: ./modelctl serve <model>";    cmd_serve "$2" ;;
+  switch)   [[ $# -ge 2 ]] || die "usage: ./modelctl switch <model>";   cmd_switch "$2" ;;
+  stop)     cmd_stop ;;
+  status)   cmd_status ;;
+  logs)     cmd_logs "${2:-}" ;;
+  test)     cmd_test ;;
+  *) sed -n '2,12p' "$0"; exit 1 ;;
+esac

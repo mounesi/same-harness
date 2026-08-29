@@ -1,0 +1,16 @@
+# Safety net: every 6 hours, terminate any Lambda instance alive longer than 24h.
+# Protects the credit from a workflow that died before its teardown step.
+name: instance-reaper
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    env:
+      LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./lambdactl ls
+      - run: ./lambdactl reap 24

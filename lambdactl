@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# lambdactl — bring Lambda Cloud GPU instances up and down via the API.
+# Companion to modelctl: lambdactl owns the machine, modelctl owns the model.
+#
+#   ./lambdactl types                       instance types + availability
+#   ./lambdactl up <instance-type> [region] launch, wait until active, print IP
+#   ./lambdactl ls                          running instances
+#   ./lambdactl ip <id|name>                public IP of an instance
+#   ./lambdactl down <id|name>              terminate one instance
+#   ./lambdactl down --all                  terminate EVERYTHING (CI safety net)
+#   ./lambdactl reap [hours]                terminate instances older than N hours (default 24)
+#
+# Env:
+#   LAMBDA_API_KEY   required — https://cloud.lambdalabs.com/api-keys
+#   LAMBDA_SSH_KEY   name of the SSH key registered in Lambda (default: first key)
+#   LAMBDA_FS        name of persistent filesystem to attach (optional, region-bound)
+#   INSTANCE_NAME    name tag for launched instance (default: harness-run)
+set -euo pipefail
+
+API="https://cloud.lambdalabs.com/api/v1"
+[[ -n "${LAMBDA_API_KEY:-}" ]] || { echo "error: LAMBDA_API_KEY not set" >&2; exit 1; }
+
+req() { # method path [json-body]
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -sf -X "$method" "$API$path" -H "Authorization: Bearer $LAMBDA_API_KEY" \
+      -H 'Content-Type: application/json' -d "$body"
+  else
+    curl -sf -X "$method" "$API$path" -H "Authorization: Bearer $LAMBDA_API_KEY"
+  fi
+}
+
+resolve_id() { # accept instance id or name
+  local q="$1"
+  req GET /instances | python3 -c "
+import json,sys
+q='$q'
+for i in json.load(sys.stdin)['data']:
+    if i['id']==q or i.get('name')==q: print(i['id']); break
+"
+}
+
+cmd_types() {
+  req GET /instance-types | python3 -c "
+import json,sys
+d=json.load(sys.stdin)['data']
+for name,t in sorted(d.items()):
+    regions=[r['name'] for r in t['regions_with_capacity_available']]
+    price=t['instance_type']['price_cents_per_hour']/100
+    avail=', '.join(regions) if regions else '—'
+    print(f\"{name:34s} \${price:>7.2f}/hr  {avail}\")
+"
+}
+
+cmd_up() {
+  local itype="$1" region="${2:-}"
+  local name="${INSTANCE_NAME:-harness-run}"
+
+  if [[ -z "$region" ]]; then
+    region="$(req GET /instance-types | python3 -c "
+import json,sys
+t=json.load(sys.stdin)['data'].get('$itype')
+rs=t['regions_with_capacity_available'] if t else []
+print(rs[0]['name'] if rs else '')
+")"
+    [[ -n "$region" ]] || { echo "error: no capacity for $itype in any region (see ./lambdactl types)" >&2; exit 1; }
+  fi
+
+  local sshkey="${LAMBDA_SSH_KEY:-}"
+  if [[ -z "$sshkey" ]]; then
+    sshkey="$(req GET /ssh-keys | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(d[0]['name'] if d else '')")"
+    [[ -n "$sshkey" ]] || { echo "error: no SSH key registered in Lambda" >&2; exit 1; }
+  fi
+
+  local fs_json="[]"
+  [[ -n "${LAMBDA_FS:-}" ]] && fs_json="[\"$LAMBDA_FS\"]"
+
+  echo "==> launching $itype in $region (ssh key: $sshkey, fs: ${LAMBDA_FS:-none})" >&2
+  local id
+  id="$(req POST /instance-operations/launch "{
+    \"region_name\": \"$region\",
+    \"instance_type_name\": \"$itype\",
+    \"ssh_key_names\": [\"$sshkey\"],
+    \"file_system_names\": $fs_json,
+    \"name\": \"$name\"
+  }" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['instance_ids'][0])")"
+  echo "==> instance $id — waiting for active" >&2
+
+  local ip="" status=""
+  for _ in $(seq 1 90); do
+    read -r status ip < <(req GET "/instances/$id" | python3 -c "
+import json,sys; i=json.load(sys.stdin)['data']
+print(i['status'], i.get('ip') or '-')")
+    [[ "$status" == "active" && "$ip" != "-" ]] && break
+    printf '.' >&2; sleep 10
+  done
+  echo >&2
+  [[ "$status" == "active" ]] || { echo "error: instance $id not active after 15m (status: $status)" >&2; exit 1; }
+
+  echo "==> waiting for SSH" >&2
+  for _ in $(seq 1 30); do
+    ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 -o BatchMode=yes "ubuntu@$ip" true 2>/dev/null && break
+    printf '.' >&2; sleep 10
+  done
+  echo >&2
+  echo "==> up: $id  ubuntu@$ip" >&2
+  # machine-readable line for CI:
+  echo "$id $ip"
+}
+
+cmd_ls() {
+  req GET /instances | python3 -c "
+import json,sys
+for i in json.load(sys.stdin)['data']:
+    print(f\"{i['id']}  {i.get('name','-'):20s} {i['instance_type']['name']:30s} {i['status']:10s} {i.get('ip') or '-'}\")
+" || true
+}
+
+cmd_ip() {
+  local id; id="$(resolve_id "$1")"
+  [[ -n "$id" ]] || { echo "error: no instance '$1'" >&2; exit 1; }
+  req GET "/instances/$id" | python3 -c "import json,sys; print(json.load(sys.stdin)['data'].get('ip') or '')"
+}
+
+terminate_ids() { # space-separated ids on stdin/args
+  local ids_json
+  ids_json="$(printf '%s\n' "$@" | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))")"
+  [[ "$ids_json" != "[]" ]] || { echo "==> nothing to terminate"; return 0; }
+  echo "==> terminating: $*"
+  req POST /instance-operations/terminate "{\"instance_ids\": $ids_json}" >/dev/null
+  echo "==> done"
+}
+
+cmd_down() {
+  if [[ "${1:-}" == "--all" ]]; then
+    local ids
+    ids="$(req GET /instances | python3 -c "import json,sys; print(' '.join(i['id'] for i in json.load(sys.stdin)['data']))")"
+    # shellcheck disable=SC2086
+    terminate_ids $ids
+  else
+    local id; id="$(resolve_id "$1")"
+    [[ -n "$id" ]] || { echo "error: no instance '$1'" >&2; exit 1; }
+    terminate_ids "$id"
+  fi
+}
+
+cmd_reap() {
+  local max_h="${1:-24}"
+  local ids
+  ids="$(req GET /instances | python3 -c "
+import json,sys,datetime
+max_s=$max_h*3600
+now=datetime.datetime.now(datetime.timezone.utc)
+old=[]
+for i in json.load(sys.stdin)['data']:
+    ts=i.get('launched_at')
+    if not ts: continue
+    age=(now-datetime.datetime.fromisoformat(ts.replace('Z','+00:00'))).total_seconds()
+    if age>max_s: old.append(i['id'])
+print(' '.join(old))
+")"
+  if [[ -n "$ids" ]]; then
+    echo "==> reaping instances older than ${max_h}h: $ids"
+    # shellcheck disable=SC2086
+    terminate_ids $ids
+  else
+    echo "==> nothing older than ${max_h}h"
+  fi
+}
+
+case "${1:-}" in
+  types) cmd_types ;;
+  up)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl up <instance-type> [region]" >&2; exit 1; }; cmd_up "$2" "${3:-}" ;;
+  ls)    cmd_ls ;;
+  ip)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl ip <id|name>" >&2; exit 1; }; cmd_ip "$2" ;;
+  down)  [[ $# -ge 2 ]] || { echo "usage: ./lambdactl down <id|name|--all>" >&2; exit 1; }; cmd_down "$2" ;;
+  reap)  cmd_reap "${2:-}" ;;
+  *) sed -n '2,13p' "$0"; exit 1 ;;
+esac

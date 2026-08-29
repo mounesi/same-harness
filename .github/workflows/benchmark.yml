@@ -1,0 +1,93 @@
+# Benchmark run: bring a Lambda GPU server up, serve the model, run the harness, tear down.
+# The teardown step runs ALWAYS — a red run must never leave a $54/hr node alive.
+#
+# Repo secrets needed: LAMBDA_API_KEY, LAMBDA_SSH_PRIVATE_KEY
+# Repo variables:      LAMBDA_SSH_KEY (key name in Lambda), LAMBDA_FS (persistent filesystem name)
+name: benchmark-run
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "model name (must exist in models.d/)"
+        required: true
+        type: choice
+        options: [qwen3-coder-next, minimax-m3, deepseek-v4-flash, glm-5.2, kimi-k3, qwen3.8-max]
+      instance_type:
+        description: "Lambda instance type"
+        required: true
+        type: choice
+        options: [gpu_1x_h100_pcie, gpu_8x_h100_sxm5, gpu_8x_b200_sxm6]
+      suite:
+        description: "benchmark suite"
+        required: true
+        default: all
+        type: choice
+        options: [all, swebench-verified, swebench-pro, agenttask]
+
+concurrency:
+  group: gpu-run            # one GPU run at a time — no accidental double spend
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720    # 12h hard ceiling on any run
+    env:
+      LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
+      LAMBDA_SSH_KEY: ${{ vars.LAMBDA_SSH_KEY }}
+      LAMBDA_FS: ${{ vars.LAMBDA_FS }}
+      INSTANCE_NAME: ci-${{ inputs.model }}-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.LAMBDA_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Bring GPU server up
+        id: up
+        run: |
+          read -r ID IP < <(./lambdactl up "${{ inputs.instance_type }}" | tail -n1)
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "started_at=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Provision + serve model
+        run: |
+          IP=${{ steps.up.outputs.ip }}
+          scp -o StrictHostKeyChecking=accept-new -r modelctl models.d "ubuntu@$IP:~/"
+          ssh "ubuntu@$IP" 'pip install -q vllm hf_transfer'
+          # weights persist on the attached filesystem across runs
+          ssh "ubuntu@$IP" "WEIGHTS_DIR=/home/ubuntu/$LAMBDA_FS/models ./modelctl serve ${{ inputs.model }}"
+
+      - name: Run harness
+        run: |
+          IP=${{ steps.up.outputs.ip }}
+          # harness lives in this repo (AI-2957); talks to localhost:8000/v1 on the box
+          ssh "ubuntu@$IP" "./harness/run.sh --model ${{ inputs.model }} --suite ${{ inputs.suite }} --passes 3 --out ~/results"
+          mkdir -p results && scp -r "ubuntu@$IP:~/results/*" results/
+
+      - name: Record instance-hours (cost log)
+        if: always()
+        run: |
+          [[ -n "${{ steps.up.outputs.started_at }}" ]] || exit 0
+          SECS=$(( $(date +%s) - ${{ steps.up.outputs.started_at }} ))
+          printf '{"model":"%s","instance_type":"%s","seconds":%d,"run_id":"%s"}\n' \
+            "${{ inputs.model }}" "${{ inputs.instance_type }}" "$SECS" "${{ github.run_id }}" \
+            | tee -a results/cost-log.jsonl
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ inputs.model }}-${{ github.run_id }}
+          path: results/
+          if-no-files-found: ignore
+
+      - name: Tear GPU server down (ALWAYS)
+        if: always()
+        run: |
+          [[ -n "${{ steps.up.outputs.id }}" ]] && ./lambdactl down "${{ steps.up.outputs.id }}" || true
