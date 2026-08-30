@@ -54,6 +54,12 @@ jobs:
           [[ -n "${INSTANCE_TYPE:-}" ]] || { echo "models.d/${{ inputs.model }}.env has no INSTANCE_TYPE"; exit 1; }
           [[ "${MULTINODE:-0}" == "1" ]] && { echo "multi-node models are not CI-supported yet"; exit 1; }
           echo "instance_type=$INSTANCE_TYPE" >> "$GITHUB_OUTPUT"
+          # List price for the cost ledger below. Best-effort: an empty value just means the
+          # ledger records setup SECONDS without dollars, which analysis/aggregate.py tolerates.
+          CPH="$(./lambdactl types 2>/dev/null \
+                 | awk -v t="$INSTANCE_TYPE" '$1==t {p=$2; gsub(/[$,]/,"",p); sub(/\/hr$/,"",p); printf "%.0f", p*100; exit}')" || CPH=""
+          echo "price_cents_per_hour=$CPH" >> "$GITHUB_OUTPUT"
+          echo "==> $INSTANCE_TYPE at ${CPH:-unknown} cents/hour" >&2
 
       - name: Bring GPU server up
         id: up
@@ -75,28 +81,45 @@ jobs:
           ssh "ubuntu@$IP" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo"
 
       - name: Provision + serve model
+        id: serve
         run: |
           IP=${{ steps.up.outputs.ip }}
           ssh "ubuntu@$IP" "pip install -q 'vllm==${VLLM_VERSION}' hf_transfer"
           # grading dependencies are pinned in harness/requirements.lock (codex invariant 5)
           ssh "ubuntu@$IP" "cd ~/harness-repo && pip install -q -r harness/requirements.lock"
           ssh "ubuntu@$IP" "cd ~/harness-repo && WEIGHTS_DIR=$WEIGHTS_DIR ./modelctl serve ${{ inputs.model }}"
+          # Everything up to here is SETUP: instance provision + weight download + vLLM load.
+          # CONTRACTS.md §8 reports that time separately and never folds it into
+          # cost_per_resolved, so the ledger step needs the boundary timestamp.
+          echo "setup_done_at=$(date +%s)" >> "$GITHUB_OUTPUT"
 
       - name: Run harness
+        # `shell: bash` is load-bearing: it selects `bash --noprofile --norc -eo pipefail`.
+        # The default for a bare `run:` is `bash -e {0}` with NO pipefail, so the
+        # `| tee` below would report tee's status and a failed run would look green.
+        shell: bash
         env:
           # provenance the manifest requires but cannot discover from inside the instance
           LAMBDA_INSTANCE_ID: ${{ steps.up.outputs.id }}
           LAMBDA_INSTANCE_TYPE: ${{ steps.profile.outputs.instance_type }}
         run: |
           IP=${{ steps.up.outputs.ip }}
+          mkdir -p results
+          # run.sh stdout is machine-readable only: one "RUN <run_id> <suite> <dir> <status>"
+          # line per run (§1.4). Capture it — the harness run_id is the ONLY join key between
+          # the cost ledger and analysis/aggregate.py (§3.1). tee writes as lines arrive, so a
+          # run that dies mid-flight still leaves the ids it already emitted.
           ssh "ubuntu@$IP" "cd ~/harness-repo && \
             WEIGHTS_DIR=$WEIGHTS_DIR \
             LAMBDA_INSTANCE_ID='${LAMBDA_INSTANCE_ID}' \
             LAMBDA_INSTANCE_TYPE='${LAMBDA_INSTANCE_TYPE}' \
             GITHUB_RUN_ID='${{ github.run_id }}' \
-            ./harness/run.sh --model ${{ inputs.model }} --suite ${{ inputs.suite }} --passes 3 --out ~/results"
+            ./harness/run.sh --model ${{ inputs.model }} --suite ${{ inputs.suite }} --passes 3 --out ~/results" \
+            | tee -a results/run-lines.txt
 
       - name: Package + push run bundles
+        if: always()   # an exit-4 (incomplete) run still has results worth keeping
+        shell: bash
         run: |
           IP=${{ steps.up.outputs.ip }}
           # bundle on the instance (immutable tar + SHA-256), then pull manifests/checksums
@@ -113,16 +136,62 @@ jobs:
             || echo "confirmed=false" >> "$GITHUB_OUTPUT"
           ./lambdactl ls   # visible post-teardown state in the log
 
+      # cost-log.jsonl is read by analysis/aggregate.py --cost-log, which joins on the HARNESS
+      # run_id (<model>__<suite>__<ts>__<hex>) and reads setup_cost_usd / setup_seconds. It is
+      # keyed by run_id, so the GitHub numeric id must never appear in that field.
       - name: Record cost ledger entry
         if: always()
+        env:
+          STARTED_AT: ${{ steps.up.outputs.started_at }}
+          SETUP_DONE_AT: ${{ steps.serve.outputs.setup_done_at }}
+          CPH: ${{ steps.profile.outputs.price_cents_per_hour }}
+          ITYPE: ${{ steps.profile.outputs.instance_type }}
+          IID: ${{ steps.up.outputs.id }}
+          TERMINATED: ${{ steps.down.outputs.confirmed || 'false' }}
+          GH_RUN_ID: ${{ github.run_id }}
+          MODEL: ${{ inputs.model }}
         run: |
-          [[ -n "${{ steps.up.outputs.started_at }}" ]] || exit 0
-          SECS=$(( $(date +%s) - ${{ steps.up.outputs.started_at }} ))
+          [[ -n "$STARTED_AT" ]] || exit 0
           mkdir -p results
-          printf '{"model":"%s","instance_type":"%s","instance_id":"%s","seconds":%d,"termination_confirmed":%s,"run_id":"%s","note":"workflow-elapsed; reconcile against Lambda billing"}\n' \
-            "${{ inputs.model }}" "${{ steps.profile.outputs.instance_type }}" \
-            "${{ steps.up.outputs.id }}" "$SECS" "${{ steps.down.outputs.confirmed || 'false' }}" \
-            "${{ github.run_id }}" | tee -a results/cost-log.jsonl
+          ELAPSED=$(( $(date +%s) - STARTED_AT ))
+          if [[ -n "$SETUP_DONE_AT" ]]; then
+            SETUP_S=$(( SETUP_DONE_AT - STARTED_AT ))
+            SETUP_COMPLETE=true
+          else
+            # never reached a served model: the whole job was setup that never paid off
+            SETUP_S=$ELAPSED
+            SETUP_COMPLETE=false
+          fi
+
+          # Job-level line for billing reconciliation. It deliberately carries NO "run_id" key:
+          # the GitHub id is not a harness run id, and aggregate.py skips lines without one.
+          printf '{"record":"job","github_run_id":"%s","model":"%s","instance_type":"%s","instance_id":"%s","job_elapsed_seconds":%d,"setup_seconds":%d,"setup_complete":%s,"termination_confirmed":%s,"price_cents_per_hour":%s,"note":"whole-workflow elapsed; reconcile against Lambda billing"}\n' \
+            "$GH_RUN_ID" "$MODEL" "$ITYPE" "$IID" "$ELAPSED" "$SETUP_S" \
+            "$SETUP_COMPLETE" "$TERMINATED" "${CPH:-null}" \
+            | tee -a results/cost-log.jsonl
+
+          RUNS=results/run-lines.txt
+          N=0
+          if [[ -f "$RUNS" ]]; then N=$(grep -c '^RUN ' "$RUNS" || true); fi
+          if (( N == 0 )); then
+            echo "==> no RUN lines captured — setup cost is not attributable to a harness run" >&2
+            exit 0
+          fi
+          # One warm-up serves every run in the job (--suite all makes three), so split the
+          # setup seconds evenly instead of charging the full warm-up to each run.
+          SHARE=$(awk -v s="$SETUP_S" -v n="$N" 'BEGIN{printf "%.3f", s/n}')
+
+          grep '^RUN ' "$RUNS" | while read -r _ RID SUITE _ STATUS; do
+            PRICE=""
+            if [[ -n "$CPH" ]]; then
+              USD=$(awk -v s="$SHARE" -v c="$CPH" 'BEGIN{printf "%.6f", s/3600*c/100}')
+              PRICE=$(printf '"effective_cents_per_hour":%s,"setup_cost_usd":%s,' "$CPH" "$USD")
+            fi
+            printf '{"record":"run","run_id":"%s","suite":"%s","status":"%s","setup_seconds":%s,%s"setup_seconds_job_total":%d,"runs_in_job":%d,"setup_attribution":"even-split-across-runs-in-job","setup_complete":%s,"job_elapsed_seconds":%d,"github_run_id":"%s","model":"%s","instance_type":"%s","instance_id":"%s","note":"setup = provision + weight download + vLLM load; reported separately per CONTRACTS.md 8, never folded into cost_per_resolved"}\n' \
+              "$RID" "$SUITE" "$STATUS" "$SHARE" "$PRICE" "$SETUP_S" "$N" \
+              "$SETUP_COMPLETE" "$ELAPSED" "$GH_RUN_ID" "$MODEL" "$ITYPE" "$IID" \
+              | tee -a results/cost-log.jsonl
+          done
 
       - name: Upload results
         if: always()

@@ -91,6 +91,19 @@ class AgentTaskDataError(RuntimeError):
 # --- small helpers ----------------------------------------------------------------------
 
 
+
+def _is_within(child: Path, parent: Path) -> bool:
+    """Path.is_relative_to equivalent for CPython < 3.9.
+
+    The grading preflight calls environment_digest() on every host, including boxes with
+    an older default python3, so this must not depend on a 3.9+ method.
+    """
+    try:
+        Path(child).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
+
 def _canonical_json(obj: Any) -> str:
     """Canonical JSON per CONTRACTS.md §0 (compact form, used only for hashing)."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -170,7 +183,7 @@ def _data_dir() -> Path:
 
     for cand in candidates:
         resolved = cand.expanduser().resolve()
-        if resolved.is_relative_to(_REPO_ROOT):
+        if _is_within(resolved, _REPO_ROOT):
             raise AgentTaskDataError(
                 f"AgentTask data pack at {resolved} is inside the repo working tree; "
                 "customer-derived task content must never be reachable from git (AI-2955)"
@@ -551,7 +564,7 @@ def materialize(task: Task, dest: Path, *, include_hidden_tests: bool = False) -
 def _pack_path(task: Task, spec: Mapping[str, Any], what: str) -> Path:
     data_dir = Path(task.metadata["data_dir"])
     path = (data_dir / str(spec["path"])).resolve()
-    if not path.is_relative_to(data_dir.resolve()):
+    if not _is_within(path, data_dir):
         raise AgentTaskDataError(f"{task.instance_id}: {what} path escapes the data pack")
     if not path.exists():
         raise AgentTaskDataError(f"{task.instance_id}: {what} missing at {path}")

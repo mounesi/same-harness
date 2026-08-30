@@ -18,6 +18,16 @@
 #
 # Every model is a file in models.d/<name>.env defining:
 #   HF_REPO (required), TP, PP, MAX_MODEL_LEN, EXTRA_ARGS, MULTINODE, VLLM_DOCKER_IMAGE
+#
+# State written under $STATE_DIR (default <repo>/.state), all of it read by harness/run.sh:
+#   vllm.pid    pid of the server (or of the docker log follower)
+#   current     name of the model being served
+#   vllm.log    the server's own stdout/stderr
+#   vllm-argv   ONE line: the exact command this script launched. It is the only record of
+#               how the server was started — run.sh copies it into every run directory as
+#               env/vllm-args.txt and the manifest records it as runtime.vllm_argv
+#               (docs/CONTRACTS.md §2.2). It must be written here, because info() writes to
+#               stdout and vllm.log only ever receives vLLM's own output.
 set -euo pipefail
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +44,7 @@ fi
 PIDFILE="$STATE_DIR/vllm.pid"
 CURFILE="$STATE_DIR/current"
 LOGFILE="$STATE_DIR/vllm.log"
+ARGVFILE="$STATE_DIR/vllm-argv"
 
 die()  { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -114,7 +125,17 @@ MN
   # shellcheck disable=SC2206
   [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
 
-  info "launching: $VLLM_BIN ${args[*]}"
+  local launch_line
+  if [[ -n "$VLLM_DOCKER_IMAGE" ]]; then
+    launch_line="docker run -d --name modelctl-vllm --gpus all --ipc=host -p $PORT:$PORT -v $WEIGHTS_DIR:$WEIGHTS_DIR $VLLM_DOCKER_IMAGE ${args[*]}"
+  else
+    launch_line="$VLLM_BIN ${args[*]}"
+  fi
+  info "launching: $launch_line"
+  # Durable record, written BEFORE the launch: this line is the provenance of the server
+  # (harness/run.sh -> env/vllm-args.txt -> manifest runtime.vllm_argv). Writing it only to
+  # stdout would lose it the moment this shell exits.
+  printf '%s\n' "$launch_line" >"$ARGVFILE"
   if [[ -n "$VLLM_DOCKER_IMAGE" ]]; then
     docker run -d --name modelctl-vllm --gpus all --ipc=host -p "$PORT:$PORT" \
       -v "$WEIGHTS_DIR:$WEIGHTS_DIR" "$VLLM_DOCKER_IMAGE" "${args[@]}" >"$STATE_DIR/docker.cid"
@@ -141,7 +162,9 @@ cmd_stop() {
   else
     info "nothing running"
   fi
-  rm -f "$PIDFILE" "$CURFILE"
+  # vllm-argv describes a server that is no longer running; leaving it would let the next
+  # run.sh record a dead server's argv as its provenance.
+  rm -f "$PIDFILE" "$CURFILE" "$ARGVFILE"
 }
 
 cmd_switch() { cmd_stop; cmd_serve "$1"; }

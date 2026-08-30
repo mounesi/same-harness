@@ -36,8 +36,17 @@
 #
 # Exit codes (docs/CONTRACTS.md §1.3):
 #   0 ok — tasks failing to resolve is a NORMAL 0     1 usage          2 config
-#   3 preflight (endpoint down / served-model mismatch / unresolved REQUIRED provenance)
+#   3 preflight (endpoint down / served-model mismatch / missing grading dependency /
+#     unresolved REQUIRED provenance)
 #   4 incomplete      5 grading degraded (>2% INFRA_GRADER)      130 interrupt
+#
+# Preflight is three tiers, all of them before the first model call:
+#   1. endpoint    GET $endpoint/models answers, and serves exactly --model
+#   2. provenance  every REQUIRED field of §2 resolves (manifest build)
+#   3. grading     the selected adapter's environment_digest() answers and the grader it
+#                  names is actually installed here (docker, the eval module). Without this
+#                  a run discovers at its FIRST grade() that it cannot grade at all — after
+#                  hours of GPU budget. HARNESS_SKIP_GRADING_PREFLIGHT=1 opts out.
 #
 # Subprocess contract: this driver runs, once per pass and from the repo root,
 #   python3 -m harness.agent run --manifest <m> --run-dir <d> --pass-idx <n>
@@ -52,7 +61,11 @@
 # Env: HARNESS_ENDPOINT, WEIGHTS_DIR, STATE_DIR, HARNESS_PRICE_SNAPSHOT, HARNESS_PYTHON,
 #      LAMBDA_INSTANCE_ID / LAMBDA_REGION / LAMBDA_INSTANCE_TYPE (exported by CI),
 #      HARNESS_ALLOW_NETWORK=1 (allow the HfApi revision lookup),
-#      HARNESS_SKIP_WEIGHT_DIGEST=1 (skip the weights content digest; marks nonconformant).
+#      HARNESS_SKIP_WEIGHT_DIGEST=1 (skip the weights content digest; marks nonconformant),
+#      HARNESS_SKIP_GRADING_PREFLIGHT=1 (start even though this host cannot grade).
+#
+# STATE_DIR MUST resolve to the same directory modelctl uses ($STATE_DIR, else <repo>/.state):
+# that is where modelctl writes vllm-argv, the only record of how the server was launched.
 set -euo pipefail
 
 ORIG_ARGV=("$@")
@@ -61,7 +74,11 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$BASE_DIR/.." && pwd)"
 MANIFEST_PY="$BASE_DIR/manifest.py"
 AGENT_PY="$BASE_DIR/agent.py"
+# Same resolution as modelctl ("${STATE_DIR:-$BASE_DIR/.state}" with modelctl's BASE_DIR
+# being the repo root) — the two MUST agree or the launch argv is silently lost.
 STATE_DIR="${STATE_DIR:-$REPO_DIR/.state}"
+case "$STATE_DIR" in /*) ;; *) STATE_DIR="$(cd "$STATE_DIR" 2>/dev/null && pwd || echo "$PWD/$STATE_DIR")" ;; esac
+VLLM_ARGV_FILE="$STATE_DIR/vllm-argv"
 PY="${HARNESS_PYTHON:-python3}"
 
 VALID_SUITES=(swebench-verified swebench-pro agenttask)
@@ -256,11 +273,18 @@ print("\n".join(str(m.get("id", "")) for m in data))
 finish_run() {
   local status="$1" code="$2"; shift 2
   local SCAN_UNIQUE=0
+  # --resume reuses the manifest, so timing.started_at stays the ORIGINAL start and
+  # timing.wall_clock_s spans the idle gap between the two invocations. Naming the resumed
+  # run here is what makes manifest.py accumulate timing.active_wall_clock_s per invocation
+  # and set flags.resumed_from — the headline cost is computed from the active number.
+  local resumed=()
+  if [[ -n "$RESUME" ]]; then resumed=(--resumed-from "$RESUME"); fi
   eval "$(manifest_py scan --run-dir "$CUR_RUN_DIR" --run-id "$CUR_RUN_ID" 2>/dev/null \
           || echo 'SCAN_UNIQUE=0')"
   manifest_py finalize --run-dir "$CUR_RUN_DIR" --status "$status" \
       --exit-code "$code" --attempts-written "$SCAN_UNIQUE" \
-      --started-at "$CUR_STARTED" --ended-at "$(utciso)" "$@" >&2 \
+      --started-at "$CUR_STARTED" --ended-at "$(utciso)" \
+      ${resumed[@]+"${resumed[@]}"} "$@" >&2 \
     || info "WARNING: could not finalize the manifest for $CUR_RUN_ID"
   manifest_py checksums --run-dir "$CUR_RUN_DIR" >/dev/null 2>&1 \
     || info "WARNING: could not write SHA256SUMS for $CUR_RUN_ID"
@@ -343,12 +367,21 @@ do_run() {
     printf 'nvidia-smi unavailable on %s\n' "$(hostname 2>/dev/null || echo host)" \
       >"$run_dir/env/nvidia-smi.txt"
   fi
-  if grep -h '^==> launching:' "$STATE_DIR/vllm.log" >/dev/null 2>&1; then
+  # How the server was actually launched. modelctl writes this file at launch time; the
+  # "==> launching:" line it also prints goes to modelctl's STDOUT and never reaches
+  # vllm.log (which only ever receives vLLM's own redirected output), so grepping the log
+  # for it can only ever come back empty.
+  if [[ -s "$VLLM_ARGV_FILE" ]]; then
+    tail -n1 "$VLLM_ARGV_FILE" >"$run_dir/env/vllm-args.txt"
+  elif grep -h '^==> launching:' "$STATE_DIR/vllm.log" >/dev/null 2>&1; then
+    # legacy state dirs, where an operator redirected modelctl's own stdout into the log
     grep -h '^==> launching:' "$STATE_DIR/vllm.log" | tail -n1 | sed 's/^==> launching: //' \
       >"$run_dir/env/vllm-args.txt"
   else
-    printf 'unavailable: no "==> launching:" line in %s\n' "$STATE_DIR/vllm.log" \
-      >"$run_dir/env/vllm-args.txt"
+    printf 'unavailable: %s was not written (server not started by ./modelctl serve?)\n' \
+      "$VLLM_ARGV_FILE" >"$run_dir/env/vllm-args.txt"
+    info "WARNING: no $VLLM_ARGV_FILE — runtime.vllm_argv will be null and this run will"
+    info "         carry no record of how the server was launched (start it with ./modelctl serve)"
   fi
 
   # ---- preflight: the endpoint must be serving THIS model -----------------
@@ -435,6 +468,24 @@ EOF
         --manifest "$run_dir/run-manifest.json" ${preview[@]+"${preview[@]}"} >/dev/null; then
     finish_run failed 2
     return 2
+  fi
+
+  # ---- preflight tier 3: this host must be able to GRADE ------------------
+  # docker and the eval module are otherwise not touched until the first grade() call, so
+  # a run would burn its whole GPU budget before discovering it can never produce a
+  # verdict. The digest printed here is the same value the manifest records.
+  info "preflight: grading dependencies for $suite"
+  local prc=0 pout=""
+  pout="$(manifest_py grading-preflight --repo "$REPO_DIR" --suite "$suite")" || prc=$?
+  if [[ -n "$pout" ]]; then info "preflight: $(printf '%s' "$pout" | tr '\n' ' ')"; fi
+  if [[ "$prc" -ne 0 ]]; then
+    if [[ "$MODE" == "dry-run" ]]; then
+      info "WARNING: this host cannot grade $suite (exit $prc) — a real run would refuse to start"
+    else
+      info "refusing to start: nothing was executed, so no GPU budget was spent"
+      finish_run failed 3
+      return 3
+    fi
   fi
 
   if [[ "$MODE" == "dry-run" ]]; then

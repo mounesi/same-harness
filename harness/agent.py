@@ -49,10 +49,12 @@ import importlib
 import json
 import os
 import re
+import shutil
 import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -462,7 +464,7 @@ class LLMClient:
 
     # -- completions -------------------------------------------------------------------
 
-    def _payload(self, messages: list[dict], tools: Iterable[dict]) -> dict:
+    def _payload(self, messages: list[dict], tools: Iterable[dict], seed: int | None = None) -> dict:
         inf = self.inf
         payload: dict[str, Any] = {
             "model": self.model,
@@ -471,7 +473,9 @@ class LLMClient:
             "tool_choice": "auto",
             "temperature": inf["temperature"],
             "top_p": inf["top_p"],
-            "seed": inf["seed"],
+            # The base seed is the held-constant recorded in the manifest; the caller
+            # passes the per-pass seed derived from it (see attempt_seed()).
+            "seed": int(inf["seed"] if seed is None else seed),
             "max_tokens": inf["max_tokens"],
             "presence_penalty": inf["presence_penalty"],
             "frequency_penalty": inf["frequency_penalty"],
@@ -485,9 +489,11 @@ class LLMClient:
             payload["repetition_penalty"] = inf["repetition_penalty"]
         return payload
 
-    def complete(self, messages: list[dict], tools: Iterable[dict]) -> tuple[dict, float]:
+    def complete(
+        self, messages: list[dict], tools: Iterable[dict], seed: int | None = None
+    ) -> tuple[dict, float]:
         """One completion request. Raises RetryableLLMError / ContextOverflow / AttemptAbort."""
-        payload = self._payload(messages, tools)
+        payload = self._payload(messages, tools, seed)
         started = time.monotonic()
         try:
             status, body = self._request(
@@ -584,11 +590,33 @@ def safe_rel(path: str) -> str:
 
 
 class LocalExecutor(Executor):
-    """Runs in a directory on this host."""
+    """Runs in a directory on this host.
 
-    def __init__(self, workdir: Path) -> None:
+    `owned` marks a directory the harness created for exactly one attempt, which
+    `cleanup()` is therefore allowed to delete. Per-attempt workspaces are full git clones
+    (or adapter-materialised snapshots) of the task repo; left behind they accumulate
+    without bound, and for the `agenttask` suite they are restricted content that MUST NOT
+    end up in a published bundle (CONTRACTS.md §7.4). They are removed as soon as the
+    attempt releases the workspace, on the success path and on every failure path alike.
+    A directory the harness did not create (an explicit `environment["workspace"]`) is
+    never touched.
+    """
+
+    def __init__(self, workdir: Path, owned: bool = False) -> None:
         self.root = Path(workdir).resolve()
         self.workdir = str(self.root)
+        self.owned = bool(owned)
+
+    def cleanup(self) -> None:
+        # Idempotent: build_workspace() may clean up a half-built workspace that
+        # run_attempt()'s `finally` will then release again.
+        if not self.owned:
+            return
+        self.owned = False
+        if self.root == Path(self.root.anchor) or self.root == REPO_ROOT:
+            stderr(f"==> refusing to remove workspace root {self.root}")
+            return
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def run(self, command: str, timeout_s: int) -> tuple[int, str]:
         try:
@@ -738,10 +766,11 @@ def build_workspace(task: Any, attempt_slug: str, scratch_root: Path) -> Executo
                 try:
                     materialize(task, dest, include_hidden_tests=False)
                 except Exception as exc:  # noqa: BLE001 — any failure here is INFRA_SANDBOX
+                    shutil.rmtree(dest, ignore_errors=True)
                     raise SandboxError(
                         f"adapter materialize() failed for {task.instance_id}: {exc}"
                     ) from exc
-                return LocalExecutor(dest)
+                return LocalExecutor(dest, owned=True)
         if not source or not Path(source).exists():
             raise SandboxError(
                 "no workspace: task has no image, no environment['workspace'], no adapter "
@@ -757,8 +786,9 @@ def build_workspace(task: Any, attempt_slug: str, scratch_root: Path) -> Executo
             timeout=1800,
         )
         if clone.returncode != 0:
+            shutil.rmtree(dest, ignore_errors=True)  # a half-written clone is still bytes
             raise SandboxError(f"git clone failed: {clone.stderr.strip()[:300]}")
-        executor = LocalExecutor(dest)
+        executor = LocalExecutor(dest, owned=True)
 
     try:
         if base_commit:
@@ -1073,6 +1103,7 @@ class RunContext:
         scratch_root: Path,
         partitions: dict[str, str] | None = None,
         cents_per_hour: float = 0.0,
+        environment_digest: str = "",
     ) -> None:
         self.cfg = cfg
         self.params = params
@@ -1086,6 +1117,10 @@ class RunContext:
         self.scratch_root = scratch_root
         self.partitions = partitions or {}
         self.cents_per_hour = cents_per_hour
+        # From the MANIFEST, not re-derived from the adapter: the point of
+        # CONTRACTS.md §2.3 is to prove the grading environment did not change
+        # under the run, which a fresh call could not detect.
+        self.environment_digest = environment_digest
         self.notices = prompt_pkg.notices()
 
     def partition_of(self, task: Any) -> str:
@@ -1156,6 +1191,7 @@ def complete_with_retry(
     tool_names: frozenset[str],
     stats: Stats,
     traj: TrajectoryWriter,
+    seed: int | None = None,
 ) -> tuple[dict, list[dict], float]:
     """One agent turn's completion, including the whole retry policy.
 
@@ -1173,7 +1209,7 @@ def complete_with_retry(
         _check_stop()
         stats.llm_calls += 1
         try:
-            resp, elapsed_ms = ctx.client.complete(messages, tools)
+            resp, elapsed_ms = ctx.client.complete(messages, tools, seed)
             usage = resp.get("usage") or {}
             stats.add_usage(usage)
             stats.latencies_ms.append(elapsed_ms)
@@ -1238,6 +1274,7 @@ def agent_loop(
     log: Callable[[str], None],
     deadline: float,
     assistant_texts: list[str],
+    seed: int | None = None,
 ) -> tuple[str | None, str]:
     """Run the bounded edit/run/test loop. Returns (terminal_code_or_None, detail).
 
@@ -1275,7 +1312,7 @@ def agent_loop(
             warned = True
 
         assistant, calls, elapsed_ms = complete_with_retry(
-            ctx, messages, prompt.tools, toolbox.names, stats, traj
+            ctx, messages, prompt.tools, toolbox.names, stats, traj, seed
         )
         stats.iterations += 1
         messages.append(assistant)
@@ -1378,6 +1415,26 @@ def attempt_id(run_id: str, instance_id: str, pass_idx: int) -> str:
     return f"{suffix}-{instance_id}-{pass_idx}"
 
 
+def attempt_seed(base_seed: int, pass_idx: int) -> int:
+    """The sampling seed sent for one pass. Returns the held-constant base seed.
+
+    OWNER DECISION (2026-08-30): the study runs at temperature 0.0 because published
+    SWE-bench numbers are greedy and the Verified suite's whole job is to be comparable
+    with them. Under greedy (argmax) decoding the sampler seed cannot influence token
+    selection at all, so varying it per pass would buy nothing while *implying* an
+    independence the decoder cannot deliver.
+
+    The N passes therefore measure serving nondeterminism (batching, kernel scheduling,
+    GPU reduction order), not sampling variance. That is a real and worth-reporting
+    quantity, but it is a RANGE, not a sampling distribution: analysis/aggregate.py
+    reports mean + min/max across passes and does not bootstrap a CI over them.
+
+    If the study ever moves to temperature > 0, change this to `base_seed + pass_idx`
+    AND re-enable the pass-level bootstrap in aggregate.py — the two must move together.
+    """
+    del pass_idx  # deliberately unused: see the docstring
+    return base_seed
+
 def _verdict_field(verdict: Any, name: str, default: Any = None) -> Any:
     if isinstance(verdict, dict):
         return verdict.get(name, default)
@@ -1399,6 +1456,8 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
     """Execute one attempt end to end and return its raw-result/v1 record."""
     instance_id = task.instance_id
     slug = f"{instance_id}__pass-{pass_idx}"
+    base_seed = int(ctx.params["seed"])
+    seed = attempt_seed(base_seed, pass_idx)
     started_at = utcnow()
     started_mono = time.monotonic()
     deadline = started_mono + float(ctx.params["task_timeout_s"])
@@ -1427,7 +1486,13 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
     assistant_texts: list[str] = []
 
     try:
+        # Before anything expensive. A queued attempt that starts after a stop signal would
+        # otherwise build a whole workspace (docker run, git clone, setup_cmds) only to
+        # abort inside agent_loop — minutes of paid GPU-node time per attempt.
+        _check_stop()
         log(f"attempt {slug} suite={ctx.suite} model={ctx.model}")
+        log(f"sampling: temperature={ctx.params['temperature']} seed={seed} "
+            f"(base_seed {base_seed} + pass_idx {pass_idx})")
         prompt = ctx.adapter.build_prompt(task)
         if prompt.template_id != prompt_pkg.TEMPLATE_ID:
             # §5.2: all three adapters must render the same template. A mismatch means the
@@ -1444,7 +1509,7 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
         toolbox = Toolbox(executor, task, ctx.cfg)
 
         terminal_code, detail = agent_loop(
-            ctx, prompt, toolbox, stats, traj, log, deadline, assistant_texts
+            ctx, prompt, toolbox, stats, traj, log, deadline, assistant_texts, seed
         )
         patch = capture_patch(executor)
         log(f"loop finished: terminal={terminal_code or 'self-terminated'} patch_bytes={len(patch)}")
@@ -1566,6 +1631,9 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
             "fail_to_pass": _verdict_field(verdict, "fail_to_pass", {"passed": 0, "total": 0}),
             "pass_to_pass": _verdict_field(verdict, "pass_to_pass", {"passed": 0, "total": 0}),
             "graded_at": iso(ended_at),
+            # §2.3 invariant: must equal the manifest's harness.environment_digest on every
+            # record. A record that disagrees was graded by a different environment.
+            "environment_digest": ctx.environment_digest,
         }
 
     gpu_seconds = wall_clock_ms / 1000.0
@@ -1584,6 +1652,14 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
         "partition": ctx.partition_of(task),
         "model": ctx.model,
         "pass_idx": pass_idx,
+        # Recorded per attempt so a reader can verify from the raw data that every pass ran
+        # with the same sampling parameters — the harness-constant claim, made checkable.
+        "sampling": {
+            "base_seed": base_seed,
+            "seed": seed,
+            "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
+            "temperature": ctx.params["temperature"],
+        },
         "started_at": iso(started_at),
         "ended_at": iso(ended_at),
         "wall_clock_ms": wall_clock_ms,
@@ -1832,6 +1908,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_id = args.run_id
     manifest_instance_ids: list[str] = []
     cents_per_hour = float(os.environ.get("HARNESS_EFFECTIVE_CENTS_PER_HOUR", "0") or 0)
+    environment_digest = ""
     consent_class = args.consent_class
 
     if manifest is not None:
@@ -1843,6 +1920,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         manifest_instance_ids = list(manifest["suite"].get("instance_ids") or [])
         consent_class = consent_class or (manifest.get("flags") or {}).get("consent_class")
         cents_per_hour = float((manifest.get("price") or {}).get("effective_cents_per_hour") or cents_per_hour)
+        environment_digest = str((manifest.get("harness") or {}).get("environment_digest") or "")
         if not args.seed_file and manifest["suite"].get("seed_file"):
             args.seed_file = str(REPO_ROOT / manifest["suite"]["seed_file"])
         if not args.partitions and manifest["suite"].get("partitions_file"):
@@ -1881,8 +1959,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     )
     run_dir = Path(args.run_dir) if args.run_dir else REPO_ROOT / "results" / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    scratch_root = Path(args.scratch or os.environ.get("HARNESS_SCRATCH") or (run_dir / "workspaces"))
+    # Per-attempt workspaces live OUTSIDE the run directory. They are full clones of the
+    # task repo; inside <run_dir> they would be walked by manifest.py's checksum pass and
+    # packaged by `resultsctl package`, which for the `agenttask` suite would put
+    # restricted task content into a bundle meant to hold results only (CONTRACTS.md §7.4).
+    # The run-id subdirectory keeps concurrent runs from colliding and makes the tree safe
+    # to delete wholesale when the run ends.
+    scratch_base = Path(args.scratch or os.environ.get("HARNESS_SCRATCH") or
+                        (Path(tempfile.gettempdir()) / "harness-workspaces"))
+    scratch_root = scratch_base / run_id
     scratch_root.mkdir(parents=True, exist_ok=True)
+    if run_dir.resolve() == scratch_root.resolve() or run_dir.resolve() in scratch_root.resolve().parents:
+        stderr(
+            f"==> warning: scratch root {scratch_root} is inside the run directory — "
+            "per-attempt workspaces will be checksummed and packaged into the run bundle"
+        )
 
     consent_class = consent_class or getattr(adapter, "CONSENT_CLASS", "public")
     client = LLMClient(endpoint, model, cfg)
@@ -1926,6 +2017,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         scratch_root=scratch_root,
         partitions=partitions,
         cents_per_hour=cents_per_hour,
+        environment_digest=environment_digest,
     )
 
     writer = ResultsWriter(results_path)
@@ -1938,13 +2030,50 @@ def cmd_run(args: argparse.Namespace) -> int:
         task, pass_idx = item
         return run_attempt(ctx, task, pass_idx)
 
+    # Attempts are submitted lazily, a shallow queue at a time, instead of all at once:
+    # a stop signal must not leave hundreds of queued attempts that each still build a
+    # workspace before aborting. On stop we submit nothing further and cancel whatever is
+    # still queued; only the attempts already running have to drain. Cancelled attempts
+    # write no record, so `--resume` picks them up unchanged (CONTRACTS.md §1.3 exit 4).
+    max_workers = int(params["concurrency"])
+    queue_depth = max(1, max_workers) * 2
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    work_iter = iter(work)
+    pending: dict = {}
+
+    def submit_next() -> bool:
+        if _STOP.is_set():
+            return False
+        try:
+            item = next(work_iter)
+        except StopIteration:
+            return False
+        pending[pool.submit(execute, item)] = item
+        return True
+
+    def top_up() -> None:
+        while len(pending) < queue_depth and submit_next():
+            pass
+
+    def drain_queue() -> None:
+        for future in list(pending):
+            if future.cancel():
+                pending.pop(future, None)
+
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=int(params["concurrency"])) as pool:
-            futures = {pool.submit(execute, item): item for item in work}
-            for future in concurrent.futures.as_completed(futures):
-                task, pass_idx = futures[future]
+        top_up()
+        while pending:
+            done, _ = concurrent.futures.wait(
+                list(pending), return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in done:
+                task, pass_idx = pending.pop(future)
+                if future.cancelled():
+                    continue
                 try:
                     record = future.result()
+                except concurrent.futures.CancelledError:
+                    continue
                 except Exception as exc:  # noqa: BLE001 — never lose an attempt record
                     record = _fallback_record(ctx, task, pass_idx, exc)
                 writer.append(record)
@@ -1957,8 +2086,24 @@ def cmd_run(args: argparse.Namespace) -> int:
                     f"{record['wall_clock_ms'] // 1000}s iters={record['iterations']} "
                     f"tok={record['tokens']['total']}"
                 )
+            if _STOP.is_set():
+                drain_queue()
+            else:
+                top_up()
     finally:
+        if _STOP.is_set():
+            drain_queue()
+        pool.shutdown(wait=True)
         writer.close()
+        # Nothing under the scratch root outlives the run: each attempt removes its own
+        # workspace, this removes the (empty) run-scoped tree and anything an abort left.
+        shutil.rmtree(scratch_root, ignore_errors=True)
+
+    if _STOP.is_set() and written < planned:
+        stderr(
+            f"==> stopped: {planned - written} attempt(s) were not executed; "
+            f"re-run with --resume {run_id} to finish them"
+        )
 
     ended_at = utcnow()
     scored = sum(count for code, count in counters.items() if not code.startswith("INFRA_"))
@@ -2007,6 +2152,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 def _fallback_record(ctx: RunContext, task: Any, pass_idx: int, exc: BaseException) -> dict:
     """A record must exist for every planned attempt, even when run_attempt itself died."""
     now = iso(utcnow())
+    base_seed = int(ctx.params["seed"])
     return {
         "schema": "raw-result/v1",
         "run_id": ctx.run_id,
@@ -2016,6 +2162,12 @@ def _fallback_record(ctx: RunContext, task: Any, pass_idx: int, exc: BaseExcepti
         "partition": ctx.partition_of(task),
         "model": ctx.model,
         "pass_idx": pass_idx,
+        "sampling": {
+            "base_seed": base_seed,
+            "seed": attempt_seed(base_seed, pass_idx),
+            "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
+            "temperature": ctx.params["temperature"],
+        },
         "started_at": now,
         "ended_at": now,
         "wall_clock_ms": 0,
@@ -2216,7 +2368,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="file of instance ids (one per line) to run — how run.sh resumes a pass",
     )
     run_p.add_argument("--consent-class", default=None, choices=["public", "restricted"])
-    run_p.add_argument("--scratch", default=None, help="root for per-attempt workspaces")
+    run_p.add_argument(
+        "--scratch",
+        default=None,
+        help="root for per-attempt workspaces (a <run_id>/ subdirectory is created under "
+        "it and removed when the run ends); default $HARNESS_SCRATCH else a temp dir. "
+        "Never point this inside the run directory: workspaces would be packaged into "
+        "the run bundle.",
+    )
     run_p.add_argument("--summary-out", default=None, help="write the JSON run summary here")
     run_p.add_argument("--no-preflight", action="store_true", help="skip the GET /models check")
     add_knob_flags(run_p)

@@ -19,8 +19,23 @@
 #
 # Headline metric is cost per resolved task (CONTRACTS.md §8). GPU-served models are priced
 # from the manifest price snapshot × instance-hours; API-baseline models are priced per token
-# from --api-pricing. Runs whose harness version or prompt hash differ are REFUSED unless
-# --allow-mixed is passed, and then every output is loudly annotated.
+# from --api-pricing. Runs that differ in ANY verdict-affecting harness knob (version, prompt
+# hash/template, agent config, adapter version, grading environment digest, sampling params,
+# iteration/token budgets, max_model_len, task timeout) are REFUSED unless --allow-mixed is
+# passed, and then every output is loudly annotated.
+#
+# Two independent manifest flags gate inclusion (CONTRACTS.md §2.2):
+#   flags.nonconformant         — a genuine harness deviation that breaks comparability
+#                                 (non-default budget, dirty repo, unresolved weight revision,
+#                                 prompt/template drift). EXCLUDED by default;
+#                                 --include-nonconformant overrides.
+#   flags.provenance_incomplete — cost/provenance attribution is imprecise but the science is
+#                                 intact (missing instance id/region, fallback pricing,
+#                                 unresolved lock hash). INCLUDED by default; the cost columns
+#                                 for the affected groups are annotated approximate (≈) and the
+#                                 unresolved fields are listed per run.
+# A pre-split manifest that carries only the old single `nonconformant` flag is treated as
+# nonconformant (the conservative reading) and is called out as legacy wherever it appears.
 #
 # Exit codes: 0 ok · 1 usage · 2 validation/comparability refusal · 3 missing or unreadable input
 #
@@ -156,7 +171,14 @@ def mean_or_none(values: list[float]):
     return _mean(values) if values else None
 
 
-def bootstrap_ci_over_passes(pass_rates: list[float], iters: int, alpha: float = 0.05):
+def bootstrap_ci_over_passes(pass_rates, iters, alpha: float = 0.05):
+    """RETIRED 2026-08-30 — kept for reference only; do not call.
+
+    Bootstrapping across passes assumes the passes are independent draws. They are not:
+    the study decodes greedily at temperature 0.0 with one held-constant seed, so the
+    passes differ only by serving nondeterminism. Report the observed range instead.
+    Re-enable this ONLY together with temperature > 0 and a per-pass seed.
+    """
     """Percentile bootstrap of the mean pass-level resolve rate (CONTRACTS.md §8).
 
     With only 3 passes this interval is coarse by construction; the pass min/max range is
@@ -538,6 +560,80 @@ def load_cost_logs(paths: list[Path], diag: Diagnostics) -> dict[str, float]:
     return setup
 
 
+# ---------------------------------------------------------------- manifest flags
+#
+# CONTRACTS.md §2.2. The two flags mean different things and are handled differently:
+# `nonconformant` excludes, `provenance_incomplete` annotates. Both are write-once booleans
+# with an accompanying list of reasons. Manifests written before the split carry only
+# `nonconformant`; those are handled by _LEGACY below.
+
+NONCONFORMANT_REASON_KEYS = (
+    "nonconformant_reasons",
+    "nonconformant_reason",
+)
+PROVENANCE_REASON_KEYS = (
+    "provenance_incomplete_reasons",
+    "provenance_incomplete_reason",
+    "provenance_unresolved",
+    "provenance_unresolved_fields",
+)
+
+_LEGACY_NOTE = (
+    "legacy pre-split manifest: it carries only the old single `nonconformant` flag, which "
+    "conflated harness deviations with provenance gaps — this run is treated as a harness "
+    "deviation (the conservative reading). Re-emit the manifest to separate the two."
+)
+
+
+def _reason_list(flags: dict, keys) -> list:
+    """Collect reason strings from whichever of `keys` the manifest happens to use."""
+    out: list = []
+    for key in keys:
+        val = flags.get(key)
+        if isinstance(val, str):
+            val = [val]
+        if isinstance(val, (list, tuple)):
+            for item in val:
+                text = str(item).strip()
+                if text and text not in out:
+                    out.append(text)
+    return out
+
+
+def flag_state(manifest: dict) -> dict:
+    """Normalise a manifest's conformance flags into the post-split shape.
+
+    Returns keys: nonconformant, nonconformant_reasons, provenance_incomplete,
+    provenance_incomplete_reasons, legacy_single_flag.
+    """
+    flags = manifest.get("flags")
+    if not isinstance(flags, dict):
+        flags = {}
+    legacy = "provenance_incomplete" not in flags
+    nonconformant = bool(flags.get("nonconformant", False))
+    provenance = bool(flags.get("provenance_incomplete", False))
+    n_reasons = _reason_list(flags, NONCONFORMANT_REASON_KEYS)
+    p_reasons = _reason_list(flags, PROVENANCE_REASON_KEYS)
+    if legacy and nonconformant and not n_reasons:
+        # Pre-split run.sh recorded the reasons in `notes` (CONTRACTS.md §2.3).
+        notes = manifest.get("notes")
+        if isinstance(notes, str) and notes.strip():
+            n_reasons = [part.strip() for part in notes.split(";") if part.strip()]
+    if legacy and nonconformant:
+        n_reasons = n_reasons + [_LEGACY_NOTE]
+    return {
+        "nonconformant": nonconformant,
+        "nonconformant_reasons": n_reasons,
+        "provenance_incomplete": provenance,
+        "provenance_incomplete_reasons": p_reasons,
+        "legacy_single_flag": legacy,
+    }
+
+
+def _reasons_suffix(reasons: list) -> str:
+    return (" (" + "; ".join(reasons) + ")") if reasons else ""
+
+
 # ---------------------------------------------------------------- run selection
 
 
@@ -602,94 +698,184 @@ def api_rates_for(manifest: dict, api_pricing: dict):
 
 
 def select_runs(loaded: list[dict], args, diag: Diagnostics):
-    """Split loaded runs into included / excluded per CONTRACTS.md §8 eligibility rules."""
+    """Split loaded runs into included / excluded per CONTRACTS.md §8 eligibility rules.
+
+    `flags.nonconformant` excludes (it means the harness itself deviated, so the run is not
+    comparable). `flags.provenance_incomplete` does NOT exclude — the science is intact and
+    only the cost/provenance attribution is imprecise — but it is recorded so every cost
+    column derived from that run can be annotated approximate.
+    """
     included, excluded = [], []
     for run in loaded:
         m = run["manifest"]
+        fs = flag_state(m)
+        run["flags_state"] = fs
         reasons = []
         status = m.get("status")
         if status != "complete" and not args.include_partial:
             reasons.append(f"status={status!r} (not complete)")
         if dig(m, "flags", "exploratory", default=False) and not args.include_exploratory:
             reasons.append("flags.exploratory=true")
-        if dig(m, "flags", "nonconformant", default=False) and not args.include_nonconformant:
-            reasons.append("flags.nonconformant=true")
+        if fs["nonconformant"] and not args.include_nonconformant:
+            reasons.append("flags.nonconformant=true" + _reasons_suffix(fs["nonconformant_reasons"]))
         if dig(m, "flags", "truncated", default=False) and not args.include_truncated:
             reasons.append("flags.truncated=true")
         if reasons:
             run["exclusion_reasons"] = reasons
             excluded.append(run)
-        else:
-            included.append(run)
+            continue
+        included.append(run)
+        if fs["nonconformant"]:  # only reachable with --include-nonconformant
+            diag.warn(
+                "nonconformant_included",
+                f"{run['run_id']}: flags.nonconformant=true but included via "
+                "--include-nonconformant — this run's harness deviated, the comparison is not "
+                "like-for-like" + _reasons_suffix(fs["nonconformant_reasons"]),
+            )
+        if fs["provenance_incomplete"]:
+            diag.warn(
+                "provenance_incomplete",
+                f"{run['run_id']}: flags.provenance_incomplete=true — included (the science is "
+                "intact) but its cost/provenance attribution is APPROXIMATE. Unresolved: "
+                + (", ".join(fs["provenance_incomplete_reasons"]) or "(no reasons recorded)"),
+            )
     return included, excluded
+
+
+def provenance_notes(runs: list[dict]) -> list[dict]:
+    """One row per included run whose provenance is incomplete, for the report + stderr note."""
+    rows = []
+    for run in runs:
+        fs = run.get("flags_state") or flag_state(run["manifest"])
+        if not fs["provenance_incomplete"]:
+            continue
+        rows.append(
+            {
+                "run_id": run["run_id"],
+                "model": dig(run["manifest"], "model", "name", default="?"),
+                "suite": dig(run["manifest"], "suite", "name", default="?"),
+                "unresolved": fs["provenance_incomplete_reasons"],
+                "price_source": dig(run["manifest"], "price", "source", default=None),
+                "lambda_instance_id": dig(
+                    run["manifest"], "hardware", "lambda_instance_id", default=None
+                ),
+                "region": dig(run["manifest"], "hardware", "region", default=None),
+            }
+        )
+    return rows
 
 
 # ---------------------------------------------------------------- comparability
 
 
+# Every knob that can change a verdict is BLOCKING: mixing it needs an explicit --allow-mixed
+# and is annotated everywhere. "The harness was identical" is the study's central claim, so a
+# silent warning is not an acceptable way to report that it was not (CONTRACTS.md §0.1).
+#
+# (label, manifest path, blocking) — compared across ALL included runs.
+COMPARABILITY_KEYS = (
+    ("harness.version", ("harness", "version"), True),
+    ("harness.prompt_dir_sha256", ("harness", "prompt_dir_sha256"), True),
+    ("harness.prompt_template_id", ("harness", "prompt_template_id"), True),
+    ("harness.agent_config_sha256", ("harness", "agent_config_sha256"), True),
+    # written by harness/manifest.py once the adapters-dir digest lands; absent on older
+    # manifests, which is reported as drift rather than as a violation (see below).
+    ("harness.adapters_dir_sha256", ("harness", "adapters_dir_sha256"), True),
+    ("inference.temperature", ("inference", "temperature"), True),
+    ("inference.top_p", ("inference", "top_p"), True),
+    ("inference.top_k", ("inference", "top_k"), True),
+    ("inference.seed", ("inference", "seed"), True),
+    ("inference.max_iters", ("inference", "max_iters"), True),
+    ("inference.max_tokens", ("inference", "max_tokens"), True),
+    ("inference.max_attempt_tokens", ("inference", "max_attempt_tokens"), True),
+    # --task-timeout is the BUDGET_WALLCLOCK ceiling (§1.2), so it decides verdicts.
+    ("inference.task_timeout_s", ("inference", "task_timeout_s"), True),
+    ("runtime.max_model_len", ("runtime", "max_model_len"), True),
+    ("harness.result_schema", ("harness", "result_schema"), False),
+    # §1.2: concurrency affects throughput and latency percentiles, NOT verdicts.
+    ("inference.concurrency", ("inference", "concurrency"), False),
+    ("inference.passes", ("inference", "passes"), False),
+)
+
+# Compared WITHIN each suite: the adapter and its grading environment are legitimately
+# different between suites, so a global comparison would be meaningless.
+PER_SUITE_KEYS = (
+    ("harness.adapter_version", ("harness", "adapter_version"), True),
+    # written by the adapters once environment_digest() is recorded in the manifest.
+    ("harness.environment_digest", ("harness", "environment_digest"), True),
+    ("harness.adapter_sha256", ("harness", "adapter_sha256"), False),
+    ("suite.instance_ids_sha256", ("suite", "instance_ids_sha256"), False),
+)
+
+
+def _field_values(runs: list[dict], path):
+    """Distinct non-null values for a manifest path, plus the runs that do not record it."""
+    values: list = []
+    absent: list = []
+    for run in runs:
+        val = dig(run["manifest"], *path, default=None)
+        if val is None:
+            absent.append(run["run_id"])
+            continue
+        if val not in values:
+            values.append(val)
+    return values, absent
+
+
 def comparability_report(runs: list[dict], args, diag: Diagnostics) -> dict:
     """The study's central claim is that the harness is constant. Enforce it here."""
+    blocking: list = []
+    soft: list = []
+    fields: list = []
 
-    def distinct(getter):
-        vals = []
-        for run in runs:
-            v = getter(run["manifest"])
-            if v not in vals:
-                vals.append(v)
-        return vals
+    def examine(label, path, is_blocking, scope, subset):
+        values, absent = _field_values(subset, path)
+        entry = {
+            "field": label,
+            "scope": scope,
+            "blocking": bool(is_blocking),
+            "values": values,
+            "not_recorded_by": absent,
+        }
+        fields.append(entry)
+        where = "" if scope == "all runs" else f" within {scope}"
+        if len(values) > 1:
+            msg = f"{label} differs{where} across runs: {values}"
+            (blocking if is_blocking else soft).append(msg)
+        elif absent and values:
+            # Some manifests predate the field. Never a violation on its own — but say so,
+            # because an unrecorded knob is an unverified knob.
+            soft.append(
+                f"{label} is not recorded by {len(absent)} run(s){where} "
+                f"({', '.join(absent[:3])}{'…' if len(absent) > 3 else ''}) — "
+                "the constant could not be verified for them"
+            )
+        elif absent and not values:
+            soft.append(
+                f"{label} is not recorded by any run{where} — the constant could not be verified"
+            )
+        return entry
 
-    harness_versions = distinct(lambda m: dig(m, "harness", "version"))
-    prompt_hashes = distinct(lambda m: dig(m, "harness", "prompt_dir_sha256"))
-    template_ids = distinct(lambda m: dig(m, "harness", "prompt_template_id"))
-    agent_configs = distinct(lambda m: dig(m, "harness", "agent_config_sha256"))
-    result_schemas = distinct(lambda m: dig(m, "harness", "result_schema"))
-    temperatures = distinct(lambda m: dig(m, "inference", "temperature"))
-    top_ps = distinct(lambda m: dig(m, "inference", "top_p"))
-    seeds = distinct(lambda m: dig(m, "inference", "seed"))
-    max_iters = distinct(lambda m: dig(m, "inference", "max_iters"))
-    max_tokens = distinct(lambda m: dig(m, "inference", "max_tokens"))
-    max_model_lens = distinct(lambda m: dig(m, "runtime", "max_model_len"))
-    task_timeouts = distinct(lambda m: dig(m, "inference", "task_timeout_s"))
+    for label, path, is_blocking in COMPARABILITY_KEYS:
+        examine(label, path, is_blocking, "all runs", runs)
+
+    by_suite: dict[str, list] = {}
+    for run in runs:
+        by_suite.setdefault(dig(run["manifest"], "suite", "name", default="?"), []).append(run)
+    for suite in sorted(by_suite):
+        for label, path, is_blocking in PER_SUITE_KEYS:
+            examine(label, path, is_blocking, f"suite {suite}", by_suite[suite])
+
+    # Legacy views, kept because summary.json consumers and render_markdown read them.
+    def vals(label):
+        for entry in fields:
+            if entry["field"] == label and entry["scope"] == "all runs":
+                return entry["values"]
+        return []
 
     adapters: dict[str, list] = {}
-    for run in runs:
-        m = run["manifest"]
-        suite = dig(m, "suite", "name", default="?")
-        ver = dig(m, "harness", "adapter_version")
-        adapters.setdefault(suite, [])
-        if ver not in adapters[suite]:
-            adapters[suite].append(ver)
-
-    blocking = []
-    if len(harness_versions) > 1:
-        blocking.append(f"harness.version differs across runs: {harness_versions}")
-    if len(prompt_hashes) > 1:
-        blocking.append(f"harness.prompt_dir_sha256 differs across runs: {prompt_hashes}")
-
-    soft = []
-    if len(template_ids) > 1:
-        soft.append(f"prompt_template_id differs: {template_ids}")
-    if len(agent_configs) > 1:
-        soft.append(f"agent_config_sha256 differs: {agent_configs}")
-    if len(result_schemas) > 1:
-        soft.append(f"result_schema differs: {result_schemas}")
-    if len(temperatures) > 1:
-        soft.append(f"inference.temperature differs: {temperatures}")
-    if len(top_ps) > 1:
-        soft.append(f"inference.top_p differs: {top_ps}")
-    if len(seeds) > 1:
-        soft.append(f"inference.seed differs: {seeds}")
-    if len(max_iters) > 1:
-        soft.append(f"inference.max_iters differs: {max_iters}")
-    if len(max_tokens) > 1:
-        soft.append(f"inference.max_tokens differs: {max_tokens}")
-    if len(max_model_lens) > 1:
-        soft.append(f"runtime.max_model_len differs: {max_model_lens}")
-    if len(task_timeouts) > 1:
-        soft.append(f"inference.task_timeout_s differs: {task_timeouts}")
-    for suite, vers in sorted(adapters.items()):
-        if len(vers) > 1:
-            soft.append(f"adapter_version differs within suite {suite}: {vers}")
+    for suite, suite_runs in by_suite.items():
+        adapters[suite] = _field_values(suite_runs, ("harness", "adapter_version"))[0]
 
     mixed = bool(blocking)
     for msg in blocking:
@@ -708,20 +894,25 @@ def comparability_report(runs: list[dict], args, diag: Diagnostics) -> dict:
         "allow_mixed": bool(args.allow_mixed),
         "blocking_differences": blocking,
         "soft_differences": soft,
-        "harness_versions": harness_versions,
-        "prompt_dir_sha256": prompt_hashes,
-        "prompt_template_ids": template_ids,
-        "agent_config_sha256": agent_configs,
-        "result_schemas": result_schemas,
+        "fields": fields,
+        "blocking_fields": [e["field"] for e in fields if e["blocking"]],
+        "harness_versions": vals("harness.version"),
+        "prompt_dir_sha256": vals("harness.prompt_dir_sha256"),
+        "prompt_template_ids": vals("harness.prompt_template_id"),
+        "agent_config_sha256": vals("harness.agent_config_sha256"),
+        "adapters_dir_sha256": vals("harness.adapters_dir_sha256"),
+        "result_schemas": vals("harness.result_schema"),
         "inference": {
-            "temperature": temperatures,
-            "top_p": top_ps,
-            "seed": seeds,
-            "max_iters": max_iters,
-            "max_tokens": max_tokens,
-            "task_timeout_s": task_timeouts,
+            "temperature": vals("inference.temperature"),
+            "top_p": vals("inference.top_p"),
+            "top_k": vals("inference.top_k"),
+            "seed": vals("inference.seed"),
+            "max_iters": vals("inference.max_iters"),
+            "max_tokens": vals("inference.max_tokens"),
+            "max_attempt_tokens": vals("inference.max_attempt_tokens"),
+            "task_timeout_s": vals("inference.task_timeout_s"),
         },
-        "runtime": {"max_model_len": max_model_lens},
+        "runtime": {"max_model_len": vals("runtime.max_model_len")},
         "adapter_versions_by_suite": adapters,
     }
 
@@ -789,7 +980,13 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
     pass_at_k = (any_pass_resolved / instances_scored) if instances_scored else None
     all_at_k = (all_pass_resolved / instances_scored) if instances_scored else None
 
-    ci_low, ci_high = bootstrap_ci_over_passes(pass_rates, args.bootstrap_iters)
+    # The passes share one seed at temperature 0.0 (greedy decoding — see
+    # harness/agent.py attempt_seed), so they are NOT independent samples and a bootstrap
+    # over them would report a sampling CI the design cannot support. Report the observed
+    # spread instead: mean + min/max, which is what the study methodology specifies.
+    # The INSTANCE-level cluster bootstrap below stays valid — it resamples instances,
+    # which genuinely were sampled.
+    ci_low, ci_high = (min(pass_rates), max(pass_rates)) if pass_rates else (None, None)
     ci_lo_i, ci_hi_i = bootstrap_ci_over_instances(
         [(v["resolved"], v["scored"]) for v in per_instance.values()], args.bootstrap_iters
     )
@@ -849,7 +1046,18 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
             if f"per-token:{src}" not in cost_sources:
                 cost_sources.append(f"per-token:{src}")
         else:
-            wall_s = dig(m, "timing", "wall_clock_s", default=None)
+            # active_wall_clock_s excludes the idle gap between a --resume's invocations
+            # (CONTRACTS.md §2.2/§8/§9): billing that gap would make the headline metric
+            # depend on when an operator happened to type --resume. Fall back only for
+            # pre-split manifests, and say so.
+            wall_s = dig(m, "timing", "active_wall_clock_s", default=None)
+            if not isinstance(wall_s, (int, float)):
+                wall_s = dig(m, "timing", "wall_clock_s", default=None)
+                if isinstance(wall_s, (int, float)):
+                    diag.warn(
+                        "run %s has no timing.active_wall_clock_s (pre-split manifest); "
+                        "cost uses idle-inclusive wall_clock_s" % run.get("run_id", "?")
+                    )
             cph = run_price_cph(m, diag)
             if isinstance(cph, (int, float)):
                 price_cph_values.append(float(cph))
@@ -890,6 +1098,34 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
         + token_cost_detail["output_usd"]
     )
     cost_usd = hours_cost_usd + token_cost_usd
+
+    # ---- cost-attribution quality. flags.provenance_incomplete does not exclude a run, but
+    # every cost number derived from it is approximate and must be labelled as such (§8).
+    provenance_runs = []
+    for run in runs:
+        fs = run.get("flags_state") or flag_state(run["manifest"])
+        if fs["provenance_incomplete"]:
+            provenance_runs.append(
+                {
+                    "run_id": run["run_id"],
+                    "unresolved": fs["provenance_incomplete_reasons"] or ["(no reasons recorded)"],
+                }
+            )
+    cost_approximate_reasons = [
+        f"{p['run_id']}: " + ", ".join(p["unresolved"]) for p in provenance_runs
+    ]
+    if "instance-hours:attributed-fallback" in cost_sources:
+        cost_approximate_reasons.append(
+            "cost fell back to summing per-attempt cost.usd for at least one run "
+            "(under-counts idle instance time)"
+        )
+    cost_approximate = bool(cost_approximate_reasons)
+    if cost_approximate:
+        diag.warn(
+            "cost_approximate",
+            f"{model}/{suite}: cost columns are APPROXIMATE — "
+            + "; ".join(cost_approximate_reasons),
+        )
 
     attributable_cost = sum(float(dig(r, "cost", "usd", default=0.0) or 0.0) for r in records)
     cost_per_resolved = (
@@ -970,8 +1206,8 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
         "attempts_infra_excluded": len(infra),
         "resolved_attempts": resolved_attempts,
         "resolve_rate": resolve_rate,
-        "resolve_rate_ci95_low": ci_low,
-        "resolve_rate_ci95_high": ci_high,
+        "resolve_rate_pass_min": ci_low,
+        "resolve_rate_pass_max": ci_high,
         "resolve_rate_ci95_low_instance_bootstrap": ci_lo_i,
         "resolve_rate_ci95_high_instance_bootstrap": ci_hi_i,
         "pass_rate_mean": mean_or_none(pass_rates),
@@ -985,6 +1221,9 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
         "billing_mode": billing_mode,
         "cost_sources": cost_sources,
         "cost_known": cost_known,
+        "cost_approximate": cost_approximate,
+        "cost_approximate_reasons": cost_approximate_reasons,
+        "provenance_incomplete_runs": provenance_runs,
         "gpu_hours": gpu_hours if billing_mode != "per_token" else None,
         "effective_cents_per_hour": sorted(set(price_cph_values)) or None,
         "cost_usd": cost_usd if cost_known else None,
@@ -1023,6 +1262,7 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
             "nonconformant_any": any(
                 dig(run["manifest"], "flags", "nonconformant", default=False) for run in runs
             ),
+            "provenance_incomplete_any": bool(provenance_runs),
             "consent_classes": sorted(
                 {dig(run["manifest"], "flags", "consent_class", default="unknown") for run in runs}
             ),
@@ -1053,6 +1293,7 @@ def rollup_by_model(groups: list[dict]) -> list[dict]:
                 "setup_cost_usd": sum(g["setup_cost_usd"] or 0.0 for g in gs) or None,
                 "gpu_hours": sum(g["gpu_hours"] or 0.0 for g in gs) or None,
                 "billing_modes": sorted({g["billing_mode"] for g in gs}),
+                "cost_approximate": any(g["cost_approximate"] for g in gs),
             }
         )
     return rows
@@ -1112,6 +1353,14 @@ def fmt_num(x, digits=0):
     return f"{x:,.{digits}f}"
 
 
+def fmt_usd_approx(x, approximate: bool, digits=2):
+    """Cost cell. A run flagged provenance_incomplete makes its group's costs approximate."""
+    text = fmt_usd(x, digits)
+    if approximate and text != "—":
+        return "≈" + text
+    return text
+
+
 def fmt_delta_pct(x, digits=1):
     if x is None:
         return "—"
@@ -1149,27 +1398,44 @@ def render_markdown(report: dict) -> str:
         a("> ## MIXED-HARNESS AGGREGATE — NOT PUBLISHABLE AS A LIKE-FOR-LIKE COMPARISON\n>")
         a(
             "> These runs do **not** share one harness. The study's central claim is that the "
-            "harness is the control variable; it does not hold for this table.\n>"
+            "harness is the control variable; it does not hold for this table. Every knob below "
+            "parameterises a verdict, so a difference in any one of them makes the numbers "
+            "incomparable — not merely noisy.\n>"
         )
         for msg in comp["blocking_differences"]:
             a(f"> - {msg}")
         a(">\n> Produced only because `--allow-mixed` was passed.\n")
 
     a("## Harness constants\n")
-    const_rows = [
-        ["harness version", ", ".join(str(v) for v in comp["harness_versions"])],
-        ["prompt dir sha256", ", ".join(str(v)[:16] for v in comp["prompt_dir_sha256"])],
-        ["prompt template id", ", ".join(str(v) for v in comp["prompt_template_ids"])],
-        ["agent config sha256", ", ".join(str(v)[:16] for v in comp["agent_config_sha256"])],
-        ["temperature", ", ".join(str(v) for v in comp["inference"]["temperature"])],
-        ["top_p", ", ".join(str(v) for v in comp["inference"]["top_p"])],
-        ["sampling seed", ", ".join(str(v) for v in comp["inference"]["seed"])],
-        ["max_iters", ", ".join(str(v) for v in comp["inference"]["max_iters"])],
-        ["max_tokens", ", ".join(str(v) for v in comp["inference"]["max_tokens"])],
-        ["max_model_len", ", ".join(str(v) for v in comp["runtime"]["max_model_len"])],
-        ["task timeout (s)", ", ".join(str(v) for v in comp["inference"]["task_timeout_s"])],
-    ]
-    a(md_table(["constant", "value(s) across included runs"], const_rows))
+    a(
+        "Every row marked **blocking** is a verdict-affecting knob: if it is not a single value "
+        "across the included runs, `aggregate.py` refuses to aggregate without `--allow-mixed`.\n"
+    )
+
+    def _short(value) -> str:
+        """Abbreviate digests so the table stays readable; leave everything else alone."""
+        text = str(value)
+        prefix = "sha256:" if text.startswith("sha256:") else ""
+        body = text[len(prefix):]
+        if len(body) == 64 and all(c in "0123456789abcdef" for c in body.lower()):
+            return prefix + body[:16] + "…"
+        return text
+
+    const_rows = []
+    for entry in comp.get("fields", []):
+        values = ", ".join(_short(v) for v in entry["values"]) or "—"
+        note = ""
+        if entry["not_recorded_by"]:
+            note = f" _(not recorded by {len(entry['not_recorded_by'])} run(s))_"
+        const_rows.append(
+            [
+                entry["field"],
+                entry["scope"],
+                "blocking" if entry["blocking"] else "soft",
+                values + note,
+            ]
+        )
+    a(md_table(["constant", "compared over", "mixing", "value(s)"], const_rows))
 
     if comp["soft_differences"]:
         a("**Comparability drift detected (non-blocking):**\n")
@@ -1192,6 +1458,7 @@ def render_markdown(report: dict) -> str:
             g["cost_per_resolved_usd"] if g["cost_per_resolved_usd"] is not None else 0.0,
         ),
     ):
+        approx = g["cost_approximate"]
         headline_rows.append(
             [
                 g["model"],
@@ -1201,9 +1468,9 @@ def render_markdown(report: dict) -> str:
                 str(g["resolved_attempts"]),
                 str(g["attempts_scored"]),
                 fmt_num(g["gpu_hours"], 2) if g["gpu_hours"] is not None else "—",
-                fmt_usd(g["cost_usd"]),
-                f"**{fmt_usd(g['cost_per_resolved_usd'])}**",
-                fmt_usd(g["setup_cost_usd"]),
+                fmt_usd_approx(g["cost_usd"], approx),
+                f"**{fmt_usd_approx(g['cost_per_resolved_usd'], approx)}**",
+                fmt_usd_approx(g["setup_cost_usd"], approx),
             ]
         )
     a(
@@ -1224,13 +1491,44 @@ def render_markdown(report: dict) -> str:
         )
     )
 
+    prov = report.get("provenance_incomplete_runs") or []
+    if prov:
+        a(
+            "**≈ marks approximate cost.** Those groups include at least one run flagged "
+            "`flags.provenance_incomplete`: the run itself is scientifically sound and its "
+            "resolve rate is exact, but part of its cost/provenance attribution could not be "
+            "resolved, so the dollar columns are best-effort. Resolve rates, token counts and "
+            "the failure taxonomy are **not** affected.\n"
+        )
+        a("### Provenance-incomplete runs (included; cost approximate)\n")
+        a(
+            md_table(
+                ["run_id", "model", "suite", "unresolved provenance fields"],
+                [
+                    [
+                        p["run_id"],
+                        p["model"],
+                        SUITE_SHORT.get(p["suite"], p["suite"]),
+                        "; ".join(p["unresolved"]) or "(no reasons recorded)",
+                    ]
+                    for p in prov
+                ],
+            )
+        )
+        a(
+            "_These runs are included by design: `flags.provenance_incomplete` means the cost "
+            "attribution is imprecise, not that the harness deviated. A run whose harness "
+            "actually deviated carries `flags.nonconformant` and is excluded — see \"Runs "
+            "excluded\"._\n"
+        )
+
     # ---- resolution detail
     a("## Resolution rate — mean and range over passes\n")
     res_rows = []
     for g in sorted(groups, key=lambda g: (SUITE_ORDER.index(g["suite"]) if g["suite"] in SUITE_ORDER else 9, g["model"])):
         ci = (
-            f"[{fmt_pct(g['resolve_rate_ci95_low'])}, {fmt_pct(g['resolve_rate_ci95_high'])}]"
-            if g["resolve_rate_ci95_low"] is not None
+            f"[{fmt_pct(g['resolve_rate_pass_min'])}, {fmt_pct(g['resolve_rate_pass_max'])}]"
+            if g["resolve_rate_pass_min"] is not None
             else "—"
         )
         rng = (
@@ -1261,7 +1559,7 @@ def render_markdown(report: dict) -> str:
                 "pooled",
                 "pass@1 (mean)",
                 "pass range",
-                "95% CI (pass bootstrap)",
+                "range over passes",
                 "pass@k (any)",
                 "all passes",
                 "instances",
@@ -1403,9 +1701,9 @@ def render_markdown(report: dict) -> str:
                 str(row["attempts_scored"]),
                 fmt_pct(row["resolve_rate"]),
                 fmt_num(row["gpu_hours"], 2),
-                fmt_usd(row["cost_usd"]),
-                fmt_usd(row["cost_per_resolved_usd"]),
-                fmt_usd(row["setup_cost_usd"]),
+                fmt_usd_approx(row["cost_usd"], row["cost_approximate"]),
+                fmt_usd_approx(row["cost_per_resolved_usd"], row["cost_approximate"]),
+                fmt_usd_approx(row["setup_cost_usd"], row["cost_approximate"]),
             ]
         )
     a(
@@ -1432,12 +1730,13 @@ def render_markdown(report: dict) -> str:
                 str(r["effective_cents_per_hour"] if r["effective_cents_per_hour"] is not None else "—"),
                 (r["weight_digest"] or "—")[:23],
                 r["checksums"],
+                "approx" if r["provenance_incomplete"] else "exact",
             ]
         )
     a(
         md_table(
             ["run_id", "model", "suite", "status", "passes", "records", "wall h", "¢/h",
-             "weight digest", "checksums"],
+             "weight digest", "checksums", "provenance"],
             run_rows,
         )
     )
@@ -1480,10 +1779,11 @@ def csv_by_model_suite(report: dict, path: Path) -> None:
     headers = [
         "model", "suite", "runs", "passes", "instances_scored", "attempts_total",
         "attempts_scored", "attempts_infra_excluded", "resolved_attempts", "resolve_rate",
-        "resolve_rate_ci95_low", "resolve_rate_ci95_high", "pass_rate_mean", "pass_rate_min",
+        "resolve_rate_pass_min", "resolve_rate_pass_max", "pass_rate_mean", "pass_rate_min",
         "pass_rate_max", "pass_at_1", "pass_at_k", "all_passes_resolved_rate", "billing_mode",
         "gpu_hours", "cost_usd", "cost_per_resolved_usd", "cost_per_attempt_usd",
-        "setup_cost_usd", "attempt_wall_s_p50", "attempt_wall_s_p95", "generation_s_p50",
+        "setup_cost_usd", "cost_approximate", "cost_approximate_reasons",
+        "attempt_wall_s_p50", "attempt_wall_s_p95", "generation_s_p50",
         "generation_s_p95", "tokens_prompt_median", "tokens_completion_median",
         "tokens_total_median", "tokens_total_sum", "iterations_median",
         "infra_unknown_share", "server_unavailable_share", "harness_mixed",
@@ -1494,11 +1794,12 @@ def csv_by_model_suite(report: dict, path: Path) -> None:
             [
                 g["model"], g["suite"], g["runs"], g["k"], g["instances_scored"],
                 g["attempts_total"], g["attempts_scored"], g["attempts_infra_excluded"],
-                g["resolved_attempts"], g["resolve_rate"], g["resolve_rate_ci95_low"],
-                g["resolve_rate_ci95_high"], g["pass_rate_mean"], g["pass_rate_min"],
+                g["resolved_attempts"], g["resolve_rate"], g["resolve_rate_pass_min"],
+                g["resolve_rate_pass_max"], g["pass_rate_mean"], g["pass_rate_min"],
                 g["pass_rate_max"], g["pass_at_1"], g["pass_at_k"], g["all_passes_resolved_rate"],
                 g["billing_mode"], g["gpu_hours"], g["cost_usd"], g["cost_per_resolved_usd"],
-                g["cost_per_attempt_usd"], g["setup_cost_usd"],
+                g["cost_per_attempt_usd"], g["setup_cost_usd"], g["cost_approximate"],
+                "; ".join(g["cost_approximate_reasons"]),
                 g["latency"]["attempt_wall_s_p50"], g["latency"]["attempt_wall_s_p95"],
                 g["latency"]["generation_s_p50"], g["latency"]["generation_s_p95"],
                 g["tokens"]["prompt_median"], g["tokens"]["completion_median"],
@@ -1555,7 +1856,9 @@ def csv_runs(report: dict, path: Path) -> None:
         "run_id", "model", "suite", "status", "passes", "records", "wall_clock_s",
         "effective_cents_per_hour", "billing_mode", "harness_version", "prompt_dir_sha256",
         "adapter_version", "weight_revision", "weight_digest", "repo_git_sha", "instance_type",
-        "region", "lambda_instance_id", "consent_class", "nonconformant", "exploratory",
+        "region", "lambda_instance_id", "consent_class", "nonconformant",
+        "nonconformant_reasons", "provenance_incomplete", "provenance_incomplete_reasons",
+        "legacy_single_flag_manifest", "exploratory",
         "grading_degraded", "checksums", "included", "exclusion_reasons",
     ]
     rows = []
@@ -1567,6 +1870,9 @@ def csv_runs(report: dict, path: Path) -> None:
                 r["harness_version"], r["prompt_dir_sha256"], r["adapter_version"],
                 r["weight_revision"], r["weight_digest"], r["repo_git_sha"], r["instance_type"],
                 r["region"], r["lambda_instance_id"], r["consent_class"], r["nonconformant"],
+                "; ".join(r["nonconformant_reasons"]), r["provenance_incomplete"],
+                "; ".join(r["provenance_incomplete_reasons"]),
+                r["legacy_single_flag_manifest"],
                 r["exploratory"], r["grading_degraded"], r["checksums"], r["included"],
                 "; ".join(r.get("exclusion_reasons", [])),
             ]
@@ -1576,6 +1882,7 @@ def csv_runs(report: dict, path: Path) -> None:
 
 def run_summary_row(run: dict, api_pricing: dict, included: bool) -> dict:
     m = run["manifest"]
+    fs = run.get("flags_state") or flag_state(m)
     wall = dig(m, "timing", "wall_clock_s", default=None)
     return {
         "run_id": run["run_id"],
@@ -1599,7 +1906,11 @@ def run_summary_row(run: dict, api_pricing: dict, included: bool) -> dict:
         "region": dig(m, "hardware", "region", default=None),
         "lambda_instance_id": dig(m, "hardware", "lambda_instance_id", default=None),
         "consent_class": dig(m, "flags", "consent_class", default=None),
-        "nonconformant": dig(m, "flags", "nonconformant", default=False),
+        "nonconformant": fs["nonconformant"],
+        "nonconformant_reasons": fs["nonconformant_reasons"],
+        "provenance_incomplete": fs["provenance_incomplete"],
+        "provenance_incomplete_reasons": fs["provenance_incomplete_reasons"],
+        "legacy_single_flag_manifest": fs["legacy_single_flag"],
         "exploratory": dig(m, "flags", "exploratory", default=False),
         "grading_degraded": dig(m, "flags", "grading_degraded", default=False),
         "checksums": run.get("checksums", "unknown"),
@@ -1658,7 +1969,10 @@ def build_parser() -> argparse.ArgumentParser:
     beh.add_argument("--include-exploratory", action="store_true",
                      help="include runs flagged exploratory (--limit/--instance debug runs)")
     beh.add_argument("--include-nonconformant", action="store_true",
-                     help="include runs flagged nonconformant")
+                     help="include runs flagged nonconformant — a genuine harness deviation "
+                          "(non-default budget, dirty repo, unresolved weight revision, prompt "
+                          "drift). Runs flagged only provenance_incomplete are ALWAYS included; "
+                          "their cost columns are annotated approximate instead")
     beh.add_argument("--include-truncated", action="store_true",
                      help="include runs whose instance list was truncated")
     beh.add_argument("--no-verify-checksums", action="store_true",
@@ -1762,6 +2076,34 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 2
 
+    # A cost-log line keyed by something that is not a harness run_id joins to nothing and
+    # would otherwise vanish silently (the CI ledger used to be keyed by the GitHub run id).
+    unmatched = sorted(set(setup_costs) - {run["run_id"] for run in loaded})
+    if unmatched:
+        diag.warn(
+            "cost_log_run_id_unmatched",
+            "cost log carries setup cost for {} run_id(s) that match no manifest given here "
+            "({}{}) — if these are not harness run_ids of the form "
+            "<model>__<suite>__<ts>__<hex>, the ledger is keyed wrong and no setup cost will "
+            "ever be attributed".format(
+                len(unmatched),
+                ", ".join(unmatched[:3]),
+                "…" if len(unmatched) > 3 else "",
+            ),
+        )
+
+    # flags.provenance_incomplete does not exclude — say plainly what stayed in and why.
+    provenance_rows = provenance_notes(included)
+    if provenance_rows:
+        print(
+            f"==> {len(provenance_rows)} included run(s) carry flags.provenance_incomplete: the "
+            "science is intact, the cost columns for their groups are APPROXIMATE (≈).",
+            file=sys.stderr,
+        )
+        for row in provenance_rows:
+            unresolved = ", ".join(row["unresolved"]) or "(no reasons recorded)"
+            print(f"    {row['run_id']}: unresolved {unresolved}", file=sys.stderr)
+
     comparability = comparability_report(included, args, diag)
     if diag.errors:
         for e in diag.errors:
@@ -1805,6 +2147,7 @@ def main(argv: list[str]) -> int:
             "include_exploratory": bool(args.include_exploratory),
             "include_nonconformant": bool(args.include_nonconformant),
             "include_truncated": bool(args.include_truncated),
+            "provenance_incomplete_policy": "included; cost columns annotated approximate",
             "bootstrap_iters": args.bootstrap_iters,
             "bootstrap_seed": BOOTSTRAP_SEED,
             "contamination_threshold": args.contamination_threshold,
@@ -1824,6 +2167,7 @@ def main(argv: list[str]) -> int:
             dict(run_summary_row(r, api_pricing, False), exclusion_reasons=r["exclusion_reasons"])
             for r in excluded
         ],
+        "provenance_incomplete_runs": provenance_rows,
         "by_model_suite": groups,
         "by_model": rollup_by_model(groups),
         "contamination": contamination_view(groups, args.contamination_threshold),
@@ -1854,8 +2198,14 @@ def main(argv: list[str]) -> int:
         print(f"==> warning: {w['message']}", file=sys.stderr)
     if comparability["mixed"]:
         print(
-            "==> MIXED-HARNESS AGGREGATE: outputs are annotated; do not publish as a "
-            "like-for-like comparison",
+            "==> MIXED-HARNESS AGGREGATE: a verdict-affecting knob differs across runs; outputs "
+            "are annotated; do not publish as a like-for-like comparison",
+            file=sys.stderr,
+        )
+    if any(g["cost_approximate"] for g in groups):
+        print(
+            "==> cost columns marked ≈ are approximate (provenance_incomplete runs included by "
+            "design); resolve rates and token counts are exact",
             file=sys.stderr,
         )
 

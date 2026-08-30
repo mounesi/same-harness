@@ -83,27 +83,72 @@ Included by default only when `status == "complete"` and none of `flags.explorat
 `summary.json`, and `runs.csv`. §8 requires reporting the count of nonconformant runs
 excluded; that is what the "Runs excluded" table is.
 
+### `nonconformant` vs `provenance_incomplete`
+
+These are two different failures and the manifest carries them as two independent write-once
+booleans, each with its own list of reasons (CONTRACTS.md §2.2):
+
+| Flag | Means | What `aggregate.py` does |
+|---|---|---|
+| `flags.nonconformant` | a genuine **harness deviation** that breaks comparability: non-default iteration budget, dirty repo, unresolved weight revision, prompt/template drift | **excluded** from every headline number; listed with its reasons under "Runs excluded". `--include-nonconformant` overrides and the run is then flagged in the warnings |
+| `flags.provenance_incomplete` | cost/provenance attribution is **imprecise**, the science is intact: missing `lambda_instance_id` or `region`, fallback pricing, unresolved requirements-lock hash | **included**. Its group's cost columns are prefixed `≈` in `summary.md`, `cost_approximate` / `cost_approximate_reasons` are set in `by_model_suite.csv` and `summary.json`, and the unresolved fields are listed per run in the "Provenance-incomplete runs" table and on stderr |
+
+Resolve rate, pass@k, token counts and the failure taxonomy are **never** affected by
+`provenance_incomplete` — only the dollar columns are, which is why excluding those runs would
+throw away good science to protect a cost estimate.
+
+**Legacy manifests.** A manifest written before the split carries only the old single
+`nonconformant` flag, which conflated the two. Such a run is treated as **nonconformant** (the
+conservative reading) and every message about it says so explicitly, so it can be re-emitted
+rather than silently dropped. Reasons are read from `flags.nonconformant_reasons` /
+`flags.provenance_incomplete_reasons` when present, and from `notes` for legacy manifests.
+
 ## The comparability guard
 
 The study's claim is that the **harness is the control variable**. If the runs being
 aggregated do not share one harness, the comparison is meaningless, so `aggregate.py`
-**refuses to run** (exit 2) when either differs across runs:
+**refuses to run** (exit 2) when **any verdict-affecting knob** differs across runs. A knob
+that can change a verdict is blocking, not a warning — a warning with `mixed = false` and
+exit 0 would let the study's central claim fail quietly.
 
-- `harness.version`
-- `harness.prompt_dir_sha256`
+Compared across **all** included runs:
+
+| Blocking | Why it decides verdicts |
+|---|---|
+| `harness.version` | major bumps are defined as verdict-changing (§ Versioning) |
+| `harness.prompt_dir_sha256` | the prompt text itself |
+| `harness.prompt_template_id` | which template was rendered |
+| `harness.agent_config_sha256` | iteration budget, retry policy, sampling defaults |
+| `harness.adapters_dir_sha256` | the adapter code as a set |
+| `inference.temperature`, `top_p`, `top_k`, `seed` | sampling; §0.1 requires these byte-identical |
+| `inference.max_iters` | the `BUDGET_ITERATIONS` ceiling |
+| `inference.max_tokens`, `max_attempt_tokens` | the `BUDGET_TOKENS` ceiling |
+| `inference.task_timeout_s` | the `BUDGET_WALLCLOCK` ceiling |
+| `runtime.max_model_len` | decides `MODEL_CONTEXT_OVERFLOW` |
+
+Compared **within each suite** (the adapter and its grading environment legitimately differ
+between suites, so a global comparison would be meaningless):
+
+| Blocking | Why |
+|---|---|
+| `harness.adapter_version` | bumped on any grading change (§5) |
+| `harness.environment_digest` | identifies the grading environment |
+
+Soft drift — reported as a warning, promoted to fatal by `--strict` — is
+`harness.result_schema`, `inference.concurrency` (§1.2 says explicitly it does not affect
+verdicts), `inference.passes`, `harness.adapter_sha256`, and `suite.instance_ids_sha256`
+within a suite. A field that some manifests record and others do not is **also** soft, never
+blocking: an unrecorded knob is an unverified knob, not a proven difference. Both cases are
+named in the "Comparability drift" section.
 
 `--allow-mixed` overrides the refusal and then annotates it everywhere: a banner at the top
 of `summary.md`, `comparability.mixed = true` plus the specific differences in
 `summary.json`, a `harness_mixed` column on every CSV row, and a line on stderr. There is no
-quiet way to mix harness versions.
+quiet way to mix a verdict-affecting knob.
 
-Softer drift — `prompt_template_id`, `agent_config_sha256`, `adapter_version` within a suite,
-`temperature`, `top_p`, `seed`, `max_iters`, `max_tokens`, `task_timeout_s`, `max_model_len` —
-is reported as a warning and printed in the "Comparability drift" section. `--strict`
-promotes those to fatal too.
-
-The "Harness constants" table at the top of `summary.md` exists so a reader can see at a
-glance that all of those collapsed to a single value.
+The "Harness constants" table at the top of `summary.md` lists every knob above with its
+scope and whether mixing it is blocking or soft, so a reader can see at a glance that all of
+them collapsed to a single value.
 
 ## Metric definitions
 
@@ -188,8 +233,27 @@ same three keys); the manifest wins over the file.
 **Setup cost is never folded into the headline.** Model download and server warm-up happen
 outside `timing.wall_clock_s`; `--cost-log` reads CI's `cost-log.jsonl` and reports
 `setup_cost_usd` in its own column, per §8, so a large model is not penalised for a one-time
-cache miss. Records are matched by `run_id` and may carry either `setup_cost_usd` /
-`setup_usd`, or `setup_seconds` / `setup_s` / `download_s` plus a cents-per-hour field.
+cache miss. Records are matched by **the harness `run_id`** (`<model>__<suite>__<ts>__<hex>`)
+and may carry either `setup_cost_usd` / `setup_usd`, or `setup_seconds` / `setup_s` /
+`download_s` plus a cents-per-hour field.
+
+`.github/workflows/benchmark.yml` writes that file. It captures the
+`RUN <run_id> <suite> <dir> <status>` lines run.sh prints on stdout and emits **one line per
+harness run**, so the join actually works:
+
+```json
+{"record":"run","run_id":"qwen3-coder-next__swebench-verified__20260830T142211Z__9f3ac1","suite":"swebench-verified","status":"complete","setup_seconds":1180.0,"effective_cents_per_hour":249,"setup_cost_usd":0.816278,"setup_seconds_job_total":1180,"runs_in_job":1,"setup_attribution":"even-split-across-runs-in-job","job_elapsed_seconds":17400,"github_run_id":"19238471234"}
+```
+
+Setup seconds are measured from instance launch to the moment the model is served
+(provision + weight download + vLLM load) and are recorded **separately** from
+`job_elapsed_seconds`, which is the whole billed workflow. `--suite all` produces three runs
+behind one warm-up, so the job's setup seconds are split evenly across them
+(`setup_attribution`) rather than counted three times.
+
+The workflow also appends one `"record":"job"` line per workflow run for billing
+reconciliation. It deliberately carries **no** `run_id` key — the GitHub numeric id is not a
+harness run id and must never be joined to one — so `load_cost_logs` skips it.
 
 `attributable_cost_usd` (the sum of per-attempt `cost.usd`) is carried in `summary.json` as a
 cross-check only — per §3.1 that number is *attributable*, not billed.
@@ -219,7 +283,7 @@ Written to `--out-dir` (default `analysis/tables`):
 
 | File | Contents |
 |---|---|
-| `summary.md` | paste-ready markdown: harness constants, headline, resolution detail, latency/tokens, failure taxonomy, contamination, per-model rollup, run inventory, exclusions, warnings |
+| `summary.md` | paste-ready markdown: harness constants, headline, provenance-incomplete runs, resolution detail, latency/tokens, failure taxonomy, contamination, per-model rollup, run inventory, exclusions, warnings |
 | `summary.json` | schema `aggregate-report/v1` — every number above plus provenance, options, and diagnostics |
 | `by_model_suite.csv` | one row per (model, suite) |
 | `failures.csv` | long form: one row per (model, suite, error_code) over all 18 codes |
@@ -251,12 +315,16 @@ runs contributed counts only.
 ## Options quick reference
 
 ```
---allow-mixed              aggregate across differing harness versions / prompt hashes,
+--allow-mixed              aggregate across a differing verdict-affecting knob (harness
+                           version, prompt/template, agent config, adapter version,
+                           grading environment, sampling, budgets, max_model_len),
                            loudly annotated everywhere
 --strict                   treat soft comparability drift as fatal too
 --include-partial          include runs whose status is not "complete"
 --include-exploratory      include --limit/--instance debug runs
---include-nonconformant    include runs flagged nonconformant
+--include-nonconformant    include runs flagged nonconformant (a harness deviation).
+                           Runs flagged only provenance_incomplete are ALWAYS included;
+                           their cost columns are annotated approximate instead.
 --include-truncated        include runs with a truncated instance list
 --no-verify-checksums      skip SHA256SUMS verification
 --require-checksums        fail when a run has no SHA256SUMS
@@ -272,9 +340,10 @@ runs contributed counts only.
    API-baseline models; the schema above and the billing-mode detection ladder are this
    component's proposal. If the contract later names a different shape, this is the file to
    change.
-2. **`cost-log.jsonl` field names are inferred.** CONTRACTS.md §1.5 reserves the file for CI
-   and does not specify its schema. The reader accepts several plausible key names and skips
-   what it cannot parse; confirm against whatever CI actually writes.
+2. **`cost-log.jsonl` has no schema in CONTRACTS.md.** §1.5 reserves the file for CI and does
+   not specify its contents. The shape above is what `benchmark.yml` now writes and what this
+   reader consumes; the reader still accepts several alternative key names and skips lines it
+   cannot parse. If the contract later specifies the file, both sides change together.
 3. **Several runs of the same (model, suite) are pooled**, with each run's own price applied
    to its own wall clock. Pass slices stay distinct — a pass is `(run_id, pass_idx)`, so
    pooling two 3-pass runs yields six pass slices, not three.

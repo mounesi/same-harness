@@ -100,7 +100,7 @@ Unknown flags are a usage error. Flags are order-independent. `--` terminates fl
 | `0` | ok | Every planned attempt was executed and graded; `results.jsonl` complete; `SHA256SUMS` written; manifest `status = "complete"`. **Tasks failing to resolve is a normal `0`.** |
 | `1` | usage | Bad/missing/conflicting flags. Nothing written. |
 | `2` | config | Unknown model or suite, missing/invalid seed file, seed-file checksum mismatch, partitions file invalid, prompt directory missing. Nothing written. |
-| `3` | preflight | Endpoint unreachable/unhealthy, served model name ≠ `--model`, weights directory missing, provenance value that is `REQUIRED` in §2 could not be resolved. Manifest written with `status = "failed"`. |
+| `3` | preflight | Endpoint unreachable/unhealthy, served model name ≠ `--model`, weights directory missing, provenance value that is `REQUIRED` in §2 could not be resolved, or a grading dependency (docker, the suite's evaluation module) is missing on this host — detected before the first model call; `HARNESS_SKIP_GRADING_PREFLIGHT=1` overrides. Manifest written with `status = "failed"`. |
 | `4` | incomplete | Started, aborted mid-flight (SIGTERM, host loss, unrecoverable server error). `results.jsonl` holds whatever completed; manifest `status = "incomplete"`. Re-runnable with `--resume`. |
 | `5` | grading | More than 2% of attempts ended `INFRA_GRADER`, or the grader environment could not be constructed. Manifest `status = "incomplete"`, `flags.grading_degraded = true`. |
 | `130` | interrupt | SIGINT. Same on-disk state as `4`. |
@@ -147,7 +147,7 @@ stream is teed to `<run_dir>/logs/harness.log`.
       env/pip-freeze.txt
       env/nvidia-smi.txt
       env/model.env               # verbatim copy of models.d/<model>.env
-      env/vllm-args.txt           # the exact argv modelctl used, from .state/vllm.log header
+      env/vllm-args.txt           # the exact argv modelctl used, from $STATE_DIR/vllm-argv (modelctl writes it)
       SHA256SUMS                  # sha256 of every file above except itself; written last
   cost-log.jsonl                  # appended by CI, not by run.sh — reserved, do not touch
 ```
@@ -202,7 +202,9 @@ change between the two writes; `analysis/` may assert this.
     "agent_config_sha256": "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00",
     "adapter": "harness/adapters/swebench_verified.py",
     "adapter_version": "1.0.0",
-    "adapter_sha256": "77c1d0a9f3b8e2461d5a0c9e8b7f6a5d4c3b2a190807060504030201fedcba98"
+    "adapter_sha256": "77c1d0a9f3b8e2461d5a0c9e8b7f6a5d4c3b2a190807060504030201fedcba98",
+    "adapters_dir_sha256": "0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7",
+    "environment_digest": "sha256:5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071829304a"
   },
   "suite": {
     "name": "swebench-verified",
@@ -308,6 +310,8 @@ change between the two writes; `analysis/` may assert this.
     "started_at": "2026-08-30T14:22:11Z",
     "ended_at": "2026-08-30T18:41:57Z",
     "wall_clock_s": 15586,
+    "active_wall_clock_s": 15586,
+    "invocation_count": 1,
     "attempts_planned": 300,
     "attempts_written": 300
   },
@@ -315,6 +319,9 @@ change between the two writes; `analysis/` may assert this.
     "exploratory": false,
     "truncated": false,
     "nonconformant": false,
+    "nonconformant_reasons": [],
+    "provenance_incomplete": false,
+    "provenance_incomplete_reasons": [],
     "grading_degraded": false,
     "resumed_from": null,
     "consent_class": "public"
@@ -326,7 +333,10 @@ change between the two writes; `analysis/` may assert this.
 ### 2.2 Field reference — types and how each value is obtained
 
 `REQUIRED` means: if it cannot be resolved, `run.sh` exits `3`. `BEST-EFFORT` means: fall back to
-`null` (or the documented sentinel) and set `flags.nonconformant = true`.
+`null` (or the documented sentinel) and raise **one of the two degradation flags** defined below —
+`flags.nonconformant` when the gap breaks comparability, `flags.provenance_incomplete` when it only
+makes attribution imprecise. Each field's row says which. Nothing is ever silently degraded: every
+degradation appends a human-readable reason to the matching `flags.*_reasons` list.
 
 **`harness`**
 
@@ -343,6 +353,19 @@ change between the two writes; `analysis/` may assert this.
 | `agent_config_sha256` | hex | sha256 of `harness/agent_config.json` (holds iteration budget, retry policy, sampling defaults) | REQUIRED |
 | `adapter`, `adapter_sha256` | string, hex | path + file sha256 of the suite adapter module | REQUIRED |
 | `adapter_version` | string | module constant `ADAPTER_VERSION` | REQUIRED |
+| `adapters_dir_sha256` | hex \| null | directory digest (§2.4) of **`harness/adapters/`** | REQUIRED (null sets `nonconformant`) |
+| `environment_digest` | `sha256:<hex>` \| null | the selected adapter's `environment_digest()` (§5) | REQUIRED (null sets `nonconformant`) |
+
+`adapter_sha256` alone is not enough to pin grading: for both SWE-bench suites the per-suite module
+is a ~70-line delegating shim, and all task construction, prompt rendering, eval invocation and
+verdict mapping live in `harness/adapters/_swebench.py`, which no per-adapter hash covers. Two runs
+whose `adapters_dir_sha256` differ were **not** graded by the same code and are not comparable, even
+when `adapter_sha256` and `adapter_version` match.
+
+`environment_digest` is the third input that §5.3 requires for a deterministic verdict — grading is
+deterministic given (task, patch, `environment_digest()`), so a manifest that does not record it
+cannot claim its verdicts are reproducible. It is computed once per run, during the manifest build,
+and every `results.jsonl` record's `grade` block carries the same value (§3).
 
 **`suite`**
 
@@ -380,7 +403,8 @@ change between the two writes; `analysis/` may assert this.
    `hf_cache_metadata`
 3. `huggingface_hub.HfApi().model_info(HF_REPO).sha` (needs network; only attempted when
    `HARNESS_ALLOW_NETWORK=1`). → `hf_api`
-4. Literal `"unresolved"`, `flags.nonconformant = true`. → `unresolved`
+4. Literal `"unresolved"`, `flags.nonconformant = true` (which weights ran is a comparability
+   question, not an attribution one). → `unresolved`
 
 **`runtime`**
 
@@ -395,9 +419,20 @@ change between the two writes; `analysis/` may assert this.
 | `nvidia_driver` | string \| null | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` (first line) |
 | `cuda_runtime` | string \| null | `nvidia-smi` header, or `torch.version.cuda` |
 | `pip_freeze_sha256` | hex | sha256 of `env/pip-freeze.txt`, itself `python3 -m pip freeze --all` sorted |
-| `requirements_lock_sha256` | hex \| null | sha256 of `harness/requirements.lock` (fully pinned, hash-pinned) |
+| `requirements_lock_sha256` | hex \| null | sha256 of `harness/requirements.lock` (fully pinned, hash-pinned); `null` sets `flags.provenance_incomplete` |
 | `tensor_parallel_size`, `pipeline_parallel_size`, `max_model_len`, `extra_args`, `multinode` | int/string/bool | sourced from `models.d/<model>.env` with `modelctl`'s defaults (`TP=1 PP=1 MAX_MODEL_LEN=262144 EXTRA_ARGS="" MULTINODE=0`) |
-| `vllm_argv` | string | the `==> launching:` line from `.state/vllm.log` / `modelctl` state; `null` if unavailable |
+| `vllm_argv` | string \| null | the single line `modelctl` writes to `$STATE_DIR/vllm-argv` when it launches the server, copied into `<run_dir>/env/vllm-args.txt`; `null` if unavailable, which sets `flags.provenance_incomplete` |
+
+`max_model_len` is a **held constant** (§0.1), not a per-model knob: `MAX_MODEL_LEN` in
+`models.d/<model>.env` MUST equal `262144`. Any other value sets `flags.nonconformant = true`, on
+exactly the same footing as a non-default `--max-iters` — `models.d/` is precisely the file a future
+contributor would edit per model, so the check lives in the manifest build rather than in review.
+
+`vllm_argv` is the only record of how the server was actually launched, so it must not be silently
+empty: `modelctl` writes `$STATE_DIR/vllm-argv` **before** the launch and deletes it on `stop`, and
+`run.sh` MUST resolve `STATE_DIR` exactly the way `modelctl` does (`$STATE_DIR`, else
+`<repo>/.state`). `modelctl`'s `==> launching:` line goes to its own **stdout**; `vllm.log` only
+ever receives vLLM's own redirected output, so that log can never be the source of this field.
 
 **`inference`** — every field is read from `harness/agent_config.json` (the single source of truth
 for the held-constant knobs), overridable only by the flags in §1.2. `seed` is the fixed integer
@@ -407,7 +442,9 @@ default and MUST be identical across models.
 **`hardware`**
 
 Resolution ladder, in order: (1) explicit env exported by CI; (2) `~/.harness/instance.json`
-written by CI; (3) local probes; (4) `null` + `flags.nonconformant`.
+written by CI; (3) local probes; (4) `null` + `flags.provenance_incomplete` — a missing instance id
+or region costs us billing reconciliation, not comparability, so such runs stay in the aggregate
+with their cost columns annotated as approximate.
 
 | Field | Source |
 |---|---|
@@ -439,7 +476,11 @@ Ladder: (1) `$HARNESS_PRICE_SNAPSHOT` pointing at a JSON file of the shape below
 the runner *before* launch, where `LAMBDA_API_KEY` lives, and scps it over); (2) run
 `./lambdactl types` locally if the binary and `LAMBDA_API_KEY` are present, parsing the
 `<name> $<price>/hr <regions>` line for `instance_type`; (3) `pricing/fallback-prices.json`
-committed in the repo, with `source: "static-fallback"` and `flags.nonconformant = true`.
+committed in the repo, with `source: "static-fallback"` and `flags.provenance_incomplete = true`
+(the price is approximate; the verdicts are not affected).
+
+`regions_with_capacity` is context only, and is `[]` — never `["—"]` — when no region has capacity:
+`lambdactl types` renders "no capacity" as an em dash, which is a display artifact, not a region.
 
 ```json
 {
@@ -454,16 +495,51 @@ committed in the repo, with `source: "static-fallback"` and `flags.nonconformant
 }
 ```
 
+**`timing`**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `started_at` | ISO-8601 UTC | when the **first** invocation of this run started. A `--resume` reuses the manifest, so this is never rewritten. |
+| `ended_at` | ISO-8601 UTC \| null | when the most recent invocation finalized |
+| `wall_clock_s` | int \| null | `ended_at - started_at`. For a resumed run this **includes the idle gap between invocations** (typically hours). Kept for auditing; it is not a cost. |
+| `active_wall_clock_s` | int \| null | sum of one span per invocation: `ended_at - (this invocation's start)` accumulated across resumes. This is the number the headline cost is computed from (§8). Equal to `wall_clock_s` for a run that was never resumed. |
+| `invocation_count` | int | how many `run.sh` invocations contributed to this run; `1` for a run that was never resumed |
+| `attempts_planned` | int | `instance_count * passes` |
+| `attempts_written` | int | unique (instance, pass) records in `results.jsonl` |
+
+The instance is billed for the idle gap too, but that time is not attributable to this run's model
+— the GPU was idle, or another run was using it. Charging it to `cost_per_resolved` would make the
+headline metric depend on when an operator happened to type `--resume`, so §8 uses
+`active_wall_clock_s`.
+
 **`flags`**
+
+Two independent degradation flags. They are **not** interchangeable, and conflating them either
+throws away good science or publishes bad science:
 
 | Field | Type | Meaning |
 |---|---|---|
 | `exploratory` | bool | `--limit` / `--instance` used. Excluded from all published numbers. |
 | `truncated` | bool | instance list is not the full seed list |
-| `nonconformant` | bool | something that could break comparability (dirty repo, non-default `--max-iters`, unresolved provenance, fallback pricing). **Set-only, never cleared.** |
+| `nonconformant` | bool | a genuine **harness deviation that breaks comparability**: non-default `--max-iters`, `MAX_MODEL_LEN` ≠ the study constant, dirty (or absent) git work tree, unresolved weight revision or weight digest, unresolved `adapters_dir_sha256` / `environment_digest`, prompt-template drift. **Excluded from aggregation by default.** Set-only, never cleared. |
+| `nonconformant_reasons` | string[] | one human-readable reason per cause, de-duplicated, in the order they were raised. Empty iff `nonconformant == false`. |
+| `provenance_incomplete` | bool | cost/provenance attribution is **imprecise, but the science is intact**: missing `LAMBDA_INSTANCE_ID` / `LAMBDA_REGION` / instance type, fallback (`static-fallback`) pricing, unresolved `requirements_lock_sha256`, unresolved `vllm_version` / `vllm_argv` / docker image digest. **Included in aggregation by default.** Set-only, never cleared. |
+| `provenance_incomplete_reasons` | string[] | as above. Empty iff `provenance_incomplete == false`. |
 | `grading_degraded` | bool | >2% `INFRA_GRADER` |
-| `resumed_from` | string \| null | prior `run_id` |
+| `resumed_from` | string \| null | the `run_id` this invocation continued (`--resume`). An in-place resume reuses the run id, so this equals `run_id`; what matters to consumers is that a non-null value means `wall_clock_s` includes idle time and `active_wall_clock_s` must be used instead. |
 | `consent_class` | `public` \| `restricted` | `restricted` for `agenttask`. Governs §7 publication rules. |
+
+Rules for both flags:
+
+- **Write-once booleans.** Once raised — by the pre-run manifest write or by finalization — they are
+  never cleared, and a reason is never removed.
+- Every cause appends a reason. A raised flag with an empty reason list is a bug.
+- A cause classified as `nonconformant` is never *also* recorded as provenance: comparability
+  dominates.
+- `analysis/aggregate.py` MUST exclude `nonconformant` runs from headline numbers by default
+  (`--include-nonconformant` to override) and MUST include `provenance_incomplete` runs, annotating
+  their cost columns as approximate and printing which fields were unresolved. Never suppress a run
+  from the headline number because its instance id was missing.
 
 ### 2.3 Manifest invariants
 
@@ -471,6 +547,13 @@ committed in the repo, with `source: "static-fallback"` and `flags.nonconformant
 - `run_id` in the manifest == the run directory name.
 - Every record in `results.jsonl` carries the same `run_id`.
 - Only `status`, `timing.*`, and `flags.*` may differ between the pre-run and post-run write.
+- A `--resume` invocation reuses the manifest **verbatim**: it may only advance `status`,
+  `timing.ended_at` / `wall_clock_s` / `active_wall_clock_s` / `invocation_count` /
+  `attempts_written`, and `flags.*` (including `flags.resumed_from`). It MUST NOT re-resolve
+  provenance — a resumed run is the same run, with the same weights and the same grading code.
+- `harness.environment_digest` MUST equal the `grade.environment_digest` recorded on every
+  `results.jsonl` record of the run (§3). A record that disagrees was graded by a different
+  environment and invalidates the run.
 
 ### 2.4 Directory digest (normative algorithm)
 
@@ -568,6 +651,7 @@ written as attempts complete (order is not significant); consumers MUST sort.
 | `attempt_id` | string | `<run_id 6-hex suffix>-<instance_id>-<pass_idx>`; unique within a run |
 | `partition` | enum | `train` \| `dev` \| `final_holdout` \| `unpartitioned`, resolved from `partitions.json` at load time |
 | `pass_idx` | int | 0-based, `0 <= pass_idx < passes` |
+| `sampling` | object | `{base_seed, seed, seed_derivation, temperature}` — what was actually sent for this attempt. `base_seed` MUST equal the manifest's `inference.seed`. Decoding is greedy (`temperature` 0.0), so `seed == base_seed` for every pass: the passes are not independent samples and MUST be reported as mean + min/max range, never a bootstrap CI over passes. |
 | `wall_clock_ms` | int | `ended_at - started_at`, includes grading |
 | `resolved` | bool | suite-defined success. `resolved == true` **implies** `error_code == "OK"`; the converse does not hold (`OK` + `resolved:false` is impossible — use `TESTS_FAIL`; see §4) |
 | `error_code` | enum | closed enum from §4. Never free text. |
@@ -642,6 +726,15 @@ Adapters and the agent MUST map every exception into one of them; an unmapped ex
 | `INFRA_GRADER` | The grading harness itself crashed, hung, or returned an unparseable verdict. |
 | `INFRA_HOST` | Host-level abort: SIGTERM, instance reaped, disk full, harness process killed. |
 | `INFRA_UNKNOWN` | Uncategorized exception. MUST be triaged before publication. If `INFRA_UNKNOWN` exceeds 2% of attempts, the run is invalid and MUST be re-run. |
+
+`INFRA_GRADER` MUST NOT be how a run discovers that this host cannot grade **at all**. `docker` and
+the suite's evaluation module are otherwise not touched until the first `grade()` call — hours of
+GPU budget into the run — so `run.sh` preflights them before the first model call: it calls the
+selected adapter's `environment_digest()` and checks the grader that digest names, refusing to
+start with exit `3` and an error naming the exact missing dependency (§1.3). The escape hatch is
+`HARNESS_SKIP_GRADING_PREFLIGHT=1`, which turns the refusal into a warning. A run that gets past
+preflight and still produces `INFRA_GRADER` hit a real grader failure — which is what the 2%
+threshold in exit code `5` is there to measure.
 
 ### Denominator rule (normative, used by `analysis/aggregate.py`)
 
@@ -965,7 +1058,7 @@ Computed by `analysis/aggregate.py` per (model, suite), over runs with `status =
 `flags.exploratory == false`:
 
 ```
-gpu_hours          = sum(manifest.timing.wall_clock_s) / 3600          # per model+suite
+gpu_hours          = sum(manifest.timing.active_wall_clock_s) / 3600          # per model+suite
 cost_usd           = gpu_hours * manifest.price.effective_cents_per_hour / 100
 attempts_scored    = count(records where error_code NOT LIKE 'INFRA_%')
 resolved_attempts  = count(records where resolved == true)
@@ -989,6 +1082,17 @@ for a one-time cache miss. State this in the paper.
 - [ ] `bash -n` clean (`run.sh`, `resultsctl`), `python3 -m py_compile` clean (every `.py`)
 - [ ] `run.sh --manifest-only` produces a manifest that validates against §2 with no `null` in a
       `REQUIRED` field, on a machine with no GPU
+- [ ] every degradation lands in exactly one of `flags.nonconformant` / `flags.provenance_incomplete`
+      with a matching reason in `flags.*_reasons`; neither boolean is ever cleared once set
+- [ ] `analysis/aggregate.py` excludes `nonconformant` runs by default, **includes**
+      `provenance_incomplete` runs, and marks their cost columns approximate
+- [ ] `harness.adapters_dir_sha256` and `harness.environment_digest` are non-null on any host that
+      can grade, and change when `harness/adapters/_swebench.py` changes
+- [ ] §8 `gpu_hours` is computed from `timing.active_wall_clock_s`, never `timing.wall_clock_s`; a
+      resumed run (`flags.resumed_from != null`) does not bill the idle gap to `cost_per_resolved`
+- [ ] on a host with no `docker` / no evaluation module, `run.sh` exits `3` **before** the first
+      model call, naming the missing dependency (`HARNESS_SKIP_GRADING_PREFLIGHT=1` to override)
+- [ ] `runtime.vllm_argv` is non-null for a run against a server started by `./modelctl serve`
 - [ ] every `results.jsonl` line validates against §3 and carries an `error_code` from §4
 - [ ] `patch.ref` / `trajectory.ref` are relative and resolve inside the run dir
 - [ ] `resultsctl verify` passes on a freshly packaged bundle

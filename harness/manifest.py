@@ -4,6 +4,7 @@
 #   manifest.py build        ...  resolve every provenance field, write run-manifest.json
 #   manifest.py finalize     ...  rewrite status/timing/flags, write run-status.json
 #   manifest.py prompt-check ...  assert the adapter renders the manifest's template id
+#   manifest.py grading-preflight  refuse (exit 3) when this host cannot grade the suite
 #   manifest.py scan         ...  attempt + failure histogram of results.jsonl (KEY=VALUE)
 #   manifest.py missing      ...  instance ids with no record for a pass (for --resume)
 #   manifest.py checksums    ...  write SHA256SUMS over a run directory
@@ -69,6 +70,11 @@ INFERENCE_DEFAULTS = {
         "retries_count_against_iteration_budget": False,
     },
 }
+
+# CONTRACTS.md §0.1: --max-model-len is a HELD CONSTANT of the study, exactly like the
+# iteration budget. models.d/<model>.env is the file a future contributor edits per model,
+# so the value it carries is checked against this constant on every build.
+STUDY_MAX_MODEL_LEN = 262144
 
 UNRESOLVED = "unresolved"
 
@@ -230,23 +236,58 @@ def cached_dir_digest(root: Path, cache_key: str):
 # ----------------------------------------------------------------------- provenance
 
 class Resolver:
-    """Collects values, remembering which REQUIRED ones could not be resolved and
-    which resolutions cost us comparability."""
+    """Collects values, remembering which REQUIRED ones could not be resolved and how a
+    degraded resolution has to be classified.
+
+    CONTRACTS.md §2.2 keeps these two apart, because conflating them either throws away
+    good science or publishes bad science:
+
+      * ``nonconformant``          — a genuine harness deviation that breaks comparability:
+        dirty repo, non-default ``--max-iters`` or ``MAX_MODEL_LEN``, unresolved weight
+        revision/digest, prompt-template drift.  ``analysis/aggregate.py`` excludes these
+        runs from headline numbers by default.
+      * ``provenance_incomplete``  — the science is intact but cost/provenance attribution
+        is imprecise: missing ``LAMBDA_INSTANCE_ID``/``LAMBDA_REGION``, fallback pricing,
+        an unresolved requirements-lock hash.  Included by default; the cost columns are
+        annotated as approximate and the unresolved fields are named.
+
+    Both are write-once booleans plus a de-duplicated list of reasons.
+    """
 
     def __init__(self, strict: bool):
         self.strict = strict
         self.unresolved = []
-        self.reasons = []
+        self.nonconformant_reasons = []
+        self.provenance_reasons = []
+
+    @property
+    def reasons(self):
+        """Every reason, nonconformant first — what `notes` records."""
+        return list(self.nonconformant_reasons) + list(self.provenance_reasons)
 
     def nonconformant(self, reason: str) -> None:
-        if reason not in self.reasons:
-            self.reasons.append(reason)
+        if reason not in self.nonconformant_reasons:
+            self.nonconformant_reasons.append(reason)
             warn("nonconformant: " + reason)
 
-    def required(self, name: str, value, sentinel=UNRESOLVED):
+    def provenance(self, reason: str) -> None:
+        # A reason already recorded as a comparability break is not downgraded.
+        if reason in self.nonconformant_reasons:
+            return
+        if reason not in self.provenance_reasons:
+            self.provenance_reasons.append(reason)
+            warn("provenance incomplete: " + reason)
+
+    def required(self, name: str, value, sentinel=UNRESOLVED, kind: str = "nonconformant"):
         if value in (None, "", []):
-            self.unresolved.append(name)
-            self.nonconformant("%s unresolved" % name)
+            if kind == "provenance":
+                # A provenance gap degrades cost attribution, not comparability: it must NOT
+                # feed self.unresolved, which cmd_build turns into a hard exit 3. That would
+                # defeat the whole point of splitting the flag.
+                self.provenance("%s unresolved" % name)
+            else:
+                self.unresolved.append(name)
+                self.nonconformant("%s unresolved" % name)
             return sentinel
         return value
 
@@ -402,13 +443,15 @@ def resolve_hardware(res: Resolver, node_count: int):
         used.add("probe")
     hostname = sh(["hostname", "-f"]) or sh(["hostname"]) or platform.node() or None
 
+    # These are cost/provenance attribution, not comparability: the model, the harness and
+    # the grading are unchanged by a missing instance id (CONTRACTS.md §2.2).
     if not instance_type:
-        res.nonconformant("hardware.instance_type unresolved")
+        res.provenance("hardware.instance_type unresolved — the price ladder has no key")
     if not instance_id:
-        res.nonconformant("hardware.lambda_instance_id unresolved — cost cannot be "
-                          "reconciled against Lambda billing")
+        res.provenance("hardware.lambda_instance_id unresolved — cost cannot be "
+                       "reconciled against Lambda billing")
     if not region:
-        res.nonconformant("hardware.region unresolved")
+        res.provenance("hardware.region unresolved")
 
     if "env" in used:
         provenance = "env"
@@ -441,7 +484,7 @@ def resolve_price(repo: Path, instance_type, node_count: int, res: Resolver):
         "node_count": node_count, "effective_cents_per_hour": None,
     }
     if not instance_type:
-        res.nonconformant("price unresolved — no instance type")
+        res.provenance("price unresolved — no instance type")
         return empty
 
     def finish(source, captured_at, cents, regions):
@@ -482,8 +525,12 @@ def resolve_price(repo: Path, instance_type, node_count: int, res: Resolver):
             for line in text.splitlines():
                 m = re.match(r"^(\S+)\s+\$\s*([0-9]+(?:\.[0-9]+)?)/hr\s*(.*)$", line)
                 if m and m.group(1) == instance_type:
-                    regions = [] if m.group(3).strip() in ("", "-") else \
-                        [r.strip() for r in m.group(3).split(",") if r.strip()]
+                    # `lambdactl types` prints an em dash when no region has capacity;
+                    # that means [], not ["—"].
+                    tail = m.group(3).strip()
+                    regions = [] if tail in ("", "-", "\u2014", "none") else \
+                        [r.strip() for r in tail.split(",")
+                         if r.strip() and r.strip() not in ("-", "\u2014")]
                     cents = int(round(float(m.group(2)) * 100))
                     return finish("lambdactl-types", utcnow(), cents, regions)
         warn("./lambdactl types did not report %s" % instance_type)
@@ -492,10 +539,11 @@ def resolve_price(repo: Path, instance_type, node_count: int, res: Resolver):
     if fallback.is_file():
         got = from_snapshot(fallback, "static-fallback")
         if got:
-            res.nonconformant("price came from pricing/fallback-prices.json, not a live snapshot")
+            res.provenance("price came from pricing/fallback-prices.json, not a live "
+                           "snapshot — cost figures are approximate")
             return got
 
-    res.nonconformant("price unresolved for %s" % instance_type)
+    res.provenance("price unresolved for %s — cost cannot be computed" % instance_type)
     return empty
 
 
@@ -531,6 +579,76 @@ def resolve_adapter(repo: Path, suite: str, res: Resolver):
         m = re.search(r"""^ADAPTER_VERSION\s*(?::[^=]+)?=\s*["']([^"']+)["']""", text, re.M)
         version = m.group(1) if m else None
     return rel_path, sha256_file(path), res.required("harness.adapter_version", version)
+
+
+def adapters_dir_digest(repo: Path, res: Resolver):
+    """Directory digest (CONTRACTS.md §2.4) of `harness/adapters/`.
+
+    `harness.adapter_sha256` covers only the suite's own module, and for both SWE-bench
+    suites that module is a ~70-line delegating shim: task construction, prompt rendering,
+    eval invocation and verdict mapping all live in `harness/adapters/_swebench.py`, which
+    no other field hashes. Without this digest an edit to the grading logic between two
+    model runs would be invisible in the manifests, and the two runs would look comparable
+    when they are not.
+    """
+    root = repo / "harness" / "adapters"
+    if not root.is_dir():
+        res.nonconformant("harness/adapters/ is missing — the grading code cannot be digested")
+        return None
+    try:
+        digest, _count, _bytes = dir_digest(root)
+    except (OSError, SymlinkError) as exc:
+        res.nonconformant("harness/adapters/ digest failed (%s) — the grading code is "
+                          "not pinned by this manifest" % exc)
+        return None
+    return digest
+
+
+def load_adapter_module(repo: Path, suite: str):
+    """Import a suite adapter through the §5.4 registry, falling back to the §5.4 table.
+
+    Raises on failure — callers decide whether that is fatal.
+    """
+    import importlib
+
+    added = False
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+        added = True
+    try:
+        try:
+            return importlib.import_module("harness.adapters").get(suite)
+        except (ImportError, AttributeError, KeyError):
+            name = Path(SUITES[suite][0]).stem
+            return importlib.import_module("harness.adapters." + name)
+    finally:
+        if added and sys.path and sys.path[0] == str(repo):
+            sys.path.pop(0)
+
+
+def resolve_environment_digest(repo: Path, suite: str, res: Resolver):
+    """`harness.environment_digest` — the identity of the GRADING environment.
+
+    CONTRACTS.md §5.3 makes `grade()` deterministic only given
+    (task, patch, environment_digest()). Every adapter computes this value; recording it
+    here is what lets two runs be compared at all, and what lets a verdict be reproduced.
+    """
+    try:
+        mod = load_adapter_module(repo, suite)
+        func = getattr(mod, "environment_digest", None)
+        if not callable(func):
+            raise AttributeError("the %s adapter exposes no environment_digest()" % suite)
+        digest = func()
+    except Exception as exc:  # noqa: BLE001 - never crash the manifest write
+        res.nonconformant("harness.environment_digest unresolved (%s: %s) — the grading "
+                          "environment cannot be compared across runs"
+                          % (type(exc).__name__, exc))
+        return None
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
+        res.nonconformant("the %s adapter's environment_digest() returned %r, not "
+                          "'sha256:<hex>'" % (suite, digest))
+        return None
+    return digest
 
 
 def load_seed_file(path: Path, suite: str):
@@ -649,6 +767,8 @@ def cmd_build(args) -> int:
 
     inference_cfg, agent_config_sha = load_agent_config(repo)
     adapter_rel, adapter_sha, adapter_version = resolve_adapter(repo, args.suite, res)
+    adapters_dir_sha = adapters_dir_digest(repo, res)
+    env_digest = resolve_environment_digest(repo, args.suite, res)
 
     invocation = []
     if args.invocation_file:
@@ -693,7 +813,12 @@ def cmd_build(args) -> int:
         warn("weights directory %s does not exist — run: ./modelctl download %s"
              % (weights_dir, args.model))
     elif os.environ.get("HARNESS_SKIP_WEIGHT_DIGEST") == "1":
-        res.nonconformant("weight digest skipped (HARNESS_SKIP_WEIGHT_DIGEST=1)")
+        # Documented escape hatch (run.sh header, CONTRACTS.md §2.2). Skipping the digest
+        # costs comparability, but it MUST NOT turn into an exit-3 preflight failure — so
+        # the sentinel is written here instead of falling through to res.required() below.
+        weight_digest = UNRESOLVED
+        res.nonconformant("weight digest skipped (HARNESS_SKIP_WEIGHT_DIGEST=1) — "
+                          "model.weight_digest is the '%s' sentinel" % UNRESOLVED)
     else:
         try:
             digest, weight_files, weight_bytes = cached_dir_digest(weights_dir, args.model)
@@ -704,23 +829,30 @@ def cmd_build(args) -> int:
             warn("weight digest failed: %s" % exc)
     # REQUIRED: unresolved here means exit 3 in exec mode, but only after the manifest
     # has been written (CONTRACTS.md §1.3).
-    weight_digest = res.required("model.weight_digest", weight_digest)
+    if weight_digest != UNRESOLVED:
+        weight_digest = res.required("model.weight_digest", weight_digest)
 
     weight_revision, weight_revision_source = resolve_weight_revision(weights_dir, hf_repo, res)
 
     # ---- runtime -----------------------------------------------------------
     vllm_version = dist_version("vllm")
     if not vllm_version:
-        res.nonconformant("vllm is not importable here — runtime.vllm_version unresolved")
+        # The server may legitimately live on another host: this is a recording gap, not a
+        # deviation from the held-constant harness.
+        res.provenance("vllm is not importable here — runtime.vllm_version unresolved")
     docker_image = model_env("VLLM_DOCKER_IMAGE").strip() or None
     docker_digest = None
     if docker_image:
         docker_digest = sh(["docker", "inspect", "--format", "{{index .RepoDigests 0}}", docker_image])
         if not docker_digest:
-            res.required("runtime.vllm_docker_image_digest", None, None)
+            res.required("runtime.vllm_docker_image_digest", None, None, kind="provenance")
 
     pip_freeze = run_dir / "env" / "pip-freeze.txt"
     lock = repo / "harness" / "requirements.lock"
+    lock_sha = sha256_file(lock) if lock.is_file() else None
+    if lock_sha is None:
+        res.provenance("harness/requirements.lock is missing — "
+                       "runtime.requirements_lock_sha256 is null")
     multinode = model_env("MULTINODE", "0") == "1"
     node_count = 2 if multinode else 1
 
@@ -730,6 +862,20 @@ def cmd_build(args) -> int:
             return int(raw)
         except ValueError:
             return default
+
+    # CONTRACTS.md §0.1 holds --max-model-len constant across models, exactly like the
+    # iteration budget checked further down. models.d/<model>.env is where a future
+    # contributor would quietly change it per model, so it is checked here.
+    raw_max_model_len = model_env("MAX_MODEL_LEN", "").strip()
+    if raw_max_model_len and not raw_max_model_len.isdigit():
+        res.nonconformant("MAX_MODEL_LEN=%r in models.d/%s.env is not an integer — "
+                          "modelctl would launch with the default %d instead"
+                          % (raw_max_model_len, args.model, STUDY_MAX_MODEL_LEN))
+    max_model_len = as_int("MAX_MODEL_LEN", STUDY_MAX_MODEL_LEN)
+    if max_model_len != STUDY_MAX_MODEL_LEN:
+        res.nonconformant("MAX_MODEL_LEN=%d in models.d/%s.env is not the held-constant "
+                          "context window %d (CONTRACTS.md §0.1)"
+                          % (max_model_len, args.model, STUDY_MAX_MODEL_LEN))
 
     # ---- hardware / price --------------------------------------------------
     hardware, gpu = resolve_hardware(res, node_count)
@@ -745,6 +891,19 @@ def cmd_build(args) -> int:
     if args.max_iters != INFERENCE_DEFAULTS["max_iters"]:
         res.nonconformant("--max-iters %d is not the held-constant budget %d"
                           % (args.max_iters, INFERENCE_DEFAULTS["max_iters"]))
+    # Every knob that can change a verdict is a held constant (CONTRACTS.md §0.1). Checking
+    # only max_iters would let an edited agent_config.json produce a run that claims
+    # flags.nonconformant = false while running a different harness — which is precisely
+    # what the flag exists to prevent. `concurrency` and `passes` are throughput knobs and
+    # are deliberately excluded: they cannot change what a single attempt does.
+    _THROUGHPUT_KNOBS = ("concurrency", "passes", "endpoint")
+    for _key, _want in sorted(INFERENCE_DEFAULTS.items()):
+        if _key in _THROUGHPUT_KNOBS or _key == "max_iters":
+            continue
+        _got = inference.get(_key)
+        if _got != _want:
+            res.nonconformant("inference.%s is %r, not the held-constant %r"
+                              % (_key, _got, _want))
 
     # ---- ci ----------------------------------------------------------------
     in_ci = os.environ.get("GITHUB_ACTIONS") == "true"
@@ -756,6 +915,13 @@ def cmd_build(args) -> int:
         "actor": os.environ.get("GITHUB_ACTOR") or os.environ.get("USER") or None,
         "triggered_at": os.environ.get("HARNESS_TRIGGERED_AT") or None,
     }
+
+    # runtime.vllm_argv is the only record of how the server was actually launched.
+    # modelctl writes it to $STATE_DIR/vllm-argv and run.sh copies it into the run dir.
+    vllm_argv = read_vllm_argv(run_dir)
+    if vllm_argv is None and strict:
+        res.provenance("runtime.vllm_argv unresolved — $STATE_DIR/vllm-argv was not "
+                       "written by modelctl (was the server started another way?)")
 
     consent_class = SUITES[args.suite][2]
     exploratory = bool(args.instance) or args.limit is not None
@@ -779,6 +945,8 @@ def cmd_build(args) -> int:
             "adapter": adapter_rel,
             "adapter_version": adapter_version,
             "adapter_sha256": adapter_sha,
+            "adapters_dir_sha256": adapters_dir_sha,
+            "environment_digest": env_digest,
         },
         "suite": {
             "name": args.suite,
@@ -816,13 +984,13 @@ def cmd_build(args) -> int:
             "nvidia_driver": gpu["driver"],
             "cuda_runtime": gpu["cuda"],
             "pip_freeze_sha256": sha256_file(pip_freeze) if pip_freeze.is_file() else None,
-            "requirements_lock_sha256": sha256_file(lock) if lock.is_file() else None,
+            "requirements_lock_sha256": lock_sha,
             "tensor_parallel_size": as_int("TP", 1),
             "pipeline_parallel_size": as_int("PP", 1),
-            "max_model_len": as_int("MAX_MODEL_LEN", 262144),
+            "max_model_len": max_model_len,
             "extra_args": model_env("EXTRA_ARGS", ""),
             "multinode": multinode,
-            "vllm_argv": read_vllm_argv(run_dir),
+            "vllm_argv": vllm_argv,
         },
         "inference": inference,
         "hardware": hardware,
@@ -831,14 +999,23 @@ def cmd_build(args) -> int:
         "timing": {
             "started_at": created_at,
             "ended_at": None,
+            # wall_clock_s spans started_at..ended_at and therefore includes the idle gap
+            # between a run and its --resume; active_wall_clock_s accumulates one span per
+            # invocation and is what the headline cost uses (CONTRACTS.md §2.2, §8).
             "wall_clock_s": None,
+            "active_wall_clock_s": None,
+            "invocation_count": 1,
             "attempts_planned": len(ids) * args.passes,
             "attempts_written": 0,
         },
         "flags": {
             "exploratory": exploratory,
             "truncated": truncated,
-            "nonconformant": bool(res.reasons),
+            # Two different things, never conflated (CONTRACTS.md §2.2):
+            "nonconformant": bool(res.nonconformant_reasons),
+            "nonconformant_reasons": list(res.nonconformant_reasons),
+            "provenance_incomplete": bool(res.provenance_reasons),
+            "provenance_incomplete_reasons": list(res.provenance_reasons),
             "grading_degraded": False,
             "resumed_from": args.resumed_from or None,
             "consent_class": consent_class,
@@ -857,6 +1034,21 @@ def cmd_build(args) -> int:
 
 
 # ------------------------------------------------------------------------- finalize
+
+def set_flag(flags, bool_key: str, reasons_key: str, reasons=()) -> None:
+    """Write-once boolean plus a de-duplicated reason list (CONTRACTS.md §2.2).
+
+    Never clears: a flag raised by the pre-run manifest write survives finalization.
+    """
+    existing = flags.get(reasons_key)
+    if not isinstance(existing, list):
+        existing = []
+    for reason in reasons:
+        if reason and reason not in existing:
+            existing.append(reason)
+    flags[reasons_key] = existing
+    flags[bool_key] = True
+
 
 def cmd_finalize(args) -> int:
     run_dir = Path(args.run_dir).resolve()
@@ -887,15 +1079,51 @@ def cmd_finalize(args) -> int:
     if started:
         wall = max(0, int((parse_ts(ended) - parse_ts(started)).total_seconds()))
 
+    # A --resume invocation reuses the manifest verbatim, so timing.started_at is the
+    # ORIGINAL start and wall_clock_s spans the idle gap between the two invocations —
+    # hours of it, in the normal case where a run is resumed the next morning. That number
+    # must never reach the headline cost, so active wall clock is accumulated per
+    # invocation and CONTRACTS.md §8 is computed from it.
+    this_started = args.started_at or started
+    span = 0
+    if this_started:
+        span = max(0, int((parse_ts(ended) - parse_ts(this_started)).total_seconds()))
+    prior = manifest["timing"].get("active_wall_clock_s")
+    prior = int(prior) if isinstance(prior, (int, float)) and not isinstance(prior, bool) else 0
+    invocations = manifest["timing"].get("invocation_count")
+    invocations = int(invocations) if isinstance(invocations, int) and invocations > 0 else 1
+
     manifest["status"] = args.status
     manifest["timing"]["started_at"] = started
     manifest["timing"]["ended_at"] = ended
     manifest["timing"]["wall_clock_s"] = wall
+    if args.resumed_from:
+        manifest["timing"]["active_wall_clock_s"] = prior + span
+        manifest["timing"]["invocation_count"] = invocations + 1
+    else:
+        # First (and normally only) invocation: active == this span, and finalizing twice
+        # cannot inflate it.
+        manifest["timing"]["active_wall_clock_s"] = span
+        manifest["timing"]["invocation_count"] = 1
     manifest["timing"]["attempts_written"] = args.attempts_written
+
+    flags = manifest.setdefault("flags", {})
+    flags.setdefault("nonconformant", False)
+    flags.setdefault("nonconformant_reasons", [])
+    flags.setdefault("provenance_incomplete", False)
+    flags.setdefault("provenance_incomplete_reasons", [])
     if args.grading_degraded:
-        manifest["flags"]["grading_degraded"] = True
-    if args.nonconformant:
-        manifest["flags"]["nonconformant"] = True  # set-only, never cleared
+        flags["grading_degraded"] = True
+    if args.nonconformant or args.nonconformant_reason:
+        set_flag(flags, "nonconformant", "nonconformant_reasons", args.nonconformant_reason)
+    if args.provenance_incomplete or args.provenance_reason:
+        set_flag(flags, "provenance_incomplete", "provenance_incomplete_reasons",
+                 args.provenance_reason)
+    if args.resumed_from:
+        # §2.2: the run this invocation continued. An in-place --resume reuses the run id,
+        # so this equals run_id — what matters downstream is that it is not null, because
+        # that is the marker that wall_clock_s includes idle time.
+        flags["resumed_from"] = args.resumed_from
     write_json(path, manifest)
 
     write_json(run_dir / "run-status.json", {
@@ -906,6 +1134,128 @@ def cmd_finalize(args) -> int:
         "started_at": started,
         "ended_at": ended,
     })
+    return 0
+
+
+# ----------------------------------------------------------------- grading preflight
+
+# What each suite's grade() needs on this host. Checked BEFORE the first model call, so a
+# run cannot burn hours of GPU budget only to discover at the first grade() that it can
+# never produce a verdict. Refined at run time from the adapter's own SuiteSpec.
+GRADING_DEPS = {
+    "swebench-verified": {"binaries": ("docker",), "modules": ("swebench",)},
+    "swebench-pro": {"binaries": ("docker",), "modules": ("swebench",)},
+    "agenttask": {"binaries": ("git",), "modules": ()},
+}
+
+BINARY_HINTS = {
+    "docker": "install Docker and make sure `docker version` succeeds as this user — the "
+              "SWE-bench evaluation harness builds one container per instance",
+    "git": "install git — the agenttask grader replays tests inside a git workspace",
+}
+MODULE_HINTS = {
+    "swebench": "python3 -m pip install swebench   (the official evaluation harness)",
+}
+
+SKIP_GRADING_PREFLIGHT = "HARNESS_SKIP_GRADING_PREFLIGHT"
+
+
+def module_available(name: str) -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(name) is not None
+    except Exception:  # noqa: BLE001 - a broken or missing parent package means "no"
+        return False
+
+
+def cmd_grading_preflight(args) -> int:
+    """Refuse to start a run this host could never grade (CONTRACTS.md §1.3 exit 3).
+
+    Calls the selected adapter's environment_digest() — the same call the manifest makes —
+    and checks the binaries and modules grade() will reach for. Prints the digest as
+    KEY=VALUE on stdout; every human word goes to stderr.
+    """
+    import shutil
+
+    repo = Path(args.repo).resolve()
+    suite = args.suite
+
+    if os.environ.get(SKIP_GRADING_PREFLIGHT) == "1":
+        warn("grading preflight skipped (%s=1) — a missing grader will surface as "
+             "INFRA_GRADER / INFRA_SANDBOX on every attempt instead" % SKIP_GRADING_PREFLIGHT)
+        sys.stdout.write("PREFLIGHT_SKIPPED=1\n")
+        return 0
+
+    try:
+        mod = load_adapter_module(repo, suite)
+    except Exception as exc:  # noqa: BLE001
+        die("cannot import the %s adapter (%s: %s) — grading is impossible, so nothing "
+            "was executed" % (suite, type(exc).__name__, exc), 3)
+
+    deps = GRADING_DEPS.get(suite) or {}
+    binaries = list(deps.get("binaries") or ())
+    modules = list(deps.get("modules") or ())
+    missing = []  # (what is missing, how to fix it)
+
+    # The adapter's own SuiteSpec wins over the table above.
+    spec = getattr(mod, "SPEC", None)
+    eval_module = getattr(spec, "eval_module", None) if spec is not None else None
+    if eval_module:
+        modules = [str(eval_module).split(".")[0]]
+        override = None
+        env_fn = getattr(spec, "env", None)
+        if callable(env_fn):
+            try:
+                override = env_fn("EVAL_CMD")
+            except Exception:  # noqa: BLE001
+                override = None
+        if override:
+            # HARNESS_EVAL_CMD[_<SUITE>] replaces `python -m <eval_module>` wholesale.
+            modules = []
+            import shlex
+
+            parts = shlex.split(override)
+            exe = parts[0] if parts else ""
+            if not exe or (shutil.which(exe) is None and not os.path.exists(exe)):
+                missing.append(("the HARNESS_EVAL_CMD override %r is not executable" % exe,
+                                "point HARNESS_EVAL_CMD at a real evaluation entry point"))
+
+    for binary in binaries:
+        if shutil.which(binary) is None:
+            missing.append(("%s (not on PATH)" % binary,
+                            BINARY_HINTS.get(binary, "install %s" % binary)))
+    for module in modules:
+        if not module_available(module):
+            missing.append(("the %s python module (not importable)" % module,
+                            MODULE_HINTS.get(module, "python3 -m pip install %s" % module)))
+
+    if not callable(getattr(mod, "grade", None)):
+        missing.append(("%s.grade()" % suite, "the adapter must expose grade() (§5)"))
+
+    digest = None
+    func = getattr(mod, "environment_digest", None)
+    if not callable(func):
+        missing.append(("%s.environment_digest()" % suite,
+                        "the adapter must expose environment_digest() (§5)"))
+    else:
+        try:
+            digest = func()
+        except Exception as exc:  # noqa: BLE001
+            missing.append(("environment_digest() raised %s: %s" % (type(exc).__name__, exc),
+                            "the grading environment could not be identified"))
+
+    if digest:
+        sys.stdout.write("PREFLIGHT_ENVIRONMENT_DIGEST=%s\n" % digest)
+    if missing:
+        for what, hint in missing:
+            warn("grading preflight: MISSING %s" % what)
+            warn("grading preflight:   fix: %s" % hint)
+        sys.stdout.write("PREFLIGHT_OK=0\n")
+        die("suite '%s' cannot be graded on this host — missing: %s. Nothing was "
+            "executed; fix the dependency or set %s=1 to run anyway."
+            % (suite, "; ".join(what for what, _hint in missing), SKIP_GRADING_PREFLIGHT), 3)
+    sys.stdout.write("PREFLIGHT_OK=1\n")
     return 0
 
 
@@ -1131,7 +1481,16 @@ def main(argv) -> int:
     f.add_argument("--ended-at", default="")
     f.add_argument("--grading-degraded", action="store_true")
     f.add_argument("--nonconformant", action="store_true")
+    f.add_argument("--nonconformant-reason", action="append", default=[])
+    f.add_argument("--provenance-incomplete", action="store_true")
+    f.add_argument("--provenance-reason", action="append", default=[])
+    f.add_argument("--resumed-from", default="")
     f.set_defaults(func=cmd_finalize)
+
+    gp = sub.add_parser("grading-preflight")
+    gp.add_argument("--repo", required=True)
+    gp.add_argument("--suite", required=True, choices=sorted(SUITES))
+    gp.set_defaults(func=cmd_grading_preflight)
 
     p = sub.add_parser("prompt-check")
     p.add_argument("--repo", required=True)

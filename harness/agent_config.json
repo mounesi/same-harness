@@ -6,7 +6,12 @@
     "`inference` changes verdicts -> MAJOR harness version bump, and runs across that bump",
     "are not comparable. `endpoint` is deliberately absent: it is a property of the machine,",
     "not of the experiment, and is resolved by run.sh (--endpoint / $HARNESS_ENDPOINT).",
-    "`agent_config_sha256` in the manifest is the sha256 of this file's bytes."
+    "`agent_config_sha256` in the manifest is the sha256 of this file's bytes.",
+    "`inference.seed` is the BASE seed: the held-constant that goes into the manifest,",
+    "identical for every model, suite and run. The seed actually sent for one attempt is",
+    "`base_seed + pass_idx` (agent.py attempt_seed()), so the passes aggregate.py bootstraps",
+    "over are genuine repeats instead of the same seed re-sent at temperature 0.0. Both",
+    "numbers are recorded per attempt in the record's `sampling` block."
   ],
   "schema": "agent-config/v1",
   "template_id": "agent-v1",
