@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "THE CONTROL VARIABLE. Every knob that could make one model look better than another",
+    "lives here and nowhere else. CONTRACTS.md §2.2: the manifest's `inference` block is",
+    "read from this file, overridable only by the flags in §1.2. Editing anything under",
+    "`inference` changes verdicts -> MAJOR harness version bump, and runs across that bump",
+    "are not comparable. `endpoint` is deliberately absent: it is a property of the machine,",
+    "not of the experiment, and is resolved by run.sh (--endpoint / $HARNESS_ENDPOINT).",
+    "`agent_config_sha256` in the manifest is the sha256 of this file's bytes."
+  ],
+  "schema": "agent-config/v1",
+  "template_id": "agent-v1",
+  "inference": {
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": -1,
+    "seed": 20260830,
+    "max_tokens": 8192,
+    "stop": [],
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "max_iters": 40,
+    "max_attempt_tokens": 600000,
+    "task_timeout_s": 1800,
+    "concurrency": 4,
+    "passes": 3,
+    "retry_policy": {
+      "max_retries": 3,
+      "retry_on": ["http_5xx", "connection_error", "empty_response", "malformed_tool_call"],
+      "backoff": "exponential",
+      "base_delay_s": 2,
+      "max_delay_s": 30,
+      "jitter": false,
+      "retries_count_against_iteration_budget": false
+    }
+  },
+  "loop": {
+    "no_tool_call_limit": 3,
+    "loop_repeat_threshold": 5,
+    "budget_low_warning_at": 5,
+    "max_tool_calls_per_turn": 4,
+    "compaction": {
+      "keep_recent_tool_results": 6,
+      "max_compactions": 2,
+      "elide_over_bytes": 512
+    },
+    "tools": {
+      "command_timeout_default_s": 120,
+      "command_timeout_max_s": 600,
+      "tool_output_max_bytes": 16384,
+      "file_read_max_lines": 400,
+      "search_max_results": 100,
+      "create_file_max_bytes": 262144
+    },
+    "trajectory_content_max_bytes": 8192,
+    "http_timeout_s": 900,
+    "health_check_timeout_s": 15,
+    "send_vllm_sampling_extras": true
+  }
+}

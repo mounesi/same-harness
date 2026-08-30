@@ -1,0 +1,11 @@
+{
+  "schema": "price-snapshot/v1",
+  "captured_at": "2026-08-30T00:00:00Z",
+  "source": "static-fallback (committed; last rung of the CONTRACTS.md 2.2 price ladder)",
+  "note": "Used only when neither $HARNESS_PRICE_SNAPSHOT nor ./lambdactl types can answer. A run priced from this file is marked flags.nonconformant. Refresh from ./lambdactl types and re-commit whenever Lambda list prices change.",
+  "prices": {
+    "gpu_1x_h100_pcie": {"price_cents_per_hour": 249, "regions_with_capacity": []},
+    "gpu_8x_h100_sxm5": {"price_cents_per_hour": 2392, "regions_with_capacity": []},
+    "gpu_8x_b200_sxm6": {"price_cents_per_hour": 3992, "regions_with_capacity": []}
+  }
+}

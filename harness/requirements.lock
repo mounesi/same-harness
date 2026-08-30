@@ -1,0 +1,22 @@
+# Harness runtime dependencies — PINNED (codex invariant 5).
+#
+# The harness itself is stdlib-only; these are needed by the SWE-bench adapters for
+# dataset loading and grading. Their sha256 is recorded in every run manifest as
+# runtime.requirements_lock_sha256, so a dependency change is visible in the audit trail.
+#
+# Install on the GPU instance with:
+#   pip install --require-hashes -r harness/requirements.lock   (once hashes are filled in)
+#   pip install -r harness/requirements.lock                     (until then)
+#
+# vLLM is NOT listed here: it is pinned separately via the VLLM_VERSION repo variable so the
+# serving stack and the harness stack can be upgraded independently, and its resolved
+# dist-info RECORD digest is what the manifest records.
+#
+# TODO(AI-2955): re-resolve on the first provisioned instance and freeze exact versions +
+# --hash entries. The pins below are the intended majors, not verified resolutions.
+
+datasets==3.2.0
+huggingface_hub==0.27.1
+
+# SWE-bench official evaluation harness (grading). Docker is a system prerequisite.
+swebench==3.0.3

@@ -1,0 +1,7 @@
+# Consent guard (AI-2955): only ids and this documentation may live here. Everything else —
+# task records, repo snapshots, hidden tests, patches, trajectories — is customer-derived and
+# must never enter git history. Default-deny, allow by name.
+*
+!.gitignore
+!README.md
+!seed.json

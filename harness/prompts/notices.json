@@ -1,0 +1,9 @@
+{
+  "compaction": "[harness] Older tool output in this conversation has been elided to stay within the context window. Re-read any file or re-run any command whose output you still need.",
+  "empty_response": "[harness] Your previous reply was empty. Continue the task by calling exactly one tool, or call `submit` if the patch is complete.",
+  "loop_detected": "[harness] You have repeated the identical tool call several times in a row and it is not making progress. Change your approach now: inspect a different file, narrow the command, or submit what you have.",
+  "malformed_tool_call": "[harness] Your previous tool call could not be parsed: the arguments were not valid JSON for that tool's schema, or the tool name was not one of the tools provided. Re-issue exactly one well-formed tool call. Do not wrap the JSON in prose or code fences.",
+  "no_tool_call": "[harness] You replied without calling a tool, so nothing happened in the workspace. Call exactly one tool to continue, or call `submit` if the patch is complete and verified.",
+  "tool_output_truncated": "\n[harness] ... output truncated ...",
+  "budget_low": "[harness] Your step budget is nearly exhausted. Stop investigating: make sure the fix is written to disk and call `submit`."
+}

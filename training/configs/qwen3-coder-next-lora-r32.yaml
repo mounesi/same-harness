@@ -1,0 +1,52 @@
+# AI-P153 phase 2 — LoRA fine-tune of qwen3-coder-next on Phase-1 agent trajectories.
+#
+# Consumed by:  ./training/train_lora.sh run training/configs/qwen3-coder-next-lora-r32.yaml
+# Parser:       a small YAML subset — two levels, scalars and [inline, lists], # comments.
+#               No block lists, no anchors, no multi-line strings.
+#
+# EVERY value here lands in the experiment manifest under config.resolved, so the run is
+# reproducible from the manifest alone. Change hyperparameters here, never on the command line.
+
+experiment:
+  name: qwen3-coder-next-lora-r32
+  base_model: qwen3-coder-next      # must be a models.d/<name>.env basename
+  seed: 20260830                    # same seed the benchmark uses
+
+data:
+  # Built by training/build_dataset.py from an EXPLICIT list of Phase-1 run manifests.
+  # Never inside the repo tree: these files carry trajectory text.
+  train_file: /home/ubuntu/harness-data/datasets/train/train.jsonl
+  dataset_manifest: /home/ubuntu/harness-data/datasets/train/dataset-manifest.json
+  eval_file: /home/ubuntu/harness-data/datasets/dev/dev.jsonl
+  max_seq_len: 32768                # trajectories are long; this is the cost/coverage knob
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  quantization: none                # none = LoRA in bf16 | nf4 = QLoRA (4-bit base)
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+train:
+  epochs: 2
+  micro_batch_size: 1               # 8 GPUs x 1 x 8 accum = effective batch 64
+  grad_accum: 8
+  learning_rate: 1e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  optimizer: adamw_torch_fused
+  bf16: true
+  gradient_checkpointing: true
+  flash_attention: true
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+
+runtime:
+  gpus: 8                           # gpu_8x_h100_sxm5
+  launcher: torchrun                # torchrun | accelerate | python
+  entrypoint: axolotl.cli.train     # python module run under the launcher
+  entrypoint_arg_style: positional  # positional | flag (--config)
+  extra_args: ""
+  output_dir: /persistent/experiments

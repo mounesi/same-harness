@@ -1,0 +1,28 @@
+# Raw results never enter git history (CONTRACTS §7.4, codex invariant 2).
+# Consent for the agenttask suite is unresolved — trajectories must not become permanent
+# history before that decision. Enforced mechanically by `./resultsctl verify --git-hygiene`.
+results/
+dist/
+*.tar.gz
+**/trajectories/
+**/results.jsonl
+**/patches/
+**/logs/
+**/env/
+**/workspaces/
+prompt-preview.txt
+
+# Manifests, checksums, aggregate tables and the run index ARE committed — keep them.
+!**/run-manifest.json
+!**/SHA256SUMS
+!index.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local state
+.state/
+.DS_Store

@@ -17,9 +17,11 @@ on:
       suite:
         description: "benchmark suite"
         required: true
-        default: all
+        default: swebench-verified
         type: choice
-        options: [all, swebench-verified, swebench-pro, agenttask]
+        # NOTE: "all" runs three suites sequentially and will not fit the 720m job
+        # ceiling for a large model — dispatch one suite per run instead.
+        options: [swebench-verified, swebench-pro, agenttask, all]
 
 concurrency:
   group: gpu-run            # one GPU run at a time — no accidental double spend
@@ -35,6 +37,7 @@ jobs:
       LAMBDA_FS: ${{ vars.LAMBDA_FS }}
       VLLM_VERSION: ${{ vars.VLLM_VERSION }}
       INSTANCE_NAME: ci-${{ inputs.model }}-${{ github.run_id }}
+      WEIGHTS_DIR: /home/ubuntu/${{ vars.LAMBDA_FS }}/models
     steps:
       - uses: actions/checkout@v4
 
@@ -62,18 +65,43 @@ jobs:
           echo "id=$ID" >> "$GITHUB_OUTPUT"
           echo "ip=$IP" >> "$GITHUB_OUTPUT"
 
+      - name: Ship repo to instance
+        run: |
+          IP=${{ steps.up.outputs.ip }}
+          # the WHOLE checkout: harness/, suites/, pricing/, docs/, resultsctl, and .git —
+          # manifest.py needs `git rev-parse HEAD` for the REQUIRED repo_git_sha field.
+          tar -czf /tmp/repo.tgz --exclude=.github .
+          scp -o StrictHostKeyChecking=accept-new /tmp/repo.tgz "ubuntu@$IP:~/"
+          ssh "ubuntu@$IP" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo"
+
       - name: Provision + serve model
         run: |
           IP=${{ steps.up.outputs.ip }}
-          scp -o StrictHostKeyChecking=accept-new -r modelctl models.d "ubuntu@$IP:~/"
           ssh "ubuntu@$IP" "pip install -q 'vllm==${VLLM_VERSION}' hf_transfer"
-          ssh "ubuntu@$IP" "WEIGHTS_DIR=/home/ubuntu/$LAMBDA_FS/models ./modelctl serve ${{ inputs.model }}"
+          # grading dependencies are pinned in harness/requirements.lock (codex invariant 5)
+          ssh "ubuntu@$IP" "cd ~/harness-repo && pip install -q -r harness/requirements.lock"
+          ssh "ubuntu@$IP" "cd ~/harness-repo && WEIGHTS_DIR=$WEIGHTS_DIR ./modelctl serve ${{ inputs.model }}"
 
       - name: Run harness
+        env:
+          # provenance the manifest requires but cannot discover from inside the instance
+          LAMBDA_INSTANCE_ID: ${{ steps.up.outputs.id }}
+          LAMBDA_INSTANCE_TYPE: ${{ steps.profile.outputs.instance_type }}
         run: |
           IP=${{ steps.up.outputs.ip }}
-          ssh "ubuntu@$IP" "./harness/run.sh --model ${{ inputs.model }} --suite ${{ inputs.suite }} --passes 3 --out ~/results"
-          mkdir -p results && scp -r "ubuntu@$IP:~/results/*" results/
+          ssh "ubuntu@$IP" "cd ~/harness-repo && \
+            WEIGHTS_DIR=$WEIGHTS_DIR \
+            LAMBDA_INSTANCE_ID='${LAMBDA_INSTANCE_ID}' \
+            LAMBDA_INSTANCE_TYPE='${LAMBDA_INSTANCE_TYPE}' \
+            GITHUB_RUN_ID='${{ github.run_id }}' \
+            ./harness/run.sh --model ${{ inputs.model }} --suite ${{ inputs.suite }} --passes 3 --out ~/results"
+
+      - name: Package + push run bundles
+        run: |
+          IP=${{ steps.up.outputs.ip }}
+          # bundle on the instance (immutable tar + SHA-256), then pull manifests/checksums
+          ssh "ubuntu@$IP" "cd ~/harness-repo && ./resultsctl package ~/results" || true
+          mkdir -p results && scp -r "ubuntu@$IP:~/results/*" results/ || true
 
       - name: Tear GPU server down (ALWAYS, by name tag)
         if: always()

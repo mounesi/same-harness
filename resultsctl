@@ -1,0 +1,639 @@
+#!/usr/bin/env bash
+# resultsctl — immutable run-bundle store for "The Harness Variable" (AI-P153).
+# Companion to modelctl/lambdactl: they own the machine and the model, resultsctl owns the results.
+#
+#   ./resultsctl package <run_dir> [--dist DIR] [--force]   verify SHA256SUMS, build a deterministic tarball
+#   ./resultsctl upload  <bundle>  [--force]                push bundle + .sha256 + manifest to object storage
+#   ./resultsctl push    <bundle>  [--force]                alias for upload
+#   ./resultsctl index   <bundle|run_dir> [--uri URI]       append/refresh the run's line in results-index/
+#   ./resultsctl verify  <run_id|bundle|run_dir>            re-check every checksum, end to end
+#   ./resultsctl verify  --git-hygiene [--all]              refuse raw results / restricted content in git
+#   ./resultsctl fetch   <run_id> [dir]                     download + verify + unpack a bundle
+#   ./resultsctl ls                                         list indexed runs (run_id status bundle_uri)
+#
+# Contract: docs/CONTRACTS.md §7.  Exit codes: 0 ok, 1 verification failed, 2 usage/config,
+# 3 object-store error.  stdout is machine-readable only; all chatter goes to stderr.
+#
+# Env:
+#   RESULTS_BUCKET    object-store root: s3://bucket | gs://bucket | <rclone-remote>:bucket
+#   RESULTS_PREFIX    key prefix inside the bucket        (default: agenttask-ai-p153)
+#   RESULTS_ENDPOINT  S3-compatible endpoint URL          (optional, aws cli only)
+#   RESULTS_DIST_DIR  where bundles are built             (default: <out>/dist beside the run dir)
+#   AWS_* / rclone config / gcloud auth as usual — resultsctl never handles credentials itself.
+set -euo pipefail
+
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INDEX_DIR="$BASE_DIR/results-index"
+INDEX_FILE="$INDEX_DIR/index.jsonl"
+RESULTS_PREFIX="${RESULTS_PREFIX:-agenttask-ai-p153}"
+
+EXIT_VERIFY=1
+EXIT_USAGE=2
+EXIT_STORE=3
+
+die()   { echo "error: $*" >&2; exit "$EXIT_USAGE"; }
+dief()  { echo "error: $*" >&2; exit "$EXIT_VERIFY"; }
+dies()  { echo "error: $*" >&2; exit "$EXIT_STORE"; }
+info()  { echo "==> $*" >&2; }
+warn()  { echo "warning: $*" >&2; }
+usage() { sed -n '2,20p' "$0"; exit "$EXIT_USAGE"; }
+
+# ---------------------------------------------------------------- hashing ---
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1;  then shasum -a 256 "$1" | awk '{print $1}'
+  else die "no sha256sum/shasum on PATH"; fi
+}
+
+file_bytes() { wc -c <"$1" | tr -d ' '; }
+
+# verify a sha256sum-format file from inside its own directory
+check_sums_in_dir() { # <dir> <sums-file-name>
+  local dir="$1" sums="$2"
+  (
+    cd "$dir"
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum -c --quiet "$sums"
+    elif command -v shasum >/dev/null 2>&1;  then shasum -a 256 -c "$sums" >/dev/null
+    else echo "no sha256sum/shasum on PATH" >&2; exit 1; fi
+  )
+}
+
+# ------------------------------------------------------------- git safety ---
+
+# Raw trajectories, patches and results must never reach git (CONTRACTS §3, §7.4).
+# A path inside the repo working tree is only acceptable if git itself ignores it.
+assert_writable_outside_git() { # <path> <what>
+  local path="$1" what="$2" abs
+  abs="$(cd "$(dirname "$path")" 2>/dev/null && pwd)/$(basename "$path")" || abs="$path"
+  case "$abs/" in
+    "$BASE_DIR"/*) ;;
+    *) return 0 ;;   # outside the repo entirely: fine
+  esac
+  if command -v git >/dev/null 2>&1 && git -C "$BASE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    if git -C "$BASE_DIR" check-ignore -q "$abs" 2>/dev/null; then return 0; fi
+  fi
+  cat >&2 <<MSG
+error: refusing to write $what into the repository tree:
+         $abs
+       Raw run data (results.jsonl, trajectories/, patches/, bundles) must never enter git.
+       Either write outside $BASE_DIR, or add the path to .gitignore first, e.g.:
+         results/
+         dist/
+         *.tar.gz
+         **/trajectories/
+         **/results.jsonl
+MSG
+  exit "$EXIT_USAGE"
+}
+
+# ---------------------------------------------------------- object storage ---
+
+STORE_TOOL=""
+
+# Detect a client for $RESULTS_BUCKET without exiting; returns non-zero when unavailable.
+store_detect() {
+  STORE_TOOL=""
+  [[ -n "${RESULTS_BUCKET:-}" ]] || return 1
+  case "$RESULTS_BUCKET" in
+    s3://*) if command -v aws    >/dev/null 2>&1; then STORE_TOOL=aws;    fi ;;
+    gs://*) if command -v gsutil >/dev/null 2>&1; then STORE_TOOL=gsutil; fi ;;
+  esac
+  if [[ -z "$STORE_TOOL" ]] && command -v rclone >/dev/null 2>&1; then STORE_TOOL=rclone; fi
+  [[ -n "$STORE_TOOL" ]]
+}
+
+store_require() {
+  if store_detect; then return 0; fi
+  [[ -n "${RESULTS_BUCKET:-}" ]] || dies "RESULTS_BUCKET is not set (e.g. s3://harness-results or myremote:harness-results)"
+  dies "no object-store client on PATH for '$RESULTS_BUCKET' — install one of: aws (s3://), gsutil (gs://), rclone (any remote)"
+}
+
+# aws cli extra args (bash 3.2 compatible: guarded expansion, no arrays-from-stdout)
+AWS_EXTRA=()
+if [[ -n "${RESULTS_ENDPOINT:-}" ]]; then AWS_EXTRA=(--endpoint-url "$RESULTS_ENDPOINT"); fi
+aws_cli() { aws ${AWS_EXTRA[@]+"${AWS_EXTRA[@]}"} "$@"; }
+
+obj_uri() { # <relative key>
+  echo "${RESULTS_BUCKET%/}/$RESULTS_PREFIX/$1"
+}
+
+obj_exists() { # <uri> — non-zero when absent
+  store_require
+  case "$STORE_TOOL" in
+    aws)    aws_cli s3 ls "$1" >/dev/null 2>&1 ;;
+    gsutil) gsutil -q stat "$1" >/dev/null 2>&1 ;;
+    rclone) rclone lsf "$1" >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
+}
+
+obj_put() { # <local file> <uri>
+  store_require
+  info "put $2"
+  case "$STORE_TOOL" in
+    aws)    aws_cli s3 cp "$1" "$2" >&2 || dies "upload failed: $2" ;;
+    gsutil) gsutil cp "$1" "$2" >&2 || dies "upload failed: $2" ;;
+    rclone) rclone copyto "$1" "$2" >&2 || dies "upload failed: $2" ;;
+  esac
+}
+
+obj_get() { # <uri> <local file>
+  store_require
+  info "get $1"
+  case "$STORE_TOOL" in
+    aws)    aws_cli s3 cp "$1" "$2" >&2 || dies "download failed: $1" ;;
+    gsutil) gsutil cp "$1" "$2" >&2 || dies "download failed: $1" ;;
+    rclone) rclone copyto "$1" "$2" >&2 || dies "download failed: $1" ;;
+  esac
+}
+
+bundle_key()   { echo "runs/$1/$2/$3.tar.gz"; }        # <suite> <model> <run_id>
+manifest_key() { echo "manifests/$1.json"; }           # <run_id>
+
+# --------------------------------------------------------------- manifest ---
+
+manifest_field() { # <manifest.json> <dotted.path>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1], encoding="utf-8"))
+cur = doc
+for part in sys.argv[2].split('.'):
+    if not isinstance(cur, dict) or part not in cur:
+        sys.exit(f"missing manifest field: {sys.argv[2]}")
+    cur = cur[part]
+print("" if cur is None else cur)
+PY
+}
+
+# ---------------------------------------------------------------- package ---
+
+deterministic_tar() { # <parent dir> <run_id> <out .tar.gz>
+  local parent="$1" name="$2" out="$3" gnutar="" t
+  for t in gtar tar; do
+    if command -v "$t" >/dev/null 2>&1 && "$t" --version 2>/dev/null | head -1 | grep -qi 'gnu tar'; then
+      gnutar="$t"; break
+    fi
+  done
+  if [[ -n "$gnutar" ]]; then
+    ( cd "$parent" && "$gnutar" --sort=name --format=ustar --owner=0 --group=0 --numeric-owner \
+        --mtime=@0 --exclude-vcs -cf - "$name" ) | gzip -n -9 >"$out"
+  else
+    warn "GNU tar not found — using the python3 tarfile packer (same normalisation, byte-identical to itself)"
+    python3 - "$parent" "$name" "$out" <<'PY'
+import gzip, io, os, sys, tarfile
+parent, name, out = sys.argv[1], sys.argv[2], sys.argv[3]
+root = os.path.join(parent, name)
+paths = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames.sort()
+    for d in dirnames:
+        paths.append(os.path.join(dirpath, d))
+    for f in sorted(filenames):
+        paths.append(os.path.join(dirpath, f))
+paths.append(root)
+paths.sort(key=lambda p: os.path.relpath(p, parent))
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+    for p in paths:
+        arc = os.path.relpath(p, parent)
+        ti = tar.gettarinfo(p, arcname=arc)
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        ti.mtime = 0
+        ti.mode = 0o755 if ti.isdir() else 0o644
+        if ti.isreg():
+            with open(p, "rb") as fh:
+                tar.addfile(ti, fh)
+        else:
+            tar.addfile(ti)
+with open(out, "wb") as fh:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=fh, compresslevel=9, mtime=0) as gz:
+        gz.write(buf.getvalue())
+PY
+  fi
+}
+
+cmd_package() {
+  local run_dir="" dist="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dist)  [[ $# -ge 2 ]] || die "--dist needs a directory"; dist="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      -*)      die "unknown flag '$1'" ;;
+      *)       [[ -z "$run_dir" ]] || die "package takes one run directory"; run_dir="$1"; shift ;;
+    esac
+  done
+  [[ -n "$run_dir" ]] || die "usage: ./resultsctl package <run_dir> [--dist DIR] [--force]"
+  [[ -d "$run_dir" ]] || die "not a directory: $run_dir"
+  run_dir="$(cd "$run_dir" && pwd)"
+  local run_id parent
+  run_id="$(basename "$run_dir")"; parent="$(dirname "$run_dir")"
+
+  local manifest="$run_dir/run-manifest.json"
+  [[ -f "$manifest" ]] || die "$run_id has no run-manifest.json — not a run directory"
+  [[ -f "$run_dir/SHA256SUMS" ]] || die "$run_id has no SHA256SUMS — run.sh did not finish writing it"
+  local mrun_id; mrun_id="$(manifest_field "$manifest" run_id)"
+  [[ "$mrun_id" == "$run_id" ]] || dief "manifest run_id '$mrun_id' != directory name '$run_id'"
+
+  info "verifying SHA256SUMS of $run_id"
+  check_sums_in_dir "$run_dir" SHA256SUMS || dief "$run_id: SHA256SUMS mismatch — refusing to package"
+
+  [[ -n "$dist" ]] || dist="${RESULTS_DIST_DIR:-$(dirname "$parent")/dist}"
+  assert_writable_outside_git "$dist" "bundles"
+  mkdir -p "$dist"
+  dist="$(cd "$dist" && pwd)"
+
+  local bundle="$dist/$run_id.tar.gz"
+  if [[ -e "$bundle" && "$force" != "1" ]]; then
+    die "bundle already exists (bundles are write-once): $bundle — pass --force to rebuild"
+  fi
+
+  info "packaging $run_id -> $bundle"
+  deterministic_tar "$parent" "$run_id" "$bundle.tmp"
+  mv -f "$bundle.tmp" "$bundle"
+  local sum bytes
+  sum="$(sha256_file "$bundle")"; bytes="$(file_bytes "$bundle")"
+  printf '%s  %s\n' "$sum" "$run_id.tar.gz" >"$bundle.sha256"
+  cp "$manifest" "$dist/$run_id.manifest.json"
+  info "packaged $bytes bytes"
+  echo "$bundle $sum $bytes"
+}
+
+# ----------------------------------------------------------------- upload ---
+
+cmd_upload() {
+  local bundle="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      -*)      die "unknown flag '$1'" ;;
+      *)       [[ -z "$bundle" ]] || die "upload takes one bundle"; bundle="$1"; shift ;;
+    esac
+  done
+  [[ -n "$bundle" ]] || die "usage: ./resultsctl upload <bundle.tar.gz> [--force]"
+  [[ -f "$bundle" ]] || die "no such bundle: $bundle"
+  bundle="$(cd "$(dirname "$bundle")" && pwd)/$(basename "$bundle")"
+  local dist run_id
+  dist="$(dirname "$bundle")"; run_id="$(basename "$bundle" .tar.gz)"
+  local manifest="$dist/$run_id.manifest.json" sumfile="$bundle.sha256"
+  [[ -f "$manifest" ]] || die "missing $manifest — re-run ./resultsctl package"
+  [[ -f "$sumfile"  ]] || die "missing $sumfile — re-run ./resultsctl package"
+
+  local recorded actual
+  recorded="$(awk '{print $1}' <"$sumfile")"
+  actual="$(sha256_file "$bundle")"
+  [[ "$recorded" == "$actual" ]] || dief "$run_id: bundle sha256 mismatch (recorded $recorded, actual $actual)"
+
+  local suite model uri
+  suite="$(manifest_field "$manifest" suite.name)"
+  model="$(manifest_field "$manifest" model.name)"
+  uri="$(obj_uri "$(bundle_key "$suite" "$model" "$run_id")")"
+
+  if obj_exists "$uri" && [[ "$force" != "1" ]]; then
+    dies "object already exists (bundles are write-once): $uri — pass --force only to repair a corrupted upload"
+  fi
+  obj_put "$bundle"  "$uri"
+  obj_put "$sumfile" "$uri.sha256"
+  obj_put "$manifest" "$(obj_uri "$(manifest_key "$run_id")")"
+  echo "$uri $actual"
+}
+
+# ------------------------------------------------------------------ index ---
+
+# Build/refresh one index.jsonl line. Reads the run's manifest + results.jsonl.
+index_line() { # <run_dir> <bundle_uri|-> <bundle_bytes|-> <bundle_sha|->
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import hashlib, json, os, sys, datetime
+run_dir, uri, nbytes, bsha = sys.argv[1:5]
+man_path = os.path.join(run_dir, "run-manifest.json")
+man = json.load(open(man_path, encoding="utf-8"))
+records = resolved = scored = 0
+res = os.path.join(run_dir, "results.jsonl")
+if os.path.exists(res):
+    with open(res, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            records += 1
+            code = rec.get("error_code", "INFRA_UNKNOWN")
+            if not str(code).startswith("INFRA_"):
+                scored += 1
+            if rec.get("resolved") is True:
+                resolved += 1
+man_sha = hashlib.sha256(open(man_path, "rb").read()).hexdigest()
+bundle = None
+if uri != "-" or bsha != "-":
+    bundle = {
+        "uri": None if uri == "-" else uri,
+        "bytes": int(nbytes) if nbytes != "-" else None,
+        "sha256": bsha if bsha != "-" else None,
+        "packaged_at": datetime.datetime.now(datetime.timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+run_id = man["run_id"]
+line = {
+    "schema": "run-index/v1",
+    "run_id": run_id,
+    "run_group_id": man.get("run_group_id"),
+    "model": man["model"]["name"],
+    "suite": man["suite"]["name"],
+    "passes": man.get("inference", {}).get("passes"),
+    "status": man.get("status"),
+    "harness_version": man.get("harness", {}).get("version"),
+    "repo_git_sha": man.get("harness", {}).get("repo_git_sha"),
+    "weight_digest": man.get("model", {}).get("weight_digest"),
+    "created_at": man.get("created_at"),
+    "records": records,
+    "resolved": resolved,
+    "attempts_scored": scored,
+    "consent_class": man.get("flags", {}).get("consent_class"),
+    "flags": {
+        "exploratory": man.get("flags", {}).get("exploratory"),
+        "nonconformant": man.get("flags", {}).get("nonconformant"),
+    },
+    "manifest_path": f"results-index/manifests/{run_id}.json",
+    "manifest_sha256": man_sha,
+    "bundle": bundle,
+}
+print(json.dumps(line, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+index_merge() { # <index file> <new line>
+  python3 - "$1" "$2" <<'PY'
+import json, os, sys, tempfile
+path, newline = sys.argv[1], sys.argv[2]
+new = json.loads(newline)
+rows = []
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+rows = [r for r in rows if r.get("run_id") != new["run_id"]]
+rows.append(new)
+rows.sort(key=lambda r: (r.get("created_at") or "", r.get("run_id") or ""))
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    for r in rows:
+        fh.write(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n")
+os.replace(tmp, path)
+PY
+}
+
+cmd_index() {
+  local target="" uri="" tmp="" run_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --uri) [[ $# -ge 2 ]] || die "--uri needs a value"; uri="$2"; shift 2 ;;
+      -*)    die "unknown flag '$1'" ;;
+      *)     [[ -z "$target" ]] || die "index takes one bundle or run directory"; target="$1"; shift ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "usage: ./resultsctl index <bundle|run_dir> [--uri URI]"
+
+  local bundle="" bsha="-" bbytes="-"
+  if [[ -d "$target" ]]; then
+    run_dir="$(cd "$target" && pwd)"
+  elif [[ -f "$target" ]]; then
+    bundle="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+    tmp="$(mktemp -d)"; trap "rm -rf '$tmp'" EXIT
+    info "unpacking $(basename "$bundle") for indexing"
+    tar -xzf "$bundle" -C "$tmp"
+    run_dir="$tmp/$(basename "$bundle" .tar.gz)"
+    [[ -d "$run_dir" ]] || dief "bundle does not contain a top-level $(basename "$bundle" .tar.gz)/ entry"
+    bsha="$(sha256_file "$bundle")"; bbytes="$(file_bytes "$bundle")"
+  else
+    die "no such bundle or run directory: $target"
+  fi
+  [[ -f "$run_dir/run-manifest.json" ]] || die "no run-manifest.json in $run_dir"
+
+  local run_id suite model
+  run_id="$(manifest_field "$run_dir/run-manifest.json" run_id)"
+  suite="$(manifest_field "$run_dir/run-manifest.json" suite.name)"
+  model="$(manifest_field "$run_dir/run-manifest.json" model.name)"
+
+  if [[ -z "$uri" ]] && store_detect; then
+    local candidate; candidate="$(obj_uri "$(bundle_key "$suite" "$model" "$run_id")")"
+    if obj_exists "$candidate"; then uri="$candidate"; else info "not in the object store yet — indexing with bundle.uri = null"; fi
+  fi
+
+  mkdir -p "$INDEX_DIR/manifests" "$INDEX_DIR/checksums"
+  cp "$run_dir/run-manifest.json" "$INDEX_DIR/manifests/$run_id.json"
+  if [[ -n "$bundle" ]]; then
+    printf '%s  %s\n' "$bsha" "$run_id.tar.gz" >"$INDEX_DIR/checksums/$run_id.sha256"
+  elif [[ -f "$run_dir/SHA256SUMS" ]]; then
+    printf '%s  %s\n' "$(sha256_file "$run_dir/SHA256SUMS")" "$run_id/SHA256SUMS" \
+      >"$INDEX_DIR/checksums/$run_id.sha256"
+  fi
+
+  local line; line="$(index_line "$run_dir" "${uri:--}" "$bbytes" "$bsha")"
+  touch "$INDEX_FILE"
+  index_merge "$INDEX_FILE" "$line"
+  echo "$run_id indexed"
+}
+
+index_lookup() { # <run_id> <field: uri|sha256|bytes|suite|model>
+  python3 - "$INDEX_FILE" "$1" "$2" <<'PY'
+import json, os, sys
+path, run_id, field = sys.argv[1:4]
+if not os.path.exists(path):
+    sys.exit(f"no index at {path} — run ./resultsctl index first")
+row = None
+with open(path, encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if line:
+            r = json.loads(line)
+            if r.get("run_id") == run_id:
+                row = r
+if row is None:
+    sys.exit(f"run_id not in index: {run_id}")
+b = row.get("bundle") or {}
+val = {"uri": b.get("uri"), "sha256": b.get("sha256"), "bytes": b.get("bytes"),
+       "suite": row.get("suite"), "model": row.get("model"),
+       "consent_class": row.get("consent_class")}.get(field)
+print("" if val is None else val)
+PY
+}
+
+# ----------------------------------------------------------------- verify ---
+
+verify_refs() { # <run_dir>
+  python3 - "$1" <<'PY'
+import hashlib, json, os, sys
+run_dir = sys.argv[1]
+res = os.path.join(run_dir, "results.jsonl")
+if not os.path.exists(res):
+    print("results.jsonl missing", file=sys.stderr); sys.exit(1)
+bad = 0
+n = 0
+with open(res, encoding="utf-8") as fh:
+    for lineno, line in enumerate(fh, 1):
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        n += 1
+        for key in ("patch", "trajectory"):
+            obj = rec.get(key) or {}
+            ref = obj.get("ref")
+            if not ref:
+                continue
+            if os.path.isabs(ref) or ".." in ref.split("/"):
+                print(f"line {lineno}: {key}.ref must be run-dir-relative: {ref}", file=sys.stderr)
+                bad += 1
+                continue
+            p = os.path.join(run_dir, ref)
+            if not os.path.exists(p):
+                print(f"line {lineno}: missing {key}.ref {ref}", file=sys.stderr); bad += 1; continue
+            want = obj.get("sha256")
+            if want:
+                got = hashlib.sha256(open(p, "rb").read()).hexdigest()
+                if got != want:
+                    print(f"line {lineno}: {ref} sha256 {got} != recorded {want}", file=sys.stderr)
+                    bad += 1
+print(f"checked {n} records", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+}
+
+verify_run_dir() { # <run_dir> <label>
+  local run_dir="$1" label="$2"
+  [[ -f "$run_dir/SHA256SUMS" ]] || dief "$label: no SHA256SUMS"
+  info "$label: checking SHA256SUMS"
+  check_sums_in_dir "$run_dir" SHA256SUMS || dief "$label: SHA256SUMS mismatch"
+  info "$label: checking patch/trajectory refs"
+  verify_refs "$run_dir" || dief "$label: broken or mismatched result references"
+}
+
+cmd_verify_git_hygiene() {
+  local scope="staged" files
+  [[ "${1:-}" == "--all" ]] && scope="tracked"
+  command -v git >/dev/null 2>&1 || die "git not found"
+  git -C "$BASE_DIR" rev-parse --git-dir >/dev/null 2>&1 || die "$BASE_DIR is not a git repository"
+  if [[ "$scope" == "staged" ]]; then
+    files="$(git -C "$BASE_DIR" diff --cached --name-only --diff-filter=ACMR || true)"
+  else
+    files="$(git -C "$BASE_DIR" ls-files || true)"
+  fi
+  local bad=0 f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    case "$f" in
+      results/*|*/results.jsonl|results.jsonl|*/trajectories/*|trajectories/*|*.tar.gz|dist/*|*/patches/*|patches/*)
+        echo "forbidden in git: $f" >&2; bad=1; continue ;;
+    esac
+    if [[ -f "$BASE_DIR/$f" ]] && grep -qE '"consent_class"[[:space:]]*:[[:space:]]*"restricted"' "$BASE_DIR/$f" 2>/dev/null; then
+      case "$f" in
+        results-index/manifests/*.json) ;;   # manifests carry ids only — allowed by §7.4
+        *) echo "restricted consent content in git: $f" >&2; bad=1 ;;
+      esac
+    fi
+  done <<<"$files"
+  [[ "$bad" == "0" ]] || dief "git hygiene check failed ($scope) — see docs/CONTRACTS.md §7.4"
+  echo "git-hygiene OK ($scope)"
+}
+
+cmd_verify() {
+  if [[ "${1:-}" == "--git-hygiene" ]]; then shift; cmd_verify_git_hygiene "${1:-}"; return; fi
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "usage: ./resultsctl verify <run_id|bundle|run_dir> | --git-hygiene [--all]"
+
+  if [[ -d "$target" ]]; then
+    local run_dir; run_dir="$(cd "$target" && pwd)"
+    verify_run_dir "$run_dir" "$(basename "$run_dir")"
+    echo "$(basename "$run_dir") OK"
+    return
+  fi
+
+  local bundle="" run_id="" expected=""
+  if [[ -f "$target" ]]; then
+    bundle="$(cd "$(dirname "$target")" && pwd)/$(basename "$target")"
+    run_id="$(basename "$bundle" .tar.gz)"
+    [[ -f "$bundle.sha256" ]] && expected="$(awk '{print $1}' <"$bundle.sha256")"
+  else
+    run_id="$target"
+    expected="$(index_lookup "$run_id" sha256)" || dief "$run_id: not indexed"
+    local uri; uri="$(index_lookup "$run_id" uri)"
+    [[ -n "$uri" ]] || dief "$run_id: indexed but never uploaded (bundle.uri is null) — nothing to verify remotely"
+    local tmpd; tmpd="$(mktemp -d)"; trap "rm -rf '$tmpd'" EXIT
+    bundle="$tmpd/$run_id.tar.gz"
+    obj_get "$uri" "$bundle"
+  fi
+
+  local actual; actual="$(sha256_file "$bundle")"
+  if [[ -n "$expected" ]]; then
+    [[ "$actual" == "$expected" ]] || dief "$run_id: tarball sha256 $actual != recorded $expected"
+  else
+    warn "$run_id: no recorded sha256 to compare against (tarball hashes to $actual)"
+  fi
+
+  local unp; unp="$(mktemp -d)"
+  tar -xzf "$bundle" -C "$unp"
+  local run_dir="$unp/$run_id"
+  [[ -d "$run_dir" ]] || { rm -rf "$unp"; dief "$run_id: bundle top-level entry is not $run_id/"; }
+  if ! verify_run_dir "$run_dir" "$run_id"; then rm -rf "$unp"; exit "$EXIT_VERIFY"; fi
+  rm -rf "$unp"
+  echo "$run_id OK"
+}
+
+# ------------------------------------------------------------------ fetch ---
+
+cmd_fetch() {
+  local run_id="${1:-}" dest="${2:-}"
+  [[ -n "$run_id" ]] || die "usage: ./resultsctl fetch <run_id> [dir]"
+  [[ -n "$dest" ]] || dest="${RESULTS_FETCH_DIR:-$PWD/fetched}"
+  assert_writable_outside_git "$dest" "unpacked run data"
+  mkdir -p "$dest"; dest="$(cd "$dest" && pwd)"
+
+  local uri expected
+  uri="$(index_lookup "$run_id" uri)" || dief "$run_id: not indexed"
+  [[ -n "$uri" ]] || dief "$run_id: indexed but never uploaded (bundle.uri is null)"
+  expected="$(index_lookup "$run_id" sha256)"
+
+  local tmpd; tmpd="$(mktemp -d)"; trap "rm -rf '$tmpd'" EXIT
+  local bundle="$tmpd/$run_id.tar.gz"
+  obj_get "$uri" "$bundle"
+  local actual; actual="$(sha256_file "$bundle")"
+  if [[ -n "$expected" && "$actual" != "$expected" ]]; then
+    dief "$run_id: downloaded tarball sha256 $actual != index $expected"
+  fi
+  [[ -e "$dest/$run_id" ]] && dief "$dest/$run_id already exists — refusing to overwrite fetched run data"
+  info "unpacking into $dest"
+  tar -xzf "$bundle" -C "$dest"
+  verify_run_dir "$dest/$run_id" "$run_id"
+  echo "$dest/$run_id"
+}
+
+# --------------------------------------------------------------------- ls ---
+
+cmd_ls() {
+  [[ -f "$INDEX_FILE" ]] || { info "no index yet ($INDEX_FILE)"; return 0; }
+  python3 - "$INDEX_FILE" <<'PY'
+import json, sys
+for line in open(sys.argv[1], encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    r = json.loads(line)
+    b = r.get("bundle") or {}
+    print(f"{r['run_id']} {r.get('status','?')} {b.get('uri') or '-'}")
+PY
+}
+
+case "${1:-}" in
+  package) shift; cmd_package "$@" ;;
+  upload)  shift; cmd_upload "$@" ;;
+  push)    shift; cmd_upload "$@" ;;
+  index)   shift; cmd_index "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
+  fetch)   shift; cmd_fetch "$@" ;;
+  ls)      shift; cmd_ls "$@" ;;
+  -h|--help|help) sed -n '2,20p' "$0"; exit 0 ;;
+  *) usage ;;
+esac

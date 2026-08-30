@@ -1,0 +1,173 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "run_command",
+      "description": "Run a non-interactive shell command in the repository root and return its exit code and output. Use it to explore, build, run scripts and inspect state. The command must terminate on its own; there is no stdin, no pager and no network. Large output is truncated, so narrow the command rather than dumping whole files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Shell command to execute, run with `sh -c` from the repository root."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "description": "Seconds to allow before the command is killed. Defaults to the harness default and is capped by the harness maximum."
+          }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read a text file from the repository and return it with 1-based line numbers. Read before you edit: `edit_file` needs the exact text, including indentation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file, relative to the repository root."
+          },
+          "start_line": {
+            "type": "integer",
+            "description": "First line to return, 1-based and inclusive. Defaults to 1."
+          },
+          "end_line": {
+            "type": "integer",
+            "description": "Last line to return, 1-based and inclusive. Defaults to the harness line limit past start_line."
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_files",
+      "description": "Search the repository for a POSIX extended regular expression and return matching lines as `path:line:text`. This is the cheapest way to locate the code that owns a symbol, error message or configuration key.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "POSIX extended regular expression to search for."
+          },
+          "path": {
+            "type": "string",
+            "description": "Directory or file to search, relative to the repository root. Defaults to the whole repository."
+          },
+          "glob": {
+            "type": "string",
+            "description": "Shell glob restricting which file names are searched, for example '*.py'."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Maximum number of matching lines to return. Defaults to the harness limit."
+          }
+        },
+        "required": ["pattern"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit_file",
+      "description": "Replace one exact literal occurrence of `old_str` with `new_str` in a file. `old_str` must appear exactly once unless `replace_all` is true; if it does not appear, or appears more than once, the edit is rejected and nothing changes. Copy `old_str` verbatim from `read_file` output (without the line numbers).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file, relative to the repository root."
+          },
+          "old_str": {
+            "type": "string",
+            "description": "Exact literal text to replace, including leading indentation and newlines."
+          },
+          "new_str": {
+            "type": "string",
+            "description": "Replacement text. Use an empty string to delete `old_str`."
+          },
+          "replace_all": {
+            "type": "boolean",
+            "description": "Replace every occurrence instead of requiring exactly one. Defaults to false."
+          }
+        },
+        "required": ["path", "old_str", "new_str"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_file",
+      "description": "Write `content` to `path`, creating parent directories and overwriting any existing file. Use it for new files and for short scratch scripts; use `edit_file` for targeted changes to existing files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path to the file, relative to the repository root."
+          },
+          "content": {
+            "type": "string",
+            "description": "Full contents of the file."
+          }
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_tests",
+      "description": "Run the project's test command in the repository root, optionally restricted to specific test node ids. Prefer specific node ids while iterating and the full command once before submitting.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "node_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Test node ids to run, for example 'tests/test_x.py::test_y'. Omit to run the full test command."
+          },
+          "timeout_s": {
+            "type": "integer",
+            "description": "Seconds to allow before the run is killed. Defaults to the harness default and is capped by the harness maximum."
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "submit",
+      "description": "Finish the task. The current diff of the workspace is captured and graded; no further tool calls are made. Only call this once the fix is written to disk and the tests you could run are green.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string",
+            "description": "One paragraph: the root cause and the change you made."
+          }
+        },
+        "required": ["summary"],
+        "additionalProperties": false
+      }
+    }
+  }
+]
