@@ -518,6 +518,42 @@ def _verdict(
     )
 
 
+def _pytest_version() -> str | None:
+    """Version of the pytest that will actually grade, or None if it is not importable."""
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", "--version"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return (out.stdout or out.stderr).strip().splitlines()[0] if (out.stdout or out.stderr) else "unknown"
+
+
+def grading_requirements() -> list[tuple[str, bool, str]]:
+    """(name, present, how-to-fix) for everything grade() needs on THIS host.
+
+    run.sh preflight tier 3 calls this before the first model call. agenttask grades by
+    running the hidden tests with pytest in-process, so a missing pytest means the suite
+    cannot be graded at all — and would otherwise be discovered only at the first grade(),
+    reported as TESTS_FAIL 0/N, and published as if the model had failed.
+    """
+    reqs = []
+    reqs.append((
+        "pytest (the agenttask test runner)",
+        _pytest_version() is not None,
+        "%s -m pip install pytest" % sys.executable,
+    ))
+    reqs.append((
+        "git (workspace base for the attempt diff)",
+        _tool_version("git") is not None,
+        "install git",
+    ))
+    return reqs
+
+
 def environment_digest() -> str:
     """Identity of the grading environment (CONTRACTS.md §5). Best-effort: it degrades to a
     packless digest so a manifest can still be written on a machine without the data pack."""
@@ -542,6 +578,9 @@ def environment_digest() -> str:
         "python": platform.python_version(),
         "git": _tool_version("git"),
         "default_test_cmd": DEFAULT_TEST_CMD,
+        # The test runner IS the grader here: without it every attempt grades TESTS_FAIL
+        # with 0/N passing, which reads as a model result rather than a broken host.
+        "pytest": _pytest_version(),
     }
     return "sha256:" + _sha256_bytes(_canonical_json(payload).encode("utf-8"))
 

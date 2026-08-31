@@ -722,6 +722,34 @@ class DockerExecutor(Executor):
             self._started = False
 
 
+def _ensure_git_base(executor: "Executor", task: Any) -> None:
+    """Make an adapter-materialized workspace diffable.
+
+    capture_patch() derives the attempt's patch from `git diff --cached`. A workspace laid
+    down from a tarball (the agenttask pack) has no repository, so the diff is empty and
+    EVERY attempt on that suite records NO_PATCH regardless of what the model did — the
+    uncontaminated control suite would silently score 0% and read as a model result rather
+    than as broken plumbing. Initialise a repo and commit the pristine tree so the diff has
+    a base. Docker-image workspaces already arrive as git checkouts and skip this.
+    """
+    rc, _ = executor.run("git rev-parse --is-inside-work-tree", 60)
+    if rc == 0:
+        return
+    cmds = (
+        "git init -q .",
+        "git config user.email harness@local && git config user.name harness",
+        "git add -A -- .",
+        "git -c commit.gpgsign=false commit -q -m harness-base --allow-empty",
+    )
+    for cmd in cmds:
+        rc, out = executor.run(cmd, 300)
+        if rc != 0:
+            raise SandboxError(
+                "could not create a git base for %s (%s): %s"
+                % (getattr(task, "instance_id", "?"), cmd, out[:300])
+            )
+
+
 def _adapter_for(task: Any) -> Any:
     """Resolve the adapter module that produced `task`, or None if unavailable."""
     try:
@@ -770,7 +798,9 @@ def build_workspace(task: Any, attempt_slug: str, scratch_root: Path) -> Executo
                     raise SandboxError(
                         f"adapter materialize() failed for {task.instance_id}: {exc}"
                     ) from exc
-                return LocalExecutor(dest, owned=True)
+                ex = LocalExecutor(dest, owned=True)
+                _ensure_git_base(ex, task)
+                return ex
         if not source or not Path(source).exists():
             raise SandboxError(
                 "no workspace: task has no image, no environment['workspace'], no adapter "

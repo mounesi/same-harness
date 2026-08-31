@@ -1233,6 +1233,21 @@ def cmd_grading_preflight(args) -> int:
     if not callable(getattr(mod, "grade", None)):
         missing.append(("%s.grade()" % suite, "the adapter must expose grade() (§5)"))
 
+    # An adapter may declare its own host requirements — the static GRADING_DEPS table
+    # cannot know, for example, that agenttask grades by running pytest in-process. Without
+    # this an adapter whose runner is absent passes preflight and then grades every attempt
+    # TESTS_FAIL 0/N, which publishes as a model result rather than as a broken host.
+    reqs_fn = getattr(mod, "grading_requirements", None)
+    if callable(reqs_fn):
+        try:
+            for name, present, hint in reqs_fn():
+                if not present:
+                    missing.append((name, hint))
+        except Exception as exc:  # noqa: BLE001
+            missing.append(("%s.grading_requirements() raised %s: %s"
+                            % (suite, type(exc).__name__, exc),
+                            "the adapter could not report its host requirements"))
+
     digest = None
     func = getattr(mod, "environment_digest", None)
     if not callable(func):

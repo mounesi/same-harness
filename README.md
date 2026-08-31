@@ -65,3 +65,24 @@ CI (`.github/workflows/`):
 
 Secrets: `LAMBDA_API_KEY`, `LAMBDA_SSH_PRIVATE_KEY`. Variables: `LAMBDA_SSH_KEY`, `LAMBDA_FS`.
 Note: `harness/run.sh` is the interface CI expects — built under AI-2957.
+
+## Smoke test — run this before spending a cent
+
+```bash
+./smoke/run-smoke.sh
+```
+
+Exercises the **entire** path — preflight, manifest, agent loop, tool calls, patch capture,
+grading, aggregation, bundling, leakage guard — against a mock OpenAI-compatible endpoint
+and a synthetic 2-task suite. No GPU, no credit, a few seconds.
+
+It exists because every expensive bug found in review was a plumbing bug: a file never
+shipped to the instance, a variable exported to the wrong step, two components disagreeing
+about a field name. None are visible to a syntax check, and all of them would otherwise
+surface on a $54/hr node after the weights had downloaded. Two real bugs were caught by its
+first run — see `smoke/README.md`.
+
+`.github/workflows/ci.yml` runs it on every push. Green CI = the harness is wired.
+
+Requires `pytest` (the agenttask grader runs the hidden tests with it):
+`python3 -m pip install pytest`.
