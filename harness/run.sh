@@ -22,7 +22,13 @@
 #   --max-iters N       agent iteration budget. HELD CONSTANT — any other value marks the
 #                       run flags.nonconformant                            (default 40)
 #   --resume RUN_ID     continue an incomplete run in place: reuse its manifest and run only
-#                       the missing (instance, pass) attempts
+#                       the missing (instance, pass) attempts. Attempts that ended INFRA_HOST
+#                       are retryable: their records are pruned (manifest.py prune-retryable)
+#                       right before the pass re-runs them, so every attempt keeps exactly one
+#                       record (§3.1). A resume that fails preflight has executed nothing and
+#                       leaves the run directory EXACTLY as found (manifest, SHA256SUMS, logs,
+#                       env/ untouched — §2.3: a resume may only ADVANCE status); it prints
+#                       `RUN ... failed` and exits 3.
 #   --limit N           debug only: first N instances in seed order (flags.exploratory)
 #   --instance ID       debug only: run just this id; repeatable    (flags.exploratory)
 #   --manifest-only     write the manifest(s), print the stdout line(s), exit 0
@@ -39,6 +45,12 @@
 #   3 preflight (endpoint down / served-model mismatch / missing grading dependency /
 #     unresolved REQUIRED provenance)
 #   4 incomplete      5 grading degraded (>2% INFRA_GRADER)      130 interrupt
+# Exit 0 is only ever reported when the manifest was finalized AND SHA256SUMS was written:
+# if either fails at the end of a run (ENOSPC, ...) the RUN line says `incomplete` and the
+# exit code is 4 (or the higher code the run already had), never 0. A --resume whose
+# bookkeeping (manifest.py missing / prune-retryable) fails is likewise `incomplete` / 4 —
+# it is never reported as "already complete". After SIGINT/SIGTERM no further pass AND no
+# further suite of --suite all is started; the exit code is 130 / 4.
 #
 # Preflight is three tiers, all of them before the first model call:
 #   1. endpoint    GET $endpoint/models answers, and serves exactly --model
@@ -180,6 +192,9 @@ PARTITIONS="$(abspath "$PARTITIONS")"
 if [[ -n "$SEED_FILE" ]]; then
   [[ -f "$SEED_FILE" ]] || die_cfg "seed file not found: $SEED_FILE"
   SEED_FILE="$(abspath "$SEED_FILE")"
+  # The adapters digest the seed they resolve themselves (default file unless told); export
+  # the override so manifest build, grading-preflight and the agent all describe THIS seed.
+  export HARNESS_SEED_FILE="$SEED_FILE"
 fi
 
 default_seed_file() {
@@ -237,7 +252,7 @@ CUR_RUN_DIR="" CUR_RUN_ID="" CUR_SUITE="" CUR_STARTED="" CUR_FINALIZED=1
 
 on_signal() {
   SIGNAL_EXIT="$1"
-  info "signal received — no further passes will start; the run finalizes as incomplete"
+  info "signal received — no further passes or suites will start; the run finalizes as incomplete"
 }
 trap 'on_signal 130' INT
 trap 'on_signal 4'   TERM
@@ -270,9 +285,13 @@ print("\n".join(str(m.get("id", "")) for m in data))
 # ----------------------------------------------------------------- finalisation
 # finish_run <status> <exit_code> [extra finalize flags...]
 # Rewrites the manifest, writes run-status.json and SHA256SUMS (last), prints the RUN line.
+# The status/exit code actually REPORTED are left in FINISH_STATUS / FINISH_CODE: when the
+# manifest cannot be finalized or SHA256SUMS cannot be written, the run is reported as
+# `incomplete` with exit 4 (never 0) — §1.3's exit-0 row promises both files.
+FINISH_STATUS="" FINISH_CODE=0
 finish_run() {
   local status="$1" code="$2"; shift 2
-  local SCAN_UNIQUE=0
+  local SCAN_UNIQUE=0 bookkeeping_ok=1
   # --resume reuses the manifest, so timing.started_at stays the ORIGINAL start and
   # timing.wall_clock_s spans the idle gap between the two invocations. Naming the resumed
   # run here is what makes manifest.py accumulate timing.active_wall_clock_s per invocation
@@ -281,15 +300,75 @@ finish_run() {
   if [[ -n "$RESUME" ]]; then resumed=(--resumed-from "$RESUME"); fi
   eval "$(manifest_py scan --run-dir "$CUR_RUN_DIR" --run-id "$CUR_RUN_ID" 2>/dev/null \
           || echo 'SCAN_UNIQUE=0')"
-  manifest_py finalize --run-dir "$CUR_RUN_DIR" --status "$status" \
+  if ! manifest_py finalize --run-dir "$CUR_RUN_DIR" --status "$status" \
       --exit-code "$code" --attempts-written "$SCAN_UNIQUE" \
       --started-at "$CUR_STARTED" --ended-at "$(utciso)" \
-      ${resumed[@]+"${resumed[@]}"} "$@" >&2 \
-    || info "WARNING: could not finalize the manifest for $CUR_RUN_ID"
-  manifest_py checksums --run-dir "$CUR_RUN_DIR" >/dev/null 2>&1 \
-    || info "WARNING: could not write SHA256SUMS for $CUR_RUN_ID"
+      ${resumed[@]+"${resumed[@]}"} "$@" >&2; then
+    info "ERROR: could not finalize the manifest for $CUR_RUN_ID"
+    bookkeeping_ok=0
+  fi
+  if ! manifest_py checksums --run-dir "$CUR_RUN_DIR" >/dev/null 2>&1; then
+    info "ERROR: could not write SHA256SUMS for $CUR_RUN_ID"
+    bookkeeping_ok=0
+  fi
+  if [[ "$bookkeeping_ok" -ne 1 ]]; then
+    info "ERROR: run bookkeeping failed — reporting $CUR_RUN_ID as incomplete (intended: $status/$code)"
+    status="incomplete"
+    if [[ "$code" -lt 4 ]]; then code=4; fi
+  fi
   CUR_FINALIZED=1
+  FINISH_STATUS="$status"; FINISH_CODE="$code"
   printf 'RUN %s %s %s %s\n' "$CUR_RUN_ID" "$CUR_SUITE" "$CUR_RUN_DIR" "$status"
+}
+
+# abort_resume <exit_code> <reason...>   (the caller returns the code itself)
+# A --resume that fails preflight has executed nothing. The run directory holds real graded
+# attempts, so its manifest and SHA256SUMS are left EXACTLY as found (CONTRACTS.md §2.3: a
+# resume may only advance status) — only the RUN line is printed, with status failed.
+count_records() { # non-blank lines in results.jsonl, or 0 when absent
+  local f="$1/results.jsonl"
+  if [[ -f "$f" ]]; then grep -c . "$f" || true; else echo 0; fi
+}
+
+abort_resume() {
+  local code="$1"; shift
+  info "resume of $CUR_RUN_ID refused: $*"
+  info "nothing was executed; run-manifest.json and SHA256SUMS were left untouched — fix the cause and --resume again"
+  CUR_FINALIZED=1
+  FINISH_STATUS="failed"; FINISH_CODE="$code"
+  printf 'RUN %s %s %s failed\n' "$CUR_RUN_ID" "$CUR_SUITE" "$CUR_RUN_DIR"
+}
+
+# capture_environment <run_dir>
+# Snapshot of the host into <run_dir>/env — for a fresh run before anything can perturb it;
+# for a --resume only once preflight has passed, so a refused resume leaves env/ untouched.
+capture_environment() {
+  local run_dir="$1"
+  cp "$MODEL_ENV_FILE" "$run_dir/env/model.env" 2>/dev/null || true
+  "$PY" -m pip freeze --all 2>/dev/null | LC_ALL=C sort >"$run_dir/env/pip-freeze.txt" \
+    || : >"$run_dir/env/pip-freeze.txt"
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi >"$run_dir/env/nvidia-smi.txt" 2>&1 || true
+  else
+    printf 'nvidia-smi unavailable on %s\n' "$(hostname 2>/dev/null || echo host)" \
+      >"$run_dir/env/nvidia-smi.txt"
+  fi
+  # How the server was actually launched. modelctl writes this file at launch time; the
+  # "==> launching:" line it also prints goes to modelctl's STDOUT and never reaches
+  # vllm.log (which only ever receives vLLM's own redirected output), so grepping the log
+  # for it can only ever come back empty.
+  if [[ -s "$VLLM_ARGV_FILE" ]]; then
+    tail -n1 "$VLLM_ARGV_FILE" >"$run_dir/env/vllm-args.txt"
+  elif grep -h '^==> launching:' "$STATE_DIR/vllm.log" >/dev/null 2>&1; then
+    # legacy state dirs, where an operator redirected modelctl's own stdout into the log
+    grep -h '^==> launching:' "$STATE_DIR/vllm.log" | tail -n1 | sed 's/^==> launching: //' \
+      >"$run_dir/env/vllm-args.txt"
+  else
+    printf 'unavailable: %s was not written (server not started by ./modelctl serve?)\n' \
+      "$VLLM_ARGV_FILE" >"$run_dir/env/vllm-args.txt"
+    info "WARNING: no $VLLM_ARGV_FILE — runtime.vllm_argv will be null and this run will"
+    info "         carry no record of how the server was launched (start it with ./modelctl serve)"
+  fi
 }
 
 # build_manifest <suite> <seed_file> <run_id> <run_dir> <passes> <served_model_name>
@@ -346,10 +425,18 @@ do_run() {
     mkdir -p "$run_dir"/patches "$run_dir"/trajectories "$run_dir"/logs/attempts "$run_dir"/env || return 2
   fi
 
-  CUR_RUN_ID="$run_id"; CUR_RUN_DIR="$run_dir"; CUR_FINALIZED=0
+  CUR_RUN_ID="$run_id"; CUR_RUN_DIR="$run_dir"
   CUR_STARTED="$(utciso)"
-  LOGFILE="$run_dir/logs/harness.log"
-  : >>"$LOGFILE"
+  if [[ -z "$RESUME" ]]; then
+    CUR_FINALIZED=0
+    LOGFILE="$run_dir/logs/harness.log"
+    : >>"$LOGFILE"
+  else
+    # Nothing in the run directory is written (and the EXIT trap does not finalize) until
+    # preflight has passed — a refused resume must leave the directory exactly as found.
+    CUR_FINALIZED=1
+    LOGFILE=""
+  fi
 
   info "run     : $run_id"
   info "model   : $MODEL  (${HARNESS_MODELENV_HF_REPO})"
@@ -358,31 +445,8 @@ do_run() {
   info "mode    : $MODE"
 
   # ---- environment capture, before anything can perturb it ---------------
-  cp "$MODEL_ENV_FILE" "$run_dir/env/model.env" 2>/dev/null || true
-  "$PY" -m pip freeze --all 2>/dev/null | LC_ALL=C sort >"$run_dir/env/pip-freeze.txt" \
-    || : >"$run_dir/env/pip-freeze.txt"
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi >"$run_dir/env/nvidia-smi.txt" 2>&1 || true
-  else
-    printf 'nvidia-smi unavailable on %s\n' "$(hostname 2>/dev/null || echo host)" \
-      >"$run_dir/env/nvidia-smi.txt"
-  fi
-  # How the server was actually launched. modelctl writes this file at launch time; the
-  # "==> launching:" line it also prints goes to modelctl's STDOUT and never reaches
-  # vllm.log (which only ever receives vLLM's own redirected output), so grepping the log
-  # for it can only ever come back empty.
-  if [[ -s "$VLLM_ARGV_FILE" ]]; then
-    tail -n1 "$VLLM_ARGV_FILE" >"$run_dir/env/vllm-args.txt"
-  elif grep -h '^==> launching:' "$STATE_DIR/vllm.log" >/dev/null 2>&1; then
-    # legacy state dirs, where an operator redirected modelctl's own stdout into the log
-    grep -h '^==> launching:' "$STATE_DIR/vllm.log" | tail -n1 | sed 's/^==> launching: //' \
-      >"$run_dir/env/vllm-args.txt"
-  else
-    printf 'unavailable: %s was not written (server not started by ./modelctl serve?)\n' \
-      "$VLLM_ARGV_FILE" >"$run_dir/env/vllm-args.txt"
-    info "WARNING: no $VLLM_ARGV_FILE — runtime.vllm_argv will be null and this run will"
-    info "         carry no record of how the server was launched (start it with ./modelctl serve)"
-  fi
+  # (a --resume captures it after preflight instead — see capture_environment)
+  if [[ -z "$RESUME" ]]; then capture_environment "$run_dir"; fi
 
   # ---- preflight: the endpoint must be serving THIS model -----------------
   if [[ "$MODE" != "manifest-only" ]]; then
@@ -397,11 +461,10 @@ do_run() {
   Bring the server up first:  ./modelctl serve $MODEL   (then ./modelctl status)
 
 EOF
-      if [[ -z "$RESUME" ]]; then
-        build_manifest "$suite" "$seed_file" "$run_id" "$run_dir" "$passes" "" || true
-      fi
+      if [[ -n "$RESUME" ]]; then abort_resume 3 "endpoint $ENDPOINT unreachable"; return 3; fi
+      build_manifest "$suite" "$seed_file" "$run_id" "$run_dir" "$passes" "" || true
       finish_run failed 3
-      return 3
+      return "$FINISH_CODE"
     fi
     served="$(printf '%s\n' "$ids" | head -n1)"
     if [[ "$served" != "$MODEL" ]]; then
@@ -417,11 +480,10 @@ EOF
       ./modelctl switch $MODEL
 
 EOF
-      if [[ -z "$RESUME" ]]; then
-        build_manifest "$suite" "$seed_file" "$run_id" "$run_dir" "$passes" "$served" || true
-      fi
+      if [[ -n "$RESUME" ]]; then abort_resume 3 "endpoint serves '$served', not '$MODEL'"; return 3; fi
+      build_manifest "$suite" "$seed_file" "$run_id" "$run_dir" "$passes" "$served" || true
       finish_run failed 3
-      return 3
+      return "$FINISH_CODE"
     fi
     info "preflight: endpoint serves '$served' — matches --model"
   fi
@@ -432,7 +494,7 @@ EOF
     build_manifest "$suite" "$seed_file" "$run_id" "$run_dir" "$passes" "$served" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
       info "manifest build failed (exit $rc)"
-      if [[ "$rc" -eq 3 ]]; then finish_run failed 3; return 3; fi
+      if [[ "$rc" -eq 3 ]]; then finish_run failed 3; return "$FINISH_CODE"; fi
       # exit 2 is a config error: "nothing written". Take the half-built run dir with us
       # so nothing downstream ever sees a run directory without a manifest.
       CUR_FINALIZED=1
@@ -447,7 +509,7 @@ EOF
     if [[ -n "$served" && "$mserved" != "$served" ]]; then
       printf 'error: this run was recorded against served model "%s" but the endpoint now serves "%s"\n' \
         "$mserved" "$served" >&2
-      finish_run failed 3
+      abort_resume 3 "run recorded against served model '$mserved', endpoint now serves '$served'"
       return 3
     fi
     info "resuming $run_id (manifest reused verbatim)"
@@ -457,7 +519,7 @@ EOF
 
   if [[ "$MODE" == "manifest-only" ]]; then
     finish_run manifest-only 0
-    return 0
+    return "$FINISH_CODE"
   fi
 
   # ---- harness-constant invariant: every suite renders the SAME template --
@@ -466,8 +528,9 @@ EOF
   if [[ "$MODE" == "dry-run" ]]; then preview=(--write-preview "$run_dir/prompt-preview.txt"); fi
   if ! manifest_py prompt-check --repo "$REPO_DIR" \
         --manifest "$run_dir/run-manifest.json" ${preview[@]+"${preview[@]}"} >/dev/null; then
+    if [[ -n "$RESUME" ]]; then abort_resume 2 "the $suite adapter no longer renders the manifest's prompt template"; return 2; fi
     finish_run failed 2
-    return 2
+    return "$FINISH_CODE"
   fi
 
   # ---- preflight tier 3: this host must be able to GRADE ------------------
@@ -483,15 +546,25 @@ EOF
       info "WARNING: this host cannot grade $suite (exit $prc) — a real run would refuse to start"
     else
       info "refusing to start: nothing was executed, so no GPU budget was spent"
+      if [[ -n "$RESUME" ]]; then abort_resume 3 "this host cannot grade $suite (grading-preflight exit $prc)"; return 3; fi
       finish_run failed 3
-      return 3
+      return "$FINISH_CODE"
     fi
   fi
 
   if [[ "$MODE" == "dry-run" ]]; then
     info "dry run : $planned attempts would be executed against $ENDPOINT — none were"
     finish_run dry-run 0
-    return 0
+    return "$FINISH_CODE"
+  fi
+
+  if [[ -n "$RESUME" ]]; then
+    # Preflight passed: from here on the run directory is ours again — arm the EXIT-trap
+    # finalisation, tee the log, and refresh env/ for this invocation.
+    CUR_FINALIZED=0
+    LOGFILE="$run_dir/logs/harness.log"
+    : >>"$LOGFILE"
+    capture_environment "$run_dir"
   fi
 
   # ---- passes -------------------------------------------------------------
@@ -503,19 +576,39 @@ EOF
     fi
     local only=()
     if [[ -n "$RESUME" ]]; then
-      local MISSING_COUNT=0
-      eval "$(manifest_py missing --run-dir "$run_dir" --pass-idx "$p" \
-                --out "$run_dir/logs/resume-pass-$p.ids")"
+      # The bookkeeping subcommands run in a command substitution, where set -e cannot
+      # fire: their exit status is captured explicitly. A failure here means the pass is
+      # NOT resumable — it is never mistaken for "already complete".
+      local MISSING_COUNT="" PRUNED="" mout="" mrc=0
+      mout="$(manifest_py missing --run-dir "$run_dir" --pass-idx "$p" \
+                --out "$run_dir/logs/resume-pass-$p.ids")" || mrc=$?
+      if [[ "$mrc" -eq 0 ]]; then eval "$mout"; fi
+      if [[ "$mrc" -ne 0 ]] || ! is_int "$MISSING_COUNT"; then
+        info "pass $((p + 1))/$passes — cannot determine the missing attempts (manifest.py missing exited $mrc); not resumable"
+        if [[ "$worst" -lt 4 ]]; then worst=4; fi
+        break
+      fi
       if [[ "$MISSING_COUNT" -eq 0 ]]; then
         info "pass $((p + 1))/$passes — already complete, skipping"
         continue
       fi
-      info "pass $((p + 1))/$passes — resuming $MISSING_COUNT missing attempt(s)"
+      # Attempts that ended INFRA_HOST are retryable: `missing` lists them, so their old
+      # records must go BEFORE the pass re-runs them (§3.1: exactly one record per attempt).
+      mout=""; mrc=0
+      mout="$(manifest_py prune-retryable --run-dir "$run_dir" --pass-idx "$p")" || mrc=$?
+      if [[ "$mrc" -eq 0 ]]; then eval "$mout"; fi
+      if [[ "$mrc" -ne 0 ]] || ! is_int "$PRUNED"; then
+        info "pass $((p + 1))/$passes — could not prune retryable records (manifest.py prune-retryable exited $mrc); not resumable"
+        if [[ "$worst" -lt 4 ]]; then worst=4; fi
+        break
+      fi
+      info "pass $((p + 1))/$passes — resuming $MISSING_COUNT missing attempt(s), $PRUNED retryable INFRA_HOST record(s) pruned"
       only=(--only-instances "$run_dir/logs/resume-pass-$p.ids")
     else
       info "pass $((p + 1))/$passes — $MODEL / $suite"
     fi
 
+    local SCAN_UNIQUE_BEFORE_PASS; SCAN_UNIQUE_BEFORE_PASS="$(count_records "$run_dir")"
     set +e
     pyrun harness.agent run \
       --manifest "$run_dir/run-manifest.json" \
@@ -526,6 +619,18 @@ EOF
     rc="${PIPESTATUS[0]}"
     set -e
 
+    if [[ "$rc" -eq 3 && "$SCAN_UNIQUE_BEFORE_PASS" == "$(count_records "$run_dir")" ]]; then
+      # harness.agent refused BEFORE any attempt (environment_digest disagrees with the
+      # manifest, §2.3 — typically a grader upgrade across --resume). That is a preflight
+      # failure: on a resume the run dir must stay exactly as found; on a fresh run the
+      # manifest is finalized failed. Never `incomplete` — nothing was aborted mid-flight.
+      if [[ -n "$RESUME" ]]; then
+        abort_resume 3 "harness.agent preflight refused at pass $((p + 1)) (environment_digest mismatch, §2.3)"
+        return 3
+      fi
+      finish_run failed 3
+      return 3
+    fi
     if [[ "$rc" -ne 0 ]]; then
       info "pass $((p + 1)) exited $rc — not starting further passes"
       if [[ "$rc" -gt "$worst" ]]; then worst="$rc"; fi
@@ -536,7 +641,15 @@ EOF
   # ---- status -------------------------------------------------------------
   local SCAN_RECORDS=0 SCAN_UNIQUE=0 SCAN_RESOLVED=0 SCAN_INFRA_GRADER=0
   local SCAN_INFRA_UNKNOWN=0 SCAN_ATTEMPTS_SCORED=0 SCAN_MALFORMED=0 SCAN_FOREIGN=0
-  eval "$(manifest_py scan --run-dir "$run_dir" --run-id "$run_id")"
+  local SCAN_SERVER=0 SCAN_TRAILING_SERVER=0 SCAN_INFRA_SANDBOX=0 SCAN_RETRYABLE=0 sout="" src=0
+  sout="$(manifest_py scan --run-dir "$run_dir" --run-id "$run_id")" || src=$?
+  if [[ "$src" -eq 0 ]]; then
+    eval "$sout"
+  else
+    # Unscannable results cannot be called complete: SCAN_UNIQUE stays 0 < planned below.
+    info "ERROR: manifest.py scan exited $src — results.jsonl could not be inventoried"
+    if [[ "$worst" -lt 4 ]]; then worst=4; fi
+  fi
   info "results : $SCAN_UNIQUE/$planned attempts written, $SCAN_RESOLVED resolved, \
 $SCAN_ATTEMPTS_SCORED scored, $SCAN_INFRA_GRADER INFRA_GRADER, $SCAN_INFRA_UNKNOWN INFRA_UNKNOWN"
   if [[ "$SCAN_MALFORMED" -gt 0 ]]; then
@@ -551,6 +664,12 @@ $SCAN_ATTEMPTS_SCORED scored, $SCAN_INFRA_GRADER INFRA_GRADER, $SCAN_INFRA_UNKNO
   if [[ "$SIGNAL_EXIT" != "0" ]]; then
     status="incomplete"; code="$SIGNAL_EXIT"
   elif [[ "$worst" -ne 0 || "$SCAN_UNIQUE" -lt "$planned" ]]; then
+    status="incomplete"; code=4
+  elif [[ "$SCAN_RETRYABLE" -gt 0 ]]; then
+    # Same definition of "done" as `manifest.py missing` (seam S1): an INFRA_HOST record is
+    # retryable, so a run holding one has attempts that were never scored. Nobody resumes
+    # a run marked complete — those attempts would silently leave the denominator.
+    info "RETRYABLE: $SCAN_RETRYABLE attempt(s) ended INFRA_HOST (host went away) — not complete"
     status="incomplete"; code=4
   fi
   if [[ "$SCAN_RECORDS" -gt 0 ]] && (( SCAN_INFRA_GRADER * 100 > SCAN_RECORDS * 2 )); then
@@ -584,15 +703,22 @@ $SCAN_ATTEMPTS_SCORED scored, $SCAN_INFRA_GRADER INFRA_GRADER, $SCAN_INFRA_UNKNO
   fi
 
   finish_run "$status" "$code" ${extra[@]+"${extra[@]}"}
-  return "$code"
+  return "$FINISH_CODE"
 }
 
 # ---------------------------------------------------------------------- dispatch
 EXIT_CODE=0
 for suite in "${SUITE_LIST[@]}"; do
+  if [[ "$SIGNAL_EXIT" != "0" ]]; then
+    # A signal during an earlier suite: do not start this one (it would only produce a
+    # zero-attempt `incomplete` ghost run). No RUN line — nothing was written for it.
+    info "not starting suite '$suite' — a termination signal was received"
+    continue
+  fi
   rc=0
   do_run "$suite" || rc=$?
   if [[ "$rc" -gt "$EXIT_CODE" ]]; then EXIT_CODE="$rc"; fi
   CUR_RUN_DIR=""; CUR_RUN_ID=""; CUR_FINALIZED=1; LOGFILE=""
 done
+if [[ "$SIGNAL_EXIT" != "0" && "$SIGNAL_EXIT" -gt "$EXIT_CODE" ]]; then EXIT_CODE="$SIGNAL_EXIT"; fi
 exit "$EXIT_CODE"

@@ -118,12 +118,18 @@ Proceeding with the launch (it will fail fast if the Ray cluster is missing).
 MN
   fi
 
-  local args=(serve "$MODEL_DIR" --served-model-name "$MODEL_NAME"
-              --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"
-              --port "$PORT")
+  local args=(serve "$MODEL_DIR" --tensor-parallel-size "$TP" --port "$PORT")
   [[ "$PP" != "1" ]] && args+=(--pipeline-parallel-size "$PP")
   # shellcheck disable=SC2206
   [[ -n "$EXTRA_ARGS" ]] && args+=($EXTRA_ARGS)
+  # The held-constant serving flags go LAST, after $EXTRA_ARGS: vLLM's argparse is
+  # last-wins, so a per-model env file cannot override the study constants by repeating
+  # them in EXTRA_ARGS. harness/manifest.py additionally marks such a run nonconformant.
+  case " $EXTRA_ARGS " in
+    *" --max-model-len"*|*" --served-model-name"*|*" --max_model_len"*|*" --served_model_name"*)
+      echo "WARNING: EXTRA_ARGS for $MODEL_NAME repeats a held-constant flag (--max-model-len / --served-model-name); the study value is appended last and wins" >&2 ;;
+  esac
+  args+=(--served-model-name "$MODEL_NAME" --max-model-len "$MAX_MODEL_LEN")
 
   local launch_line
   if [[ -n "$VLLM_DOCKER_IMAGE" ]]; then

@@ -1,6 +1,7 @@
 # Benchmark run: bring a Lambda GPU server up, serve the model, run the harness, tear down.
-# Teardown discovers the instance BY NAME TAG (ci-<model>-<run_id>), not only by step output,
-# so a launch that dies mid-wait still gets cleaned up. (Per codex architecture review.)
+# Teardown discovers the instance BY NAME TAG (ci-<model>-<run_id>-<run_attempt>), not only by
+# step output, so a launch that dies mid-wait still gets cleaned up. The attempt number is part
+# of the tag: a GitHub re-run must never resolve to the previous attempt's terminating instance.
 #
 # Repo secrets: LAMBDA_API_KEY, LAMBDA_SSH_PRIVATE_KEY
 # Repo variables: LAMBDA_SSH_KEY (key name in Lambda), LAMBDA_FS (persistent filesystem), VLLM_VERSION (pinned)
@@ -36,7 +37,7 @@ jobs:
       LAMBDA_SSH_KEY: ${{ vars.LAMBDA_SSH_KEY }}
       LAMBDA_FS: ${{ vars.LAMBDA_FS }}
       VLLM_VERSION: ${{ vars.VLLM_VERSION }}
-      INSTANCE_NAME: ci-${{ inputs.model }}-${{ github.run_id }}
+      INSTANCE_NAME: ci-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
       WEIGHTS_DIR: /home/ubuntu/${{ vars.LAMBDA_FS }}/models
     steps:
       - uses: actions/checkout@v4
@@ -53,13 +54,28 @@ jobs:
           source "models.d/${{ inputs.model }}.env"
           [[ -n "${INSTANCE_TYPE:-}" ]] || { echo "models.d/${{ inputs.model }}.env has no INSTANCE_TYPE"; exit 1; }
           [[ "${MULTINODE:-0}" == "1" ]] && { echo "multi-node models are not CI-supported yet"; exit 1; }
+          # Cheap gate BEFORE any instance is launched: the harness refuses placeholder
+          # partitions (§6.2) — discovering that after provisioning an 8xB200 is dead money.
+          python3 - <<'PY2'
+          import json, sys
+          p = json.load(open("suites/partitions.json"))
+          if p.get("placeholder"):
+              print("::error::suites/partitions.json is still a placeholder — freeze it before any paid run (AI-2955)")
+              sys.exit(1)
+          PY2
           echo "instance_type=$INSTANCE_TYPE" >> "$GITHUB_OUTPUT"
-          # List price for the cost ledger below. Best-effort: an empty value just means the
-          # ledger records setup SECONDS without dollars, which analysis/aggregate.py tolerates.
+          # List price for the cost ledger below, as a FALLBACK: the ledger step prefers the
+          # price the harness resolved into each run manifest. Best-effort: an empty value just
+          # means the ledger records setup SECONDS without dollars, which aggregate.py tolerates.
+          # `./lambdactl types` prints "<name>   $  23.92/hr  <regions>" — the "$" is its own
+          # field, so parse with the same regex harness/manifest.py uses, not by column.
           CPH="$(./lambdactl types 2>/dev/null \
-                 | awk -v t="$INSTANCE_TYPE" '$1==t {p=$2; gsub(/[$,]/,"",p); sub(/\/hr$/,"",p); printf "%.0f", p*100; exit}')" || CPH=""
+                 | awk -v t="$INSTANCE_TYPE" '$1==t && match($0, /\$[ ]*[0-9]+(\.[0-9]+)?\/hr/) {
+                     p=substr($0, RSTART+1, RLENGTH-4); gsub(/ /, "", p); printf "%.0f", p*100; exit }')" || CPH=""
+          # a parsed 0 is "unknown", never a price
+          [[ -n "$CPH" && "$CPH" != "0" ]] || CPH=""
           echo "price_cents_per_hour=$CPH" >> "$GITHUB_OUTPUT"
-          echo "==> $INSTANCE_TYPE at ${CPH:-unknown} cents/hour" >&2
+          echo "==> $INSTANCE_TYPE at ${CPH:-unknown} cents/hour (list price; ledger prefers the run manifest)" >&2
 
       - name: Bring GPU server up
         id: up
@@ -117,24 +133,84 @@ jobs:
             ./harness/run.sh --model ${{ inputs.model }} --suite ${{ inputs.suite }} --passes 3 --out ~/results" \
             | tee -a results/run-lines.txt
 
-      - name: Package + push run bundles
+      - name: Package run bundles + pull provenance (never trajectories/ or patches/)
         if: always()   # an exit-4 (incomplete) run still has results worth keeping
         shell: bash
         run: |
-          IP=${{ steps.up.outputs.ip }}
-          # bundle on the instance (immutable tar + SHA-256), then pull manifests/checksums
-          ssh "ubuntu@$IP" "cd ~/harness-repo && ./resultsctl package ~/results" || true
-          mkdir -p results && scp -r "ubuntu@$IP:~/results/*" results/ || true
+          IP="${{ steps.up.outputs.ip }}"
+          RUNS=results/run-lines.txt
+          if [[ -z "$IP" ]]; then echo "==> no instance — nothing to package"; exit 0; fi
+          if [[ ! -f "$RUNS" ]] || ! grep -q '^RUN ' "$RUNS"; then
+            echo "==> no RUN lines captured — nothing to package"; exit 0
+          fi
+          # One bundle per run directory named in the RUN lines (§1.4: "RUN <run_id> <suite>
+          # <run_dir> <status>"). resultsctl package takes a RUN DIRECTORY, never the --out root.
+          # A package failure fails this step (a run whose checksums do not verify is not a
+          # result) — but teardown below is if: always(), so the instance still dies.
+          fail=0; packaged=0
+          while read -r _ RID SUITE RDIR STATUS; do
+            echo "==> packaging $RID ($SUITE, $STATUS) from $RDIR"
+            # -n: ssh must NOT inherit the loop's stdin, or it swallows the remaining RUN lines
+            # and every run after the first is silently never packaged.
+            if ! ssh -n "ubuntu@$IP" "cd ~/harness-repo && ./resultsctl package '$RDIR' --dist ~/results/dist"; then
+              echo "::error::resultsctl package failed for $RID" >&2; fail=1; continue
+            fi
+            mkdir -p "results/$RID"
+            # ONLY provenance + integrity files come back into the GitHub artifact. The raw
+            # results.jsonl, trajectories/, patches/, logs/ and env/ stay inside the sealed
+            # bundle: §7.4 restricted content (agenttask) must never be pulled out loose.
+            for f in run-manifest.json SHA256SUMS run-status.json; do
+              scp -q "ubuntu@$IP:$RDIR/$f" "results/$RID/$f" </dev/null \
+                || { echo "::error::could not fetch $RID/$f" >&2; fail=1; }
+            done
+            scp -q "ubuntu@$IP:results/dist/$RID.tar.gz" "ubuntu@$IP:results/dist/$RID.tar.gz.sha256" \
+                "results/$RID/" </dev/null \
+              || { echo "::error::could not fetch the bundle for $RID" >&2; fail=1; }
+            packaged=$((packaged + 1))
+          done < <(grep '^RUN ' "$RUNS")
+          expected=$(grep -c '^RUN ' "$RUNS" || true)
+          if (( packaged != expected )); then
+            echo "::error::packaged $packaged of $expected runs" >&2; fail=1
+          fi
+          ls -laR results/ | sed 's/^/    /'
+          exit "$fail"
 
-      - name: Tear GPU server down (ALWAYS, by name tag)
+      - name: Tear GPU server down (ALWAYS, by id AND by name tag)
         if: always()
         id: down
+        shell: bash
         run: |
-          # primary: the step output; fallback: discover by name tag
-          ./lambdactl down "${{ steps.up.outputs.id || env.INSTANCE_NAME }}" \
-            && echo "confirmed=true" >> "$GITHUB_OUTPUT" \
-            || echo "confirmed=false" >> "$GITHUB_OUTPUT"
-          ./lambdactl ls   # visible post-teardown state in the log
+          ID="${{ steps.up.outputs.id }}"
+          # Primary: the id the launch step captured. Secondary: EVERY instance carrying this
+          # job's name tag (unique per run attempt), which catches a launch that died before
+          # the id reached the step output. Both are attempted; neither aborts the other.
+          rc=0
+          if [[ -n "$ID" ]]; then ./lambdactl down "$ID" || rc=1; fi
+          ./lambdactl down --all-named "$INSTANCE_NAME" || rc=1
+          # Confirm from a FOLLOW-UP LISTING, not from the terminate call's exit status: the
+          # step fails unless nothing with our id or name is left in a non-terminating state.
+          # A listing that cannot be fetched is "not confirmed". Poll briefly — the API can
+          # lag the terminate call by a few seconds.
+          confirmed=false
+          for _ in $(seq 1 12); do
+            if LS="$(./lambdactl ls)"; then
+              LIVE="$(awk -v id="$ID" -v name="$INSTANCE_NAME" \
+                        '(id != "" && $1 == id) || $2 == name { if ($4 != "terminating" && $4 != "terminated") print }' \
+                        <<<"$LS")"
+              if [[ -z "$LIVE" ]]; then confirmed=true; break; fi
+              echo "==> still live:"; echo "$LIVE"
+            else
+              echo "==> could not list instances; retrying"
+            fi
+            sleep 10
+          done
+          echo "confirmed=$confirmed" >> "$GITHUB_OUTPUT"
+          echo "==> post-teardown state:"; ./lambdactl ls || true
+          if [[ "$confirmed" != "true" ]]; then
+            echo "::error::GPU instance NOT confirmed terminated (id='$ID' name='$INSTANCE_NAME'). Terminate it by hand: ./lambdactl down --all-named $INSTANCE_NAME" >&2
+            exit 1
+          fi
+          [[ $rc -eq 0 ]] || echo "::warning::a terminate call failed, but the follow-up listing shows nothing live under id='$ID' / name='$INSTANCE_NAME'"
 
       # cost-log.jsonl is read by analysis/aggregate.py --cost-log, which joins on the HARNESS
       # run_id (<model>__<suite>__<ts>__<hex>) and reads setup_cost_usd / setup_seconds. It is
@@ -182,10 +258,20 @@ jobs:
           SHARE=$(awk -v s="$SETUP_S" -v n="$N" 'BEGIN{printf "%.3f", s/n}')
 
           grep '^RUN ' "$RUNS" | while read -r _ RID SUITE _ STATUS; do
+            # Price ladder per run: (1) price.effective_cents_per_hour from the run manifest the
+            # package step pulled back — the SAME number aggregate.py prices the run with, so the
+            # ledger cannot disagree with the headline; (2) the list price parsed above; (3) none.
+            # A zero or missing value is "unknown", never a price.
+            RUN_CPH=""; SRC=""
+            M="results/$RID/run-manifest.json"
+            if [[ -f "$M" ]]; then
+              RUN_CPH="$(python3 -c 'import json,sys; v=((json.load(open(sys.argv[1])).get("price") or {}).get("effective_cents_per_hour")); print(int(v) if isinstance(v,(int,float)) and v>0 else "")' "$M" 2>/dev/null || true)"
+            fi
+            if [[ -n "$RUN_CPH" ]]; then SRC="run-manifest"; elif [[ -n "$CPH" ]]; then RUN_CPH="$CPH"; SRC="lambdactl-types"; fi
             PRICE=""
-            if [[ -n "$CPH" ]]; then
-              USD=$(awk -v s="$SHARE" -v c="$CPH" 'BEGIN{printf "%.6f", s/3600*c/100}')
-              PRICE=$(printf '"effective_cents_per_hour":%s,"setup_cost_usd":%s,' "$CPH" "$USD")
+            if [[ -n "$RUN_CPH" ]]; then
+              USD=$(awk -v s="$SHARE" -v c="$RUN_CPH" 'BEGIN{printf "%.6f", s/3600*c/100}')
+              PRICE=$(printf '"effective_cents_per_hour":%s,"setup_cost_usd":%s,"price_source":"%s",' "$RUN_CPH" "$USD" "$SRC")
             fi
             printf '{"record":"run","run_id":"%s","suite":"%s","status":"%s","setup_seconds":%s,%s"setup_seconds_job_total":%d,"runs_in_job":%d,"setup_attribution":"even-split-across-runs-in-job","setup_complete":%s,"job_elapsed_seconds":%d,"github_run_id":"%s","model":"%s","instance_type":"%s","instance_id":"%s","note":"setup = provision + weight download + vLLM load; reported separately per CONTRACTS.md 8, never folded into cost_per_resolved"}\n' \
               "$RID" "$SUITE" "$STATUS" "$SHARE" "$PRICE" "$SETUP_S" "$N" \

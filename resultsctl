@@ -524,16 +524,40 @@ cmd_verify_git_hygiene() {
   local bad=0 f
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
+    # §7.4 path rules: raw results, per-attempt artefacts, run-dir logs/env, bundles.
     case "$f" in
-      results/*|*/results.jsonl|results.jsonl|*/trajectories/*|trajectories/*|*.tar.gz|dist/*|*/patches/*|patches/*)
+      results/*|*/results.jsonl|results.jsonl|*/trajectories/*|trajectories/*|*.tar.gz|dist/*|*/patches/*|patches/*|\
+      */logs/*|logs/*|*/env/*|env/*|*/prompt-preview.txt|prompt-preview.txt)
         echo "forbidden in git: $f" >&2; bad=1; continue ;;
     esac
-    if [[ -f "$BASE_DIR/$f" ]] && grep -qE '"consent_class"[[:space:]]*:[[:space:]]*"restricted"' "$BASE_DIR/$f" 2>/dev/null; then
+    [[ -f "$BASE_DIR/$f" ]] || continue
+    # Content rule 1: anything declaring itself restricted (manifests, bundles' metadata).
+    if grep -qE '"consent_class"[[:space:]]*:[[:space:]]*"restricted"' "$BASE_DIR/$f" 2>/dev/null; then
       case "$f" in
         results-index/manifests/*.json) ;;   # manifests carry ids only — allowed by §7.4
         *) echo "restricted consent content in git: $f" >&2; bad=1 ;;
       esac
     fi
+    # Content rule 2: raw agenttask result records never carry consent_class, so probe the
+    # markers they DO carry — a one-line raw-result/v1 record of the agenttask suite
+    # (records are written compact with sorted keys, so both markers sit on one line).
+    if grep -qE '"schema"[[:space:]]*:[[:space:]]*"raw-result/v1".*"suite"[[:space:]]*:[[:space:]]*"agenttask"' "$BASE_DIR/$f" 2>/dev/null; then
+      echo "raw agenttask result record in git: $f" >&2; bad=1
+    fi
+    # Content rule 3: agenttask task/trajectory content is stamped with its dataset origin.
+    # Markdown is exempt: the suite README and CONTRACTS document the field by example.
+    if [[ "$f" != *.md ]] && grep -qE '"origin"[[:space:]]*:[[:space:]]*"internal/agenttask"' "$BASE_DIR/$f" 2>/dev/null; then
+      echo "agenttask task content (origin internal/agenttask) in git: $f" >&2; bad=1
+    fi
+    # Content rule 4: under suites/agenttask/ only seed.json may hold instance ids (ids only,
+    # §7.4). Any other file there carrying non-PLACEHOLDER instance ids is task content.
+    case "$f" in
+      suites/agenttask/seed.json|suites/agenttask/README.md) ;;
+      suites/agenttask/*)
+        if grep -E '"instance_ids?"|agenttask-[0-9]+' "$BASE_DIR/$f" 2>/dev/null | grep -qv PLACEHOLDER; then
+          echo "non-placeholder agenttask instance ids outside seed.json: $f" >&2; bad=1
+        fi ;;
+    esac
   done <<<"$files"
   [[ "$bad" == "0" ]] || dief "git hygiene check failed ($scope) — see docs/CONTRACTS.md §7.4"
   echo "git-hygiene OK ($scope)"

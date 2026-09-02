@@ -562,6 +562,11 @@ class Executor:
     """Command + file interface to one task workspace."""
 
     workdir: str = "/"
+    # Commit the workspace was handed to the model at, recorded by build_workspace() the
+    # moment the tree is diffable. capture_patch() diffs against THIS sha, never against
+    # HEAD: the model has an unrestricted shell and may `git commit` mid-attempt, which
+    # would move HEAD and make an index-vs-HEAD diff empty (NO_PATCH for a real fix).
+    base_sha: str = ""
 
     def run(self, command: str, timeout_s: int) -> tuple[int, str]:
         raise NotImplementedError
@@ -609,7 +614,7 @@ class LocalExecutor(Executor):
 
     def cleanup(self) -> None:
         # Idempotent: build_workspace() may clean up a half-built workspace that
-        # run_attempt()'s `finally` will then release again.
+        # run_attempt_loop()'s `finally` will then release again.
         if not self.owned:
             return
         self.owned = False
@@ -725,8 +730,9 @@ class DockerExecutor(Executor):
 def _ensure_git_base(executor: "Executor", task: Any) -> None:
     """Make an adapter-materialized workspace diffable.
 
-    capture_patch() derives the attempt's patch from `git diff --cached`. A workspace laid
-    down from a tarball (the agenttask pack) has no repository, so the diff is empty and
+    capture_patch() derives the attempt's patch from `git diff --cached <base_sha>`. A
+    workspace laid down from a tarball (the agenttask pack) has no repository, so there is
+    no base to diff against and
     EVERY attempt on that suite records NO_PATCH regardless of what the model did — the
     uncontaminated control suite would silently score 0% and read as a model result rather
     than as broken plumbing. Initialise a repo and commit the pristine tree so the diff has
@@ -748,6 +754,18 @@ def _ensure_git_base(executor: "Executor", task: Any) -> None:
                 "could not create a git base for %s (%s): %s"
                 % (getattr(task, "instance_id", "?"), cmd, out[:300])
             )
+
+
+_SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
+
+
+def _record_base_sha(executor: "Executor") -> None:
+    """Pin the commit the model starts from (see Executor.base_sha). INFRA_SANDBOX if absent."""
+    rc, out = executor.run("git rev-parse --verify HEAD^{commit}", 60)
+    found = _SHA_RE.findall(out)  # run() merges stderr; take the sha, not a warning
+    if rc != 0 or not found:
+        raise SandboxError(f"could not resolve the workspace base commit: {out.strip()[:300]}")
+    executor.base_sha = found[-1]
 
 
 def _adapter_for(task: Any) -> Any:
@@ -799,7 +817,12 @@ def build_workspace(task: Any, attempt_slug: str, scratch_root: Path) -> Executo
                         f"adapter materialize() failed for {task.instance_id}: {exc}"
                     ) from exc
                 ex = LocalExecutor(dest, owned=True)
-                _ensure_git_base(ex, task)
+                try:
+                    _ensure_git_base(ex, task)
+                    _record_base_sha(ex)
+                except SandboxError:
+                    ex.cleanup()
+                    raise
                 return ex
         if not source or not Path(source).exists():
             raise SandboxError(
@@ -828,6 +851,9 @@ def build_workspace(task: Any, attempt_slug: str, scratch_root: Path) -> Executo
         rc, _ = executor.run("git rev-parse --is-inside-work-tree", 60)
         if rc != 0:
             raise SandboxError("workspace is not a git work tree — no diff can be produced")
+        # Docker and clone branches: the tree is diffable from here on. Pinned BEFORE the
+        # setup commands so anything they touch shows up in the diff exactly as before.
+        _record_base_sha(executor)
         for cmd in env.get("setup_cmds") or []:
             rc, out = executor.run(str(cmd), 3600)
             if rc != 0:
@@ -848,11 +874,22 @@ def _have(binary: str) -> bool:
 
 
 def capture_patch(executor: Executor, max_bytes: int = 1_000_000) -> str:
-    """The attempt's diff: everything in the work tree against the base commit."""
-    executor.run("git add -A -- .", 300)
-    rc, out = executor.run("git diff --cached --no-color --no-ext-diff", 600)
+    """The attempt's diff: everything in the work tree against the recorded base commit.
+
+    Diffs the index against `executor.base_sha` (not HEAD), so a model that committed
+    mid-attempt still yields its full patch. A git failure here is raised as SandboxError
+    (→ INFRA_SANDBOX, excluded from the denominator) rather than returned as "" — an empty
+    string is indistinguishable from "the model changed nothing" and would score NO_PATCH.
+    """
+    base_sha = (executor.base_sha or "").strip()
+    if not base_sha:
+        raise SandboxError("workspace has no recorded base commit; cannot capture a patch")
+    rc, out = executor.run("git add -A -- .", 300)
     if rc != 0:
-        return ""
+        raise SandboxError(f"git add failed while capturing the patch: {out.strip()[-300:]}")
+    rc, out = executor.run(f"git diff --cached --no-color --no-ext-diff {base_sha}", 600)
+    if rc != 0:
+        raise SandboxError(f"git diff against {base_sha[:12]} failed: {out.strip()[-300:]}")
     if len(out.encode("utf-8")) > max_bytes:
         # A diff this large is never a real patch; record it truncated rather than blowing
         # up the bundle. It will fail to apply and be graded PATCH_MALFORMED.
@@ -1206,8 +1243,10 @@ def parse_tool_calls(raw_calls: list, tool_names: frozenset[str]) -> list[dict]:
                 "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
                 "name": name,
                 "args": args,
-                "args_sha256": sha256_text(json.dumps(args, sort_keys=True, separators=(",", ":"))),
-                "args_bytes": len(json.dumps(args, separators=(",", ":")).encode("utf-8")),
+                # canonical_json (sorted keys, compact, ensure_ascii=False) — the one recipe
+                # CONTRACTS.md §0 documents for every *_sha256 over an object.
+                "args_sha256": hashlib.sha256(canonical_json(args)).hexdigest(),
+                "args_bytes": len(canonical_json(args)),
                 "raw": call,
             }
         )
@@ -1482,26 +1521,55 @@ def grade_patch(ctx: RunContext, task: Any, patch: str) -> tuple[Any, str | None
     return verdict, None
 
 
-def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
-    """Execute one attempt end to end and return its raw-result/v1 record."""
-    instance_id = task.instance_id
-    slug = f"{instance_id}__pass-{pass_idx}"
-    base_seed = int(ctx.params["seed"])
-    seed = attempt_seed(base_seed, pass_idx)
-    started_at = utcnow()
-    started_mono = time.monotonic()
-    deadline = started_mono + float(ctx.params["task_timeout_s"])
+class AttemptState:
+    """What the agent-loop stage hands to the grading stage.
 
-    traj_rel = f"trajectories/{instance_id}/pass-{pass_idx}.jsonl"
-    patch_rel = f"patches/{instance_id}/pass-{pass_idx}.diff"
-    traj_path = ctx.run_dir / traj_rel
-    patch_path = ctx.run_dir / patch_rel
-    log_path = ctx.run_dir / "logs" / "attempts" / f"{slug}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    One attempt runs in two stages on two pools (see cmd_run): `run_attempt_loop` holds a
+    GPU-bound slot only while the model is actually being served; grading (docker + tests,
+    up to an hour) happens in `run_attempt_grade` on a CPU-sized pool, so the vLLM server
+    is never idling behind a grader. Everything measured by the loop stage — tokens,
+    iterations, latencies, the patch text — lives here so no later failure can lose it.
+    """
 
-    stats = Stats()
-    traj = TrajectoryWriter(traj_path, int(ctx.cfg["loop"]["trajectory_content_max_bytes"]))
-    log_handle = log_path.open("w", encoding="utf-8")
+    def __init__(self, ctx: "RunContext", task: Any, pass_idx: int) -> None:
+        self.task = task
+        self.instance_id = task.instance_id
+        self.pass_idx = pass_idx
+        self.slug = f"{self.instance_id}__pass-{pass_idx}"
+        self.base_seed = int(ctx.params["seed"])
+        self.seed = attempt_seed(self.base_seed, pass_idx)
+        self.started_at = utcnow()
+        self.started_mono = time.monotonic()
+        self.traj_rel = f"trajectories/{self.instance_id}/pass-{pass_idx}.jsonl"
+        self.patch_rel = f"patches/{self.instance_id}/pass-{pass_idx}.diff"
+        self.traj_path = ctx.run_dir / self.traj_rel
+        self.patch_path = ctx.run_dir / self.patch_rel
+        self.log_path = ctx.run_dir / "logs" / "attempts" / f"{self.slug}.log"
+        self.stats = Stats()
+        self.traj_records = 0
+        self.terminal_code: str | None = None
+        self.detail = ""
+        self.patch = ""
+
+
+def _append_log(path: Path, message: str) -> None:
+    """Best-effort line to the attempt log from the grading stage (the loop stage's handle
+    is closed by then so a long grading queue does not hold hundreds of fds open)."""
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{iso(utcnow())} {message}\n")
+    except OSError:
+        pass
+
+
+def run_attempt_loop(ctx: RunContext, task: Any, pass_idx: int) -> AttemptState:
+    """Stage 1 of an attempt: workspace, agent loop, patch capture. Holds a GPU-bound slot."""
+    st = AttemptState(ctx, task, pass_idx)
+    deadline = st.started_mono + float(ctx.params["task_timeout_s"])
+    st.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    traj = TrajectoryWriter(st.traj_path, int(ctx.cfg["loop"]["trajectory_content_max_bytes"]))
+    log_handle = st.log_path.open("w", encoding="utf-8")
 
     def log(message: str) -> None:
         log_handle.write(f"{iso(utcnow())} {message}\n")
@@ -1511,8 +1579,6 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
     terminal_code: str | None = None
     detail = ""
     patch = ""
-    verdict: Any = None
-    grader_error: str | None = None
     assistant_texts: list[str] = []
 
     try:
@@ -1520,9 +1586,9 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
         # otherwise build a whole workspace (docker run, git clone, setup_cmds) only to
         # abort inside agent_loop — minutes of paid GPU-node time per attempt.
         _check_stop()
-        log(f"attempt {slug} suite={ctx.suite} model={ctx.model}")
-        log(f"sampling: temperature={ctx.params['temperature']} seed={seed} "
-            f"(base_seed {base_seed} + pass_idx {pass_idx})")
+        log(f"attempt {st.slug} suite={ctx.suite} model={ctx.model}")
+        log(f"sampling: temperature={ctx.params['temperature']} seed={st.seed} "
+            f"(base_seed {st.base_seed} + pass_idx {pass_idx})")
         prompt = ctx.adapter.build_prompt(task)
         if prompt.template_id != prompt_pkg.TEMPLATE_ID:
             # §5.2: all three adapters must render the same template. A mismatch means the
@@ -1534,12 +1600,12 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
             )
         log(f"prompt {prompt.template_id} sha256={prompt.prompt_sha256}")
 
-        executor = build_workspace(task, slug, ctx.scratch_root)
-        log(f"workspace ready: {type(executor).__name__} {executor.workdir}")
+        executor = build_workspace(task, st.slug, ctx.scratch_root)
+        log(f"workspace ready: {type(executor).__name__} {executor.workdir} base={executor.base_sha[:12]}")
         toolbox = Toolbox(executor, task, ctx.cfg)
 
         terminal_code, detail = agent_loop(
-            ctx, prompt, toolbox, stats, traj, log, deadline, assistant_texts, seed
+            ctx, prompt, toolbox, st.stats, traj, log, deadline, assistant_texts, st.seed
         )
         patch = capture_patch(executor)
         log(f"loop finished: terminal={terminal_code or 'self-terminated'} patch_bytes={len(patch)}")
@@ -1574,27 +1640,119 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
                 executor.cleanup()
             except Exception:  # noqa: BLE001
                 pass
+        traj.close()
+        log_handle.close()
+
+    st.terminal_code = terminal_code
+    st.detail = detail
+    st.patch = patch
+    st.traj_records = traj.records
+    return st
+
+
+_NO_PATCH_BLOCK: dict[str, Any] = {
+    "present": False,
+    "ref": None,
+    "sha256": None,
+    "bytes": None,
+    "files_changed": None,
+    "lines_added": None,
+    "lines_removed": None,
+}
+
+
+def run_attempt_grade(ctx: RunContext, st: AttemptState) -> dict:
+    """Stage 2 of an attempt: persist artefacts, grade, assemble the raw-result/v1 record.
+
+    Runs on the grading pool, never on a GPU-bound slot. The loop stage's metrics are
+    already in `st`; a host-disk failure while writing the patch or reading back the
+    trajectory (ENOSPC, a vanished run dir) is recorded as INFRA_HOST on a record that
+    still carries the tokens, iterations, latency and cost the model actually consumed —
+    it must never fall through to _fallback_record, which zeroes all of that.
+    """
+    task, pass_idx, instance_id = st.task, st.pass_idx, st.instance_id
+    terminal_code, detail, patch = st.terminal_code, st.detail, st.patch
+    stats = st.stats
+    verdict: Any = None
+    grader_error: str | None = None
+    host_error: str | None = None
+
+    # --- patch artefact (before grading: a verdict on a patch that could not be persisted
+    # would be unverifiable, and a 3600s grade for an INFRA_HOST record is wasted) --------
+    patch_block: dict[str, Any] = dict(_NO_PATCH_BLOCK)
+    if patch.strip():
+        try:
+            st.patch_path.parent.mkdir(parents=True, exist_ok=True)
+            st.patch_path.write_text(patch, encoding="utf-8")
+            patch_sha = sha256_file(st.patch_path)
+            patch_bytes = st.patch_path.stat().st_size
+        except OSError as exc:
+            host_error = f"host disk: could not persist patch {st.patch_rel}: {exc}"[:512]
+            _append_log(st.log_path, host_error)
+            try:
+                st.patch_path.unlink()  # a half-written diff must not be packaged as real
+            except OSError:
+                pass
+        else:
+            files_changed, added, removed = patch_stats(patch)
+            patch_block = {
+                "present": True,
+                "ref": st.patch_rel,
+                "sha256": patch_sha,
+                "bytes": patch_bytes,
+                "files_changed": files_changed,
+                "lines_added": added,
+                "lines_removed": removed,
+            }
 
     # Grading. Skipped for SERVER_*/INFRA_* (the attempt never reached a gradable state) and
     # for MODEL_REFUSAL (no patch by definition); everything else is graded, so that a patch
     # produced under a budget or loop cut-off can still come back OK.
     gradable = terminal_code is None or terminal_code.startswith(("MODEL_", "BUDGET_"))
-    if gradable and terminal_code != "MODEL_REFUSAL":
+    if gradable and terminal_code != "MODEL_REFUSAL" and host_error is None:
         verdict, grader_error = grade_patch(ctx, task, patch)
         if grader_error:
-            log(f"grader failed: {grader_error}")
+            _append_log(st.log_path, f"grader failed: {grader_error}")
         else:
-            log(f"graded: resolved={_verdict_field(verdict, 'resolved')} "
-                f"code={_verdict_field(verdict, 'error_code')}")
-    traj.close()
-    log_handle.close()
+            _append_log(
+                st.log_path,
+                f"graded: resolved={_verdict_field(verdict, 'resolved')} "
+                f"code={_verdict_field(verdict, 'error_code')}",
+            )
 
     ended_at = utcnow()
-    wall_clock_ms = int((time.monotonic() - started_mono) * 1000)
+    # CONTRACTS.md §3.1: ended_at - started_at, grading included.
+    wall_clock_ms = int((time.monotonic() - st.started_mono) * 1000)
+
+    # --- trajectory artefact (written by the loop stage; read back for its digest) -------
+    trajectory_block: dict[str, Any]
+    try:
+        trajectory_block = {
+            "ref": st.traj_rel,
+            "sha256": sha256_file(st.traj_path),
+            "records": st.traj_records,
+            "bytes": st.traj_path.stat().st_size,
+            "consent_class": ctx.consent_class,
+        }
+    except OSError as exc:
+        note = f"host disk: could not read back trajectory {st.traj_rel}: {exc}"[:512]
+        _append_log(st.log_path, note)
+        host_error = host_error or note
+        trajectory_block = {
+            "ref": None,
+            "sha256": None,
+            "records": st.traj_records,
+            "bytes": 0,
+            "consent_class": ctx.consent_class,
+        }
 
     # --- resolve the final error_code (CONTRACTS.md §4 precedence) ---------------------
     resolved = bool(_verdict_field(verdict, "resolved", False))
-    if grader_error is not None:
+    if host_error is not None:
+        error_code = "INFRA_HOST"
+        detail = host_error
+        resolved = False
+    elif grader_error is not None:
         error_code = "INFRA_GRADER"
         detail = grader_error
         resolved = False
@@ -1618,40 +1776,6 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
         detail = f"adapter returned unknown error_code {error_code!r}: {detail}"[:512]
         error_code = "INFRA_UNKNOWN"
 
-    # --- patch artefact ---------------------------------------------------------------
-    patch_block: dict[str, Any]
-    if patch.strip():
-        patch_path.parent.mkdir(parents=True, exist_ok=True)
-        patch_path.write_text(patch, encoding="utf-8")
-        files_changed, added, removed = patch_stats(patch)
-        patch_block = {
-            "present": True,
-            "ref": patch_rel,
-            "sha256": sha256_file(patch_path),
-            "bytes": patch_path.stat().st_size,
-            "files_changed": files_changed,
-            "lines_added": added,
-            "lines_removed": removed,
-        }
-    else:
-        patch_block = {
-            "present": False,
-            "ref": None,
-            "sha256": None,
-            "bytes": None,
-            "files_changed": None,
-            "lines_added": None,
-            "lines_removed": None,
-        }
-
-    trajectory_block = {
-        "ref": traj_rel,
-        "sha256": sha256_file(traj_path) if traj_path.exists() else None,
-        "records": traj.records,
-        "bytes": traj_path.stat().st_size if traj_path.exists() else 0,
-        "consent_class": ctx.consent_class,
-    }
-
     grade_block = None
     if verdict is not None and grader_error is None:
         grade_block = {
@@ -1662,7 +1786,8 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
             "pass_to_pass": _verdict_field(verdict, "pass_to_pass", {"passed": 0, "total": 0}),
             "graded_at": iso(ended_at),
             # §2.3 invariant: must equal the manifest's harness.environment_digest on every
-            # record. A record that disagrees was graded by a different environment.
+            # record. This is the LIVE adapter value — cmd_run compared it to the manifest
+            # before the first attempt and refused to run (exit 3) on a mismatch.
             "environment_digest": ctx.environment_digest,
         }
 
@@ -1685,12 +1810,12 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
         # Recorded per attempt so a reader can verify from the raw data that every pass ran
         # with the same sampling parameters — the harness-constant claim, made checkable.
         "sampling": {
-            "base_seed": base_seed,
-            "seed": seed,
+            "base_seed": st.base_seed,
+            "seed": st.seed,
             "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
             "temperature": ctx.params["temperature"],
         },
-        "started_at": iso(started_at),
+        "started_at": iso(st.started_at),
         "ended_at": iso(ended_at),
         "wall_clock_ms": wall_clock_ms,
         "resolved": bool(resolved),
@@ -1727,6 +1852,15 @@ def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
     if resolved and error_code != "OK":  # invariant from §3.1, checked rather than assumed
         record["error_code"] = "OK"
     return record
+
+
+def run_attempt(ctx: RunContext, task: Any, pass_idx: int) -> dict:
+    """Execute one attempt end to end and return its raw-result/v1 record.
+
+    Convenience for callers that do not split the stages across pools (tests, one-off
+    runs); cmd_run schedules run_attempt_loop and run_attempt_grade separately.
+    """
+    return run_attempt_grade(ctx, run_attempt_loop(ctx, task, pass_idx))
 
 
 # --------------------------------------------------------------------------------------
@@ -1820,6 +1954,10 @@ def existing_attempts(results_path: Path) -> set[tuple[str, int]]:
                 continue
             try:
                 record = json.loads(line)
+                # Same definition of "done" as manifest.py `missing`: a record whose host
+                # went away (INFRA_HOST) is retryable, not done (§3.1 / seam S1).
+                if (record.get("error_code") or "") in ("INFRA_HOST",):
+                    continue
                 done.add((record["instance_id"], int(record["pass_idx"])))
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue
@@ -1972,6 +2110,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         stderr(f"==> NONCONFORMANT: {reason}")
 
     adapter = load_adapter(suite)
+
+    # §2.3: grading is deterministic given (task, patch, environment_digest()). The check is
+    # made HERE, where grading actually happens, not only in run.sh's manifest step — it is
+    # what catches a grader/dataset upgrade between the original run and a --resume, which
+    # would otherwise mix verdicts from two environments under one manifest digest.
+    try:
+        live_digest = str(adapter.environment_digest() or "")
+    except Exception as exc:  # noqa: BLE001 — no digest means no provable environment
+        stderr(f"==> environment_digest: adapter.environment_digest() failed: {exc}")
+        return 3
+    if manifest is not None:
+        if environment_digest and live_digest != environment_digest:
+            stderr(
+                "==> environment_digest mismatch (CONTRACTS.md §2.3): the manifest recorded "
+                f"{environment_digest} but the live adapter reports {live_digest}. The grading "
+                "environment changed since the manifest was written (grader or dataset upgrade "
+                "across --resume?); refusing to grade under an environment the manifest does "
+                "not describe. Start a new run, or restore the recorded environment."
+            )
+            return 3
+        if not environment_digest:
+            stderr(
+                "==> warning: manifest has no harness.environment_digest (null → nonconformant); "
+                f"records will be stamped with the live value {live_digest or '<empty>'}"
+            )
+    environment_digest = live_digest
+
     seed_file = Path(args.seed_file) if args.seed_file else default_seed_file(suite)
     partitions_path = Path(args.partitions) if args.partitions else REPO_ROOT / "suites/partitions.json"
     tasks = select_tasks(adapter, seed_file, args.limit, args.instance or [])
@@ -2056,20 +2221,52 @@ def cmd_run(args: argparse.Namespace) -> int:
     written = 0
     resolved_count = 0
 
-    def execute(item: tuple[Any, int]) -> dict:
+    def execute(item: tuple[Any, int]) -> AttemptState:
         task, pass_idx = item
-        return run_attempt(ctx, task, pass_idx)
+        return run_attempt_loop(ctx, task, pass_idx)
 
-    # Attempts are submitted lazily, a shallow queue at a time, instead of all at once:
-    # a stop signal must not leave hundreds of queued attempts that each still build a
-    # workspace before aborting. On stop we submit nothing further and cancel whatever is
-    # still queued; only the attempts already running have to drain. Cancelled attempts
-    # write no record, so `--resume` picks them up unchanged (CONTRACTS.md §1.3 exit 4).
+    def finish(item: tuple[Any, int], record: dict) -> None:
+        nonlocal written, resolved_count
+        _task, pass_idx = item
+        writer.append(record)
+        written += 1
+        counters[record["error_code"]] = counters.get(record["error_code"], 0) + 1
+        resolved_count += 1 if record["resolved"] else 0
+        stderr(
+            f"==> [{written}/{planned}] {record['instance_id']} pass-{pass_idx} "
+            f"{record['error_code']} resolved={record['resolved']} "
+            f"{record['wall_clock_ms'] // 1000}s iters={record['iterations']} "
+            f"tok={record['tokens']['total']}"
+        )
+
+    # Two pools. The loop pool (`concurrency` slots) is GPU-bound: a slot is held only
+    # while the model is being served. Grading — docker builds and test runs, up to an hour
+    # — would otherwise sit inside one of those slots while the vLLM server idles at full
+    # hourly price, so it runs on a separate CPU-sized pool and the record is assembled and
+    # appended when THAT finishes. Exactly one record per attempt either way.
+    #
+    # Loop attempts are submitted lazily, a shallow queue at a time, instead of all at
+    # once: a stop signal must not leave hundreds of queued attempts that each still build
+    # a workspace before aborting. On stop we submit nothing further and cancel whatever
+    # is still queued; the attempts already running drain (their _check_stop aborts them
+    # with INFRA_HOST, and they DO write that record — manifest.py's `missing` treats
+    # INFRA_HOST as retryable and run.sh's --resume calls `prune-retryable` to drop those
+    # records before re-running the pass, so §3.1 still holds at one record per attempt).
+    # Attempts cancelled before they started write nothing and `--resume` picks them up
+    # unchanged (CONTRACTS.md §1.3 exit 4). Grading futures are never cancelled: each one
+    # represents paid model work whose record must land.
     max_workers = int(params["concurrency"])
     queue_depth = max(1, max_workers) * 2
+    grade_workers = int(
+        os.environ.get("HARNESS_GRADE_CONCURRENCY", "") or min(os.cpu_count() or 4, 8)
+    )
+    grade_workers = max(1, grade_workers)
+    stderr(f"==> grading concurrency {grade_workers} (HARNESS_GRADE_CONCURRENCY overrides)")
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    grade_pool = concurrent.futures.ThreadPoolExecutor(max_workers=grade_workers)
     work_iter = iter(work)
-    pending: dict = {}
+    pending: dict = {}  # loop-stage futures
+    grading: dict = {}  # grade-stage futures
 
     def submit_next() -> bool:
         if _STOP.is_set():
@@ -2092,30 +2289,30 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     try:
         top_up()
-        while pending:
+        while pending or grading:
             done, _ = concurrent.futures.wait(
-                list(pending), return_when=concurrent.futures.FIRST_COMPLETED
+                list(pending) + list(grading), return_when=concurrent.futures.FIRST_COMPLETED
             )
             for future in done:
-                task, pass_idx = pending.pop(future)
-                if future.cancelled():
-                    continue
-                try:
-                    record = future.result()
-                except concurrent.futures.CancelledError:
-                    continue
-                except Exception as exc:  # noqa: BLE001 — never lose an attempt record
-                    record = _fallback_record(ctx, task, pass_idx, exc)
-                writer.append(record)
-                written += 1
-                counters[record["error_code"]] = counters.get(record["error_code"], 0) + 1
-                resolved_count += 1 if record["resolved"] else 0
-                stderr(
-                    f"==> [{written}/{planned}] {record['instance_id']} pass-{pass_idx} "
-                    f"{record['error_code']} resolved={record['resolved']} "
-                    f"{record['wall_clock_ms'] // 1000}s iters={record['iterations']} "
-                    f"tok={record['tokens']['total']}"
-                )
+                if future in pending:
+                    item = pending.pop(future)
+                    if future.cancelled():
+                        continue
+                    try:
+                        state = future.result()
+                    except concurrent.futures.CancelledError:
+                        continue
+                    except Exception as exc:  # noqa: BLE001 — never lose an attempt record
+                        finish(item, _fallback_record(ctx, item[0], item[1], exc))
+                        continue
+                    grading[grade_pool.submit(run_attempt_grade, ctx, state)] = item
+                else:
+                    item = grading.pop(future)
+                    try:
+                        record = future.result()
+                    except Exception as exc:  # noqa: BLE001 — never lose an attempt record
+                        record = _fallback_record(ctx, item[0], item[1], exc)
+                    finish(item, record)
             if _STOP.is_set():
                 drain_queue()
             else:
@@ -2124,6 +2321,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         if _STOP.is_set():
             drain_queue()
         pool.shutdown(wait=True)
+        grade_pool.shutdown(wait=True)
         writer.close()
         # Nothing under the scratch root outlives the run: each attempt removes its own
         # workspace, this removes the (empty) run-scoped tree and anything an abort left.

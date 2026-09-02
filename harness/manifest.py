@@ -7,8 +7,10 @@
 #   manifest.py grading-preflight  refuse (exit 3) when this host cannot grade the suite
 #   manifest.py scan         ...  attempt + failure histogram of results.jsonl (KEY=VALUE)
 #   manifest.py missing      ...  instance ids with no record for a pass (for --resume)
+#   manifest.py prune-retryable    drop a pass's INFRA_HOST records so --resume can replace them
 #   manifest.py checksums    ...  write SHA256SUMS over a run directory
 #   manifest.py get          ...  print one dotted field of a JSON file
+#   manifest.py dir-digest   ...  print the §2.4 digest of a directory (test hook)
 #
 # Implements docs/CONTRACTS.md §2 (run-manifest/v1) and §2.4 (directory digest).
 # Python 3.11 stdlib only. Never touches the network unless HARNESS_ALLOW_NETWORK=1.
@@ -17,15 +19,19 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
+import ipaddress
 import json
 import os
 import platform
 import re
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 MANIFEST_SCHEMA = "run-manifest/v1"
 RESULT_SCHEMA = "raw-result/v1"
@@ -77,6 +83,21 @@ INFERENCE_DEFAULTS = {
 STUDY_MAX_MODEL_LEN = 262144
 
 UNRESOLVED = "unresolved"
+
+# Serving flags that CONTRACTS.md §0.1 holds constant across models. modelctl places
+# $EXTRA_ARGS *before* these on the vllm command line so that under argparse last-wins the
+# study values always win; a models.d/<model>.env that carries one of them anyway is a
+# nonconformant run, not a silently-overridden one.
+HELD_CONSTANT_SERVING_FLAGS = ("--max-model-len", "--served-model-name")
+
+# Records carrying this error code were never scored: the host itself went away (SIGTERM,
+# reaper, disk full). A --resume replaces them rather than counting them as done (§3.1).
+RETRYABLE_ERROR_CODES = ("INFRA_HOST",)
+
+# Per-file hashing threads for dir_digest. hashlib releases the GIL, so sha256 over a
+# multi-hundred-GB weights tree scales with cores; the digest itself is order-independent
+# of how the hashes were produced (§2.4 sorts the stream afterwards).
+DIGEST_WORKERS = min(32, max(4, (os.cpu_count() or 4) * 2))
 
 
 # --------------------------------------------------------------------------- basics
@@ -181,19 +202,30 @@ class SymlinkError(ValueError):
     """A weights tree contained a symlink; §2.4 makes that fatal for weights."""
 
 
-def dir_digest(root: Path, symlinks_fatal: bool = False):
-    """CONTRACTS.md §2.4. Returns (hexdigest, file_count, total_bytes)."""
+def dir_digest(root: Path, symlinks_fatal: bool = False, workers=None):
+    """CONTRACTS.md §2.4. Returns (hexdigest, file_count, total_bytes).
+
+    ``workers`` > 1 hashes files on a thread pool; ``workers == 1`` is the plain serial
+    reference. Both produce the identical byte stream: the per-file hashes are a pure
+    function of the bytes, and the ``(rel, h)`` pairs are sorted afterwards exactly as
+    §2.4 step 3 requires, so the result cannot depend on completion order.
+    """
     files, links = walk_files(root)
     if links and symlinks_fatal:
         raise SymlinkError("%s contains symlinks (%s ...) — weights must be real files"
                            % (root, links[0]))
     if links:
         warn("%s: skipped %d symlink(s) per §2.4" % (root, len(links)))
-    pairs = []
-    total = 0
-    for rel, full in files:
-        pairs.append((rel, sha256_file(full)))
-        total += os.path.getsize(full)
+    if workers is None:
+        workers = DIGEST_WORKERS
+    paths = [full for _rel, full in files]
+    if workers > 1 and len(paths) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(paths))) as ex:
+            hashes = list(ex.map(sha256_file, paths))
+    else:
+        hashes = [sha256_file(full) for full in paths]
+    pairs = [(rel, h) for (rel, _full), h in zip(files, hashes)]
+    total = sum(os.path.getsize(full) for full in paths)
     pairs.sort(key=lambda p: p[0].encode("utf-8"))
     stream = "".join("%s  %s\n" % (h, rel) for rel, h in pairs)
     return sha256_text(stream), len(pairs), total
@@ -210,10 +242,34 @@ def dir_fingerprint(root: Path) -> str:
     return sha256_text(json.dumps(meta, sort_keys=True, separators=(",", ":")))
 
 
+def weight_digest_cache_dir(root: Path) -> Path:
+    """Where the digest cache for ``root`` lives.
+
+    Weights sit on the persistent filesystem while ``$HOME`` is the ephemeral root disk of
+    a freshly dispatched CI instance, so a cache under ``~`` is cold on every dispatch and
+    a multi-hundred-GB rehash lands on the critical path after vLLM is already billing.
+    The cache therefore lives *next to* the weights — ``<weights_dir>/../.harness/
+    weight-digest/`` — on the same filesystem but OUTSIDE the digested tree, so it can
+    never perturb the digest it describes (§2.4 does not skip ``.harness/``, so putting it
+    inside the tree would change the digest on the second run). ``~/.harness`` is the
+    fallback only when that location is not writable.
+    """
+    candidates = [root.parent / ".harness" / "weight-digest",
+                  Path.home() / ".harness" / "weight-digest"]
+    for cand in candidates:
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            if os.access(str(cand), os.W_OK):
+                return cand
+        except OSError:
+            continue
+    return candidates[-1]
+
+
 def cached_dir_digest(root: Path, cache_key: str):
     """Digest a very large tree once. Cache lives outside the tree so it cannot
-    perturb the digest it describes."""
-    cache = Path.home() / ".harness" / "weight-digest" / (cache_key + ".json")
+    perturb the digest it describes (see weight_digest_cache_dir)."""
+    cache = weight_digest_cache_dir(root) / (cache_key + ".json")
     fp = dir_fingerprint(root)
     try:
         blob = read_json(cache)
@@ -304,6 +360,41 @@ def git_facts(repo: Path, res: Resolver):
     if dirty:
         res.nonconformant("repo has uncommitted changes (git status --porcelain non-empty)")
     return res.required("harness.repo_git_sha", sha), describe, dirty
+
+
+def extra_args_overriding_held_constants(extra_args: str):
+    """The held-constant serving flags that ``EXTRA_ARGS`` tries to set, in order."""
+    try:
+        tokens = shlex.split(extra_args or "")
+    except ValueError:
+        tokens = (extra_args or "").split()
+    hits = []
+    for tok in tokens:
+        name = tok.split("=", 1)[0]
+        name = name.replace("_", "-")  # argparse accepts --max_model_len too
+        if name in HELD_CONSTANT_SERVING_FLAGS and name not in hits:
+            hits.append(name)
+    return hits
+
+
+def endpoint_is_loopback(endpoint: str) -> bool:
+    """True when the --endpoint host is localhost / 127.0.0.1 / ::1 (self-hosted vLLM)."""
+    raw = (endpoint or "").strip()
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        host = urlsplit(raw).hostname
+    except ValueError:
+        return False
+    if not host:
+        return False
+    host = host.strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def model_env(key: str, default: str = "") -> str:
@@ -672,8 +763,19 @@ def load_seed_file(path: Path, suite: str):
         die("seed file %s contains duplicate instance ids" % path, 2)
     if blob.get("count") != len(ids):
         die("seed file %s: count=%r but %d instance_ids" % (path, blob.get("count"), len(ids)), 2)
+    # instance_ids_sha256 is the freeze seal (§6.1). It is REQUIRED for a real seed file:
+    # an absent hash is not "unfrozen", it is the signature of an edited id list whose
+    # stale hash was deleted — which would otherwise be re-sealed by the build below.
     recorded = blob.get("instance_ids_sha256")
-    if recorded and recorded != id_set_sha256(ids):
+    placeholder = bool(blob.get("placeholder"))
+    if not recorded:
+        if placeholder:
+            warn("seed file %s is a placeholder without instance_ids_sha256" % path)
+        else:
+            die("seed file %s has no instance_ids_sha256 — a frozen seed file MUST carry "
+                "the seal of its id set (§6.1); regenerate it with suites/select.py or "
+                "suites/generate_seeds.py rather than editing instance_ids" % path, 2)
+    elif recorded != id_set_sha256(ids):
         die("seed file %s: instance_ids_sha256 mismatch — the id set has been edited "
             "since it was frozen" % path, 2)
     sel = blob.get("selection") or {}
@@ -693,7 +795,22 @@ def load_partitions(path: Path):
         die("partitions file %s has schema %r, expected partitions/v1" % (path, blob.get("schema")), 2)
     if not isinstance(blob.get("partitions"), dict):
         die("partitions file %s has no partitions object" % path, 2)
+    if blob.get("placeholder"):
+        die("partitions file %s is a PLACEHOLDER — it was derived from placeholder seed "
+            "files and is not a freeze (§6.2). Regenerate it with suites/generate_partitions.py "
+            "together with the real seed files before any run" % path, 2)
+    for name, block in blob["partitions"].items():
+        if not isinstance(block, dict) or not isinstance(block.get("ids"), list):
+            die("partitions file %s: partition %r is not a {count, ids} block" % (path, name), 2)
     return blob
+
+
+def partitioned_ids(blob) -> set:
+    """Every fully-qualified ``suite::instance_id`` that resolves to some partition."""
+    out = set()
+    for block in blob["partitions"].values():
+        out.update(i for i in block["ids"] if isinstance(i, str))
+    return out
 
 
 def load_agent_config(repo: Path):
@@ -793,7 +910,14 @@ def cmd_build(args) -> int:
     truncated = len(ids) != len(all_ids)
 
     partitions_path = Path(args.partitions).resolve()
-    load_partitions(partitions_path)
+    partitions_blob = load_partitions(partitions_path)
+    # §6.2: the partitions file is frozen over exactly the seed sets. A seed set none of
+    # whose ids is partitioned was never part of that freeze — every record would come out
+    # partition:"unpartitioned" and the leakage guard would have nothing to guard.
+    qualified = set("%s::%s" % (args.suite, i) for i in all_ids)
+    if not qualified & partitioned_ids(partitions_blob):
+        res.nonconformant("no seed id is partitioned — partitions.json was not frozen for "
+                          "this seed set")
 
     def repo_rel(path: Path) -> str:
         try:
@@ -876,10 +1000,18 @@ def cmd_build(args) -> int:
         res.nonconformant("MAX_MODEL_LEN=%d in models.d/%s.env is not the held-constant "
                           "context window %d (CONTRACTS.md §0.1)"
                           % (max_model_len, args.model, STUDY_MAX_MODEL_LEN))
+    extra_args = model_env("EXTRA_ARGS", "")
+    overridden = extra_args_overriding_held_constants(extra_args)
+    if overridden:
+        res.nonconformant("EXTRA_ARGS overrides a held-constant serving flag (%s in "
+                          "models.d/%s.env)" % (", ".join(overridden), args.model))
 
     # ---- hardware / price --------------------------------------------------
     hardware, gpu = resolve_hardware(res, node_count)
     price = resolve_price(repo, hardware["instance_type"], node_count, res)
+    # A loopback endpoint is the self-hosted case: the model is billed by the instance hour.
+    # Anything else is a hosted API billed per token (CONTRACTS.md §2.2 "price").
+    price["billing_mode"] = "instance_hours" if endpoint_is_loopback(args.endpoint) else "per_token"
 
     # ---- inference ---------------------------------------------------------
     inference = dict(inference_cfg)
@@ -988,7 +1120,7 @@ def cmd_build(args) -> int:
             "tensor_parallel_size": as_int("TP", 1),
             "pipeline_parallel_size": as_int("PP", 1),
             "max_model_len": max_model_len,
-            "extra_args": model_env("EXTRA_ARGS", ""),
+            "extra_args": extra_args,
             "multinode": multinode,
             "vllm_argv": vllm_argv,
         },
@@ -1363,6 +1495,7 @@ def cmd_scan(args) -> int:
     seen = set()
     resolved = infra_grader = infra_unknown = infra_any = 0
     server = sandbox = 0
+    retryable = 0  # records `missing` would re-run — a run holding any is not complete
     # trailing_server: consecutive SERVER_* at the END of the record stream — the signature
     # of a vLLM process that died mid-run, as opposed to sporadic transient failures.
     trailing_server = 0
@@ -1384,6 +1517,8 @@ def cmd_scan(args) -> int:
             trailing_server = 0
         if code == "INFRA_SANDBOX":
             sandbox += 1
+        if code in RETRYABLE_ERROR_CODES:
+            retryable += 1
     out = [
         ("SCAN_RECORDS", len(recs)),
         ("SCAN_UNIQUE", len(seen)),
@@ -1392,6 +1527,7 @@ def cmd_scan(args) -> int:
         ("SCAN_INFRA_UNKNOWN", infra_unknown),
         ("SCAN_SERVER", server),
         ("SCAN_TRAILING_SERVER", trailing_server),
+        ("SCAN_RETRYABLE", retryable),
         ("SCAN_INFRA_SANDBOX", sandbox),
         ("SCAN_ATTEMPTS_SCORED", len(recs) - infra_any),
         ("SCAN_MALFORMED", malformed),
@@ -1405,11 +1541,61 @@ def cmd_missing(args) -> int:
     run_dir = Path(args.run_dir).resolve()
     manifest = read_json(run_dir / "run-manifest.json")
     recs, _m, _f = read_records(run_dir, manifest["run_id"])
-    done = set(r.get("instance_id") for r in recs if r.get("pass_idx") == args.pass_idx)
+    # An INFRA_HOST record was never scored (the host went away mid-attempt): it is
+    # retryable, so its instance is still missing. run.sh prunes those records before the
+    # pass re-runs (prune-retryable), which keeps §3.1 "exactly one record per attempt".
+    done = set(r.get("instance_id") for r in recs
+               if r.get("pass_idx") == args.pass_idx
+               and (r.get("error_code") or "") not in RETRYABLE_ERROR_CODES)
     missing = [i for i in manifest["suite"]["instance_ids"] if i not in done]
     if args.out:
         Path(args.out).write_text("".join(i + "\n" for i in missing), encoding="utf-8")
     sys.stdout.write("MISSING_COUNT=%d\n" % len(missing))
+    return 0
+
+
+def cmd_prune_retryable(args) -> int:
+    """Rewrite results.jsonl without this pass's INFRA_HOST records (seam S1).
+
+    Atomic (tmp + os.replace); every other line — other passes, other error codes,
+    malformed or foreign lines — is preserved byte for byte. Prints PRUNED=<count>.
+    """
+    run_dir = Path(args.run_dir).resolve()
+    path = run_dir / "results.jsonl"
+    if not path.is_file():
+        sys.stdout.write("PRUNED=0\n")
+        return 0
+    run_id = None
+    try:
+        run_id = read_json(run_dir / "run-manifest.json").get("run_id")
+    except (OSError, ValueError, AttributeError):
+        pass
+    kept = []
+    pruned = 0
+    with open(path, "rb") as fh:
+        for raw in fh:
+            drop = False
+            try:
+                rec = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                rec = None
+            if isinstance(rec, dict) \
+                    and rec.get("pass_idx") == args.pass_idx \
+                    and (rec.get("error_code") or "") in RETRYABLE_ERROR_CODES \
+                    and (run_id is None or rec.get("run_id") == run_id):
+                drop = True
+            if drop:
+                pruned += 1
+            else:
+                kept.append(raw)
+    if pruned:
+        tmp = str(path) + ".prune.tmp"
+        with open(tmp, "wb") as fh:
+            fh.writelines(kept)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, str(path))
+    sys.stdout.write("PRUNED=%d\n" % pruned)
     return 0
 
 
@@ -1453,6 +1639,21 @@ def cmd_get(args) -> int:
         sys.stdout.write(json.dumps(node, sort_keys=True) + "\n")
     else:
         sys.stdout.write("%s\n" % node)
+    return 0
+
+
+# ----------------------------------------------------------------------- dir-digest
+
+def cmd_dir_digest(args) -> int:
+    root = Path(args.dir).resolve()
+    if not root.is_dir():
+        die("%s is not a directory" % root, 2)
+    digest, count, total = dir_digest(root, symlinks_fatal=args.symlinks_fatal,
+                                      workers=args.workers)
+    if args.verbose:
+        sys.stderr.write("==> manifest: %d file(s), %d byte(s), workers=%s\n"
+                         % (count, total, args.workers or DIGEST_WORKERS))
+    sys.stdout.write(digest + "\n")
     return 0
 
 
@@ -1524,6 +1725,11 @@ def main(argv) -> int:
     m.add_argument("--out", default="")
     m.set_defaults(func=cmd_missing)
 
+    pr = sub.add_parser("prune-retryable")
+    pr.add_argument("--run-dir", required=True)
+    pr.add_argument("--pass-idx", type=int, required=True)
+    pr.set_defaults(func=cmd_prune_retryable)
+
     c = sub.add_parser("checksums")
     c.add_argument("--run-dir", required=True)
     c.set_defaults(func=cmd_checksums)
@@ -1532,6 +1738,14 @@ def main(argv) -> int:
     g.add_argument("file")
     g.add_argument("path")
     g.set_defaults(func=cmd_get)
+
+    dd = sub.add_parser("dir-digest")
+    dd.add_argument("dir")
+    dd.add_argument("--workers", type=int, default=None,
+                    help="hashing threads (1 = serial reference; default %d)" % DIGEST_WORKERS)
+    dd.add_argument("--symlinks-fatal", action="store_true")
+    dd.add_argument("--verbose", action="store_true")
+    dd.set_defaults(func=cmd_dir_digest)
 
     args = ap.parse_args(argv)
     return args.func(args)

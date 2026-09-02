@@ -91,7 +91,7 @@ booleans, each with its own list of reasons (CONTRACTS.md §2.2):
 | Flag | Means | What `aggregate.py` does |
 |---|---|---|
 | `flags.nonconformant` | a genuine **harness deviation** that breaks comparability: non-default iteration budget, dirty repo, unresolved weight revision, prompt/template drift | **excluded** from every headline number; listed with its reasons under "Runs excluded". `--include-nonconformant` overrides and the run is then flagged in the warnings |
-| `flags.provenance_incomplete` | cost/provenance attribution is **imprecise**, the science is intact: missing `lambda_instance_id` or `region`, fallback pricing, unresolved requirements-lock hash | **included**. Its group's cost columns are prefixed `≈` in `summary.md`, `cost_approximate` / `cost_approximate_reasons` are set in `by_model_suite.csv` and `summary.json`, and the unresolved fields are listed per run in the "Provenance-incomplete runs" table and on stderr |
+| `flags.provenance_incomplete` | cost/provenance attribution is **imprecise**, the science is intact: missing `lambda_instance_id` or `region`, fallback pricing, unresolved requirements-lock hash | **included**. Its group's cost columns are prefixed `≈` in `summary.md`, `cost_approximate` / `cost_approximate_reasons` are set in `by_model_suite.csv` and `summary.json`, and the unresolved fields are listed per run in the "Provenance-incomplete runs" table and on stderr. If such a run has no price and no wall clock at all, its group's cost columns are `—` (`cost_known = false`) with a `cost_unknown` warning — it is never a reason to exit 2 |
 
 Resolve rate, pass@k, token counts and the failure taxonomy are **never** affected by
 `provenance_incomplete` — only the dollar columns are, which is why excluding those runs would
@@ -125,6 +125,7 @@ Compared across **all** included runs:
 | `inference.max_tokens`, `max_attempt_tokens` | the `BUDGET_TOKENS` ceiling |
 | `inference.task_timeout_s` | the `BUDGET_WALLCLOCK` ceiling |
 | `runtime.max_model_len` | decides `MODEL_CONTEXT_OVERFLOW` |
+| `runtime.extra_args` | per-model vLLM serving flags (`EXTRA_ARGS`: quantisation, KV-cache dtype, reasoning/tool parsers, …) change what the model emits; `null`, `""` and whitespace-only all mean "no extra args" and compare equal, and a manifest that predates the field is reported as soft drift ("not recorded"), not as a violation |
 
 Compared **within each suite** (the adapter and its grading environment legitimately differ
 between suites, so a global comparison would be meaningless):
@@ -182,17 +183,26 @@ Percentiles use linear interpolation between order statistics. Bootstraps use a 
 **GPU-served models** (`billing_mode = instance_hours`), per §8:
 
 ```
-gpu_hours         = Σ over runs of manifest.timing.wall_clock_s / 3600
-cost_usd          = Σ over runs of (wall_clock_s / 3600) × price.effective_cents_per_hour / 100
+gpu_hours         = Σ over runs of manifest.timing.active_wall_clock_s / 3600
+cost_usd          = Σ over runs of (active_wall_clock_s / 3600) × price.effective_cents_per_hour / 100
 cost_per_resolved = cost_usd / resolved_attempts        # THE headline number
 ```
 
 The price is applied **per run**, not once per group, so runs on different instance types or
 captured at different prices still sum correctly; it reduces to the §8 formula when the price
-is uniform. If `price.effective_cents_per_hour` is absent it is derived from
-`price_cents_per_hour × node_count` (warning). If `timing.wall_clock_s` is also missing, the
-tool falls back to summing per-attempt `cost.usd` and says so loudly — that fallback
-under-counts idle instance time and must not be published without a note.
+is uniform. `timing.active_wall_clock_s` excludes the idle gap between a `--resume`'s
+invocations; a pre-split manifest that only has `timing.wall_clock_s` is billed on that
+(idle-inclusive) value with a `timing_active_wall_clock_missing` warning. If
+`price.effective_cents_per_hour` is absent it is derived from `price_cents_per_hour ×
+node_count` (warning). If the wall clock is also missing, the tool falls back to summing
+per-attempt `cost.usd` and says so loudly — that fallback under-counts idle instance time and
+must not be published without a note. When there is nothing to fall back on either:
+
+* a run flagged `provenance_incomplete` is still **included** (§9 — its verdicts are intact,
+  only its dollars are unknowable): the group's `cost_usd` / `cost_per_resolved_usd` are
+  `null` (`—` in `summary.md`), `cost_known = false`, `cost_sources` carries
+  `instance-hours:unknown`, and a `cost_unknown` warning names the run;
+* any other run is a data-integrity failure — `cost_unresolvable`, exit 2.
 
 **API-baseline models** (`billing_mode = per_token`) are billed from token counts instead:
 
@@ -203,10 +213,25 @@ cost_usd = Σ over attempts of
            + tokens.completion/1e6               × output_usd_per_mtok
 ```
 
-A model is treated as API-baseline when `price.billing_mode == "per_token"` in its manifest,
-or the model name appears in the `--api-pricing` file, or the manifest carries neither a
-price-per-hour nor a `lambda_instance_id`. If a model resolves to per-token billing and no
-rates are available, the tool **fails** (exit 2) rather than silently reporting a free model.
+Which mode a run is in is decided **per run** by `billing_mode_for`, in this order:
+
+1. `price.billing_mode` in the manifest (`"instance_hours"` | `"per_token"`) — authoritative.
+   `harness/manifest.py` writes it: `instance_hours` when the `--endpoint` host is loopback
+   (the self-hosted vLLM case), `per_token` otherwise.
+2. **Legacy manifests** (written before `price.billing_mode` existed): evidence of a rented
+   instance wins — a numeric `price.effective_cents_per_hour` / `price_cents_per_hour`, a
+   `hardware.lambda_instance_id`, or a loopback `inference.endpoint` → `instance_hours`.
+3. Inline per-token rates in the manifest's `price` object → `per_token`.
+4. Only then the model **name** (`model.name` / `served_model_name` / `hf_repo`) in the
+   `--api-pricing` file → `per_token`.
+5. Otherwise `instance_hours`.
+
+The name lookup is deliberately the *last* resort, not the first: the study runs some models
+both self-hosted and as an API baseline (e.g. Qwen), so a name that appears in `--api-pricing`
+says nothing about how *this* run was served. Consulting the name first would silently price a
+self-hosted run at API token rates — a wrong headline number with no diagnostic. If a run
+resolves to per-token billing and no rates are available, the tool **fails** (exit 2) rather
+than silently reporting a free model.
 
 `--api-pricing` file (schema `api-pricing/v1`; `cached_input_usd_per_mtok` defaults to the
 input rate when omitted):
@@ -308,7 +333,7 @@ runs contributed counts only.
 |---|---|
 | `0` | tables produced (warnings may still have been printed) |
 | `1` | usage error |
-| `2` | validation or comparability refusal — mixed harness without `--allow-mixed`, bad schema, checksum mismatch, unknown error code, unresolvable cost, no eligible runs |
+| `2` | validation or comparability refusal — mixed harness without `--allow-mixed`, bad schema, checksum mismatch, unknown error code, unresolvable cost (a `provenance_incomplete` run with no price is a warning instead — see Cost), no eligible runs |
 | `3` | missing or unreadable input (manifest not found, no `results.jsonl`, directory argument, unwritable `--out-dir`) |
 | `130` | interrupted |
 
@@ -317,8 +342,8 @@ runs contributed counts only.
 ```
 --allow-mixed              aggregate across a differing verdict-affecting knob (harness
                            version, prompt/template, agent config, adapter version,
-                           grading environment, sampling, budgets, max_model_len),
-                           loudly annotated everywhere
+                           grading environment, sampling, budgets, max_model_len,
+                           serving extra_args), loudly annotated everywhere
 --strict                   treat soft comparability drift as fatal too
 --include-partial          include runs whose status is not "complete"
 --include-exploratory      include --limit/--instance debug runs

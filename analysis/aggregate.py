@@ -21,7 +21,7 @@
 # from the manifest price snapshot × instance-hours; API-baseline models are priced per token
 # from --api-pricing. Runs that differ in ANY verdict-affecting harness knob (version, prompt
 # hash/template, agent config, adapter version, grading environment digest, sampling params,
-# iteration/token budgets, max_model_len, task timeout) are REFUSED unless --allow-mixed is
+# iteration/token budgets, max_model_len, serving EXTRA_ARGS, task timeout) are REFUSED unless --allow-mixed is
 # passed, and then every output is loudly annotated.
 #
 # Two independent manifest flags gate inclusion (CONTRACTS.md §2.2):
@@ -654,10 +654,56 @@ def run_price_cph(manifest: dict, diag: Diagnostics):
     return None
 
 
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _endpoint_is_loopback(endpoint) -> bool:
+    """True when inference.endpoint points at this host — the self-hosted vLLM case."""
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return False
+    try:
+        from urllib.parse import urlsplit
+
+        host = urlsplit(endpoint.strip() if "://" in endpoint else "http://" + endpoint.strip()).hostname
+    except ValueError:
+        return False
+    host = (host or "").lower()
+    if host in _LOOPBACK_HOSTS:
+        return True
+    try:  # whole 127.0.0.0/8 and ::1 — the same rule harness/manifest.py applies
+        import ipaddress
+
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def billing_mode_for(manifest: dict, api_pricing: dict) -> str:
+    """Decide how a run is billed: "instance_hours" (GPU rented by the hour) or "per_token".
+
+    Precedence (README "Cost"):
+      1. price.billing_mode as written by harness/manifest.py — authoritative.
+      2. Legacy manifests (no billing_mode): evidence of a rented instance wins —
+         a price per hour, a lambda_instance_id, or a loopback inference endpoint —
+         because the study serves some models BOTH ways and the model NAME alone cannot
+         tell a self-hosted Qwen run from the API baseline of the same model.
+      3. Inline per-token rates in the manifest → per_token.
+      4. Last resort: the model name appears in --api-pricing → per_token.
+      5. Otherwise instance_hours (the study's default); a missing price then surfaces
+         as a cost diagnostic instead of being silently priced at API token rates.
+    """
     declared = dig(manifest, "price", "billing_mode", default=None)
     if declared in ("per_token", "instance_hours"):
         return declared
+    for key in ("effective_cents_per_hour", "price_cents_per_hour"):
+        if isinstance(dig(manifest, "price", key, default=None), (int, float)):
+            return "instance_hours"
+    if dig(manifest, "hardware", "lambda_instance_id", default=None):
+        return "instance_hours"
+    if _endpoint_is_loopback(dig(manifest, "inference", "endpoint", default=None)):
+        return "instance_hours"
+    if isinstance(dig(manifest, "price", "input_usd_per_mtok", default=None), (int, float)):
+        return "per_token"
     models = api_pricing.get("models", {}) if api_pricing else {}
     for key in (
         dig(manifest, "model", "name", default=None),
@@ -666,10 +712,6 @@ def billing_mode_for(manifest: dict, api_pricing: dict) -> str:
     ):
         if key and key in models:
             return "per_token"
-    cph = dig(manifest, "price", "effective_cents_per_hour", default=None)
-    instance = dig(manifest, "hardware", "lambda_instance_id", default=None)
-    if not cph and not instance:
-        return "per_token"
     return "instance_hours"
 
 
@@ -791,6 +833,11 @@ COMPARABILITY_KEYS = (
     # --task-timeout is the BUDGET_WALLCLOCK ceiling (§1.2), so it decides verdicts.
     ("inference.task_timeout_s", ("inference", "task_timeout_s"), True),
     ("runtime.max_model_len", ("runtime", "max_model_len"), True),
+    # Per-model EXTRA_ARGS reach the vLLM command line (modelctl). The held-constant flags
+    # win under argparse last-wins, but any other serving flag (quantisation, KV cache dtype,
+    # reasoning parsers, ...) can change what the model emits, so it may not vary silently.
+    # None and "" are the same value: "no extra args" (see _COMPARABILITY_NORMALISERS).
+    ("runtime.extra_args", ("runtime", "extra_args"), True),
     ("harness.result_schema", ("harness", "result_schema"), False),
     # §1.2: concurrency affects throughput and latency percentiles, NOT verdicts.
     ("inference.concurrency", ("inference", "concurrency"), False),
@@ -808,18 +855,48 @@ PER_SUITE_KEYS = (
 )
 
 
-def _field_values(runs: list[dict], path):
+_MISSING = object()
+
+
+def _field_values(runs: list[dict], path, normalise=None):
     """Distinct non-null values for a manifest path, plus the runs that do not record it."""
     values: list = []
     absent: list = []
     for run in runs:
-        val = dig(run["manifest"], *path, default=None)
+        # Walk by hand rather than via dig(): dig() folds an explicit null into "absent",
+        # but a normaliser may want to see it (runtime.extra_args: null == "" == no args).
+        val = run["manifest"]
+        for key in path:
+            if not isinstance(val, dict) or key not in val:
+                val = _MISSING
+                break
+            val = val[key]
+        if val is _MISSING:
+            absent.append(run["run_id"])
+            continue
+        if normalise is not None:
+            val = normalise(val)
         if val is None:
             absent.append(run["run_id"])
             continue
         if val not in values:
             values.append(val)
     return values, absent
+
+
+def _normalise_argstr(val):
+    """A serving-flag string: None, "" and whitespace-only all mean "no extra args"."""
+    if val is None:
+        return ""
+    if isinstance(val, (list, tuple)):
+        val = " ".join(str(v) for v in val)
+    return " ".join(str(val).split())
+
+
+# label → normaliser applied before values are compared (identity when absent).
+_COMPARABILITY_NORMALISERS = {
+    "runtime.extra_args": _normalise_argstr,
+}
 
 
 def comparability_report(runs: list[dict], args, diag: Diagnostics) -> dict:
@@ -829,7 +906,7 @@ def comparability_report(runs: list[dict], args, diag: Diagnostics) -> dict:
     fields: list = []
 
     def examine(label, path, is_blocking, scope, subset):
-        values, absent = _field_values(subset, path)
+        values, absent = _field_values(subset, path, _COMPARABILITY_NORMALISERS.get(label))
         entry = {
             "field": label,
             "scope": scope,
@@ -912,7 +989,10 @@ def comparability_report(runs: list[dict], args, diag: Diagnostics) -> dict:
             "max_attempt_tokens": vals("inference.max_attempt_tokens"),
             "task_timeout_s": vals("inference.task_timeout_s"),
         },
-        "runtime": {"max_model_len": vals("runtime.max_model_len")},
+        "runtime": {
+            "max_model_len": vals("runtime.max_model_len"),
+            "extra_args": vals("runtime.extra_args"),
+        },
         "adapter_versions_by_suite": adapters,
     }
 
@@ -1055,8 +1135,9 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
                 wall_s = dig(m, "timing", "wall_clock_s", default=None)
                 if isinstance(wall_s, (int, float)):
                     diag.warn(
-                        "run %s has no timing.active_wall_clock_s (pre-split manifest); "
-                        "cost uses idle-inclusive wall_clock_s" % run.get("run_id", "?")
+                        "timing_active_wall_clock_missing",
+                        f"{run['run_id']}: no timing.active_wall_clock_s (pre-split manifest); "
+                        "cost uses idle-inclusive wall_clock_s",
                     )
             cph = run_price_cph(m, diag)
             if isinstance(cph, (int, float)):
@@ -1085,11 +1166,26 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
                     if "instance-hours:attributed-fallback" not in cost_sources:
                         cost_sources.append("instance-hours:attributed-fallback")
                 else:
-                    diag.error(
-                        "cost_unresolvable",
-                        f"{run['run_id']}: no wall_clock_s/price and no per-attempt cost — "
-                        "cost cannot be computed for this run",
-                    )
+                    fs = run.get("flags_state") or flag_state(m)
+                    if fs["provenance_incomplete"]:
+                        # §9: a provenance_incomplete run is INCLUDED — its science is intact,
+                        # only the dollar columns are unknowable. Blank them ("—"), mark the
+                        # group approximate, and say so; refusing the whole aggregation here
+                        # would throw away scored attempts over a missing price.
+                        diag.warn(
+                            "cost_unknown",
+                            f"{run['run_id']}: provenance_incomplete run has no wall_clock_s/price "
+                            "and no per-attempt cost — included, but its group's cost columns "
+                            "are left blank",
+                        )
+                        if "instance-hours:unknown" not in cost_sources:
+                            cost_sources.append("instance-hours:unknown")
+                    else:
+                        diag.error(
+                            "cost_unresolvable",
+                            f"{run['run_id']}: no wall_clock_s/price and no per-attempt cost — "
+                            "cost cannot be computed for this run",
+                        )
                     cost_known = False
 
     token_cost_usd = (
@@ -1224,7 +1320,8 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
         "cost_approximate": cost_approximate,
         "cost_approximate_reasons": cost_approximate_reasons,
         "provenance_incomplete_runs": provenance_runs,
-        "gpu_hours": gpu_hours if billing_mode != "per_token" else None,
+        # A partial hours total (some run's wall clock unknown) would read as a real number.
+        "gpu_hours": gpu_hours if (billing_mode != "per_token" and cost_known) else None,
         "effective_cents_per_hour": sorted(set(price_cph_values)) or None,
         "cost_usd": cost_usd if cost_known else None,
         "attributable_cost_usd": attributable_cost or None,

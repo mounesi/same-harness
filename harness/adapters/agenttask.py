@@ -23,6 +23,17 @@ Data pack layout (out of tree, resolved by _data_dir()):
 
 The record format is documented in suites/agenttask/README.md, which is the normative
 description of the pack; this module is its reference reader.
+
+Grading timeouts (CONTRACTS.md §4):
+
+    `environment.test_timeout_s` is a PER-ATTEMPT budget: it bounds the whole grading of one
+    attempt — every fail_to_pass and pass_to_pass node id together — for BOTH runners. The
+    pytest runner spends it on its single batched invocation; the exit-code runner runs one
+    process per node id and charges each against the same shared deadline. Hitting it is a
+    grader hang: grade() raises GraderError and the caller records INFRA_GRADER (excluded
+    from the denominator) rather than a scored TESTS_FAIL, because a verdict was never
+    observed. The scope actually applied is recorded in every verdict's raw dict as
+    `timeout_scope`.
 """
 
 from __future__ import annotations
@@ -38,6 +49,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import Any, Mapping
@@ -74,9 +86,13 @@ INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Grading defaults. These are *task environment* properties, not harness properties: the
 # held-constant knobs (iteration budget, sampling, prompt) live in harness/agent_config.json.
+# DEFAULT_TEST_TIMEOUT_S is the budget for grading ONE ATTEMPT (all node ids, both runners,
+# see the module docstring) — not per test and not per process. DEFAULT_SETUP_TIMEOUT_S is
+# per setup command.
 DEFAULT_TEST_CMD = "python -m pytest -rA -p no:cacheprovider {tests}"
 DEFAULT_TEST_TIMEOUT_S = 900
 DEFAULT_SETUP_TIMEOUT_S = 1800
+TIMEOUT_SCOPE = "per_attempt_batch"  # recorded in Verdict.raw["timeout_scope"]
 DETAIL_MAX = 512
 OUTPUT_TAIL_CHARS = 2000
 
@@ -320,6 +336,12 @@ def _build_task(
     p2p = tuple(record.get("pass_to_pass") or ())
     if not f2p:
         raise AgentTaskDataError(f"task {iid}: fail_to_pass is empty — a task with no red test is not gradable")
+    # Node ids must be non-empty strings. Spaces are legal (pytest parametrize ids such as
+    # `test_parse[2020-01-01 00:00:00-utc]`) and are matched verbatim against the -rA summary.
+    for field, ids in (("fail_to_pass", f2p), ("pass_to_pass", p2p)):
+        for nid in ids:
+            if not isinstance(nid, str) or not nid.strip():
+                raise AgentTaskDataError(f"task {iid}: {field} contains a non-string or empty node id: {nid!r}")
 
     snapshot = dict(record.get("snapshot") or {})
     hidden = dict(record.get("hidden_tests") or {})
@@ -429,19 +451,51 @@ def _grade_in(tmp: Path, task: Task, patch: str) -> Verdict:
         return _verdict(False, "INFRA_SANDBOX", str(exc), {}, task, ran=False)
 
     for cmd in env["setup_cmds"]:
-        rc, out = _run(cmd, work, env["setup_timeout_s"])
-        if rc != 0:
+        rc, out, setup_timed_out = _run(cmd, work, env["setup_timeout_s"])
+        if rc != 0 or setup_timed_out:
+            why = (
+                f"setup command exceeded setup_timeout_s={env['setup_timeout_s']}"
+                if setup_timed_out
+                else f"setup command failed (rc={rc})"
+            )
             return _verdict(
                 False,
                 "INFRA_SANDBOX",
-                f"setup command failed (rc={rc})",
-                {"setup_cmd_rc": rc, "output_tail": out[-OUTPUT_TAIL_CHARS:]},
+                why,
+                {
+                    "setup_cmd_rc": rc,
+                    "setup_timed_out": setup_timed_out,
+                    "output_tail": out[-OUTPUT_TAIL_CHARS:],
+                },
                 task,
                 ran=False,
             )
 
     node_ids = list(task.fail_to_pass) + list(task.pass_to_pass)
+    test_timeout_s = int(env["test_timeout_s"])
     statuses, rc, out, timed_out = _run_tests(work, env, node_ids)
+
+    if timed_out:
+        # A grader hang, not a wrong answer: no verdict was observed, so this is INFRA_GRADER
+        # (excluded from the denominator, CONTRACTS.md §4) rather than a scored TESTS_FAIL.
+        raise GraderError(
+            f"agenttask grader: test run exceeded {test_timeout_s}s "
+            f"(scope={TIMEOUT_SCOPE}, runner={env.get('runner')}, "
+            f"{len(node_ids)} node ids); output tail: {_truncate(out[-OUTPUT_TAIL_CHARS:], 300)}"
+        )
+
+    # A runner that never ran is not a verdict. rc 127 (command not found), a missing pytest
+    # module, or output with no pytest session summary at all means NOTHING was observed —
+    # scoring it would book a host-configuration problem as 0/N against the model.
+    runner = str(env.get("runner") or "pytest")
+    if rc == 127 or "No module named pytest" in out or (
+        runner == "pytest" and not statuses and "passed" not in out and "failed" not in out
+        and "error" not in out.lower()
+    ):
+        raise GraderError(
+            f"agenttask grader: the {runner} runner did not run (rc={rc}); "
+            f"output tail: {_truncate(out[-OUTPUT_TAIL_CHARS:], 300)}"
+        )
 
     f2p_passed = sum(1 for t in task.fail_to_pass if statuses.get(t) == "passed")
     p2p_passed = sum(1 for t in task.pass_to_pass if statuses.get(t) == "passed")
@@ -451,22 +505,13 @@ def _grade_in(tmp: Path, task: Task, patch: str) -> Verdict:
     raw = {
         "returncode": rc,
         "timed_out": timed_out,
+        "test_timeout_s": test_timeout_s,
+        "timeout_scope": TIMEOUT_SCOPE,
         "statuses": statuses,
         "hidden_tests_overwrote_patched_paths": overwritten,
         "patch_applied_with": how,
         "output_tail": out[-OUTPUT_TAIL_CHARS:],
     }
-
-    if timed_out:
-        return _verdict(
-            False,
-            "TESTS_FAIL",
-            f"test run exceeded {env['test_timeout_s']}s; fail_to_pass {f2p_passed}/{f2p['total']}",
-            raw,
-            task,
-            f2p=f2p,
-            p2p=p2p,
-        )
 
     if f2p_passed == f2p["total"] and p2p_passed == p2p["total"]:
         return _verdict(True, "OK", "all fail_to_pass green, no regressions", raw, task, f2p=f2p, p2p=p2p)
@@ -705,42 +750,103 @@ def _apply_patch(work: Path, patch: str, tmp: Path) -> tuple[bool, str]:
     return False, "; ".join(reasons)
 
 
-def _run(cmd: str, cwd: Path, timeout_s: int) -> tuple[int, str]:
+def _text(data: Any) -> str:
+    """Bytes-or-str-or-None → str. `TimeoutExpired.stdout` is bytes on CPython < 3.10 even
+    when the process was opened in text mode."""
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode("utf-8", "replace")
+    return str(data)
+
+
+def _run(cmd: str, cwd: Path, timeout_s: float) -> tuple[int, str, bool]:
+    """Run `cmd` in a shell; return (returncode, combined output, timed_out).
+
+    `timed_out` is True only when OUR deadline fired (subprocess.TimeoutExpired). A command
+    that exits 124 on its own (e.g. a `timeout(1)` wrapper inside test_cmd) is reported as
+    rc=124 with timed_out=False — the two must not be conflated, because the former is a
+    grader hang (INFRA_GRADER) and the latter is an observed test outcome.
+
+    The command runs in its own session so a timeout kills the whole process group, not
+    just the shell — a hung pytest must not outlive its attempt on a rented GPU node.
+    """
     env = dict(os.environ)
     env.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", "CI": "1"})
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            cmd, cwd=cwd, shell=True, capture_output=True, text=True, timeout=timeout_s, env=env
-        )
+        stdout, stderr = proc.communicate(timeout=max(0.0, float(timeout_s)))
     except subprocess.TimeoutExpired as exc:
-        out = (exc.stdout or "") + (exc.stderr or "")
-        return 124, out if isinstance(out, str) else out.decode("utf-8", "replace")
-    return proc.returncode, proc.stdout + proc.stderr
+        _kill_group(proc)
+        # Retrying communicate() after a timeout returns EVERYTHING captured so far (the
+        # partial output on `exc` included), so it is used alone; the exception's copy is
+        # only the fallback if the retry itself cannot drain the pipes.
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = exc.stdout, exc.stderr
+        return 124, _text(stdout) + _text(stderr), True
+    return proc.returncode, _text(stdout) + _text(stderr), False
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, 9)  # SIGKILL; the session was created by start_new_session
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _run_tests(work: Path, env: Mapping[str, Any], node_ids: list[str]) -> tuple[dict, int, str, bool]:
+    """Run every node id of one attempt under ONE shared `test_timeout_s` budget.
+
+    Returns (statuses, returncode, output, timed_out). `timed_out=True` means the per-attempt
+    deadline fired (TIMEOUT_SCOPE); the caller raises GraderError for it — the statuses
+    gathered so far are partial and must not be scored.
+    """
+    budget_s = float(env["test_timeout_s"])
+
     if env.get("runner") == "exit-code":
+        # One process per node id, all charged against the same deadline so the scope
+        # matches the pytest runner's single batched invocation.
         statuses: dict[str, str] = {}
-        rc_total, chunks, timed_out = 0, [], False
+        rc_total, chunks = 0, []
+        deadline = time.monotonic() + budget_s
         for nid in node_ids:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                chunks.append(f"[agenttask] per-attempt budget of {budget_s:g}s exhausted before {nid}")
+                return statuses, rc_total, "\n".join(chunks), True
             cmd = _compose_test_cmd(str(env["test_cmd"]), [nid])
-            rc, out = _run(cmd, work, int(env["test_timeout_s"]))
-            statuses[nid] = "passed" if rc == 0 else "failed"
-            timed_out = timed_out or rc == 124
-            rc_total |= rc
+            rc, out, timed_out = _run(cmd, work, remaining)
             chunks.append(out[-OUTPUT_TAIL_CHARS:])
-        return statuses, rc_total, "\n".join(chunks), timed_out
+            if timed_out:
+                return statuses, rc_total, "\n".join(chunks), True
+            statuses[nid] = "passed" if rc == 0 else "failed"
+            rc_total |= rc
+        return statuses, rc_total, "\n".join(chunks), False
 
     cmd = _compose_test_cmd(str(env["test_cmd"]), node_ids)
-    rc, out = _run(cmd, work, int(env["test_timeout_s"]))
-    timed_out = rc == 124
+    rc, out, timed_out = _run(cmd, work, budget_s)
+    if timed_out:
+        return {}, rc, out, True
 
     report = env.get("report_json")
     if report:
         parsed = _parse_json_report(work / str(report))
         if parsed is not None:
-            return parsed, rc, out, timed_out
-    return _parse_pytest_output(out), rc, out, timed_out
+            return parsed, rc, out, False
+    return _parse_pytest_output(out), rc, out, False
 
 
 def _compose_test_cmd(template: str, node_ids: list[str]) -> str:
@@ -750,19 +856,91 @@ def _compose_test_cmd(template: str, node_ids: list[str]) -> str:
     return f"{template} {tests}"
 
 
-_PYTEST_LINE = re.compile(r"^(PASSED|FAILED|ERROR|XFAIL|XPASS)\s+(\S+)")
+# pytest's -rA short-summary line is `<OUTCOME> <nodeid>` optionally followed by ` - <reason>`.
+# The node id is printed verbatim and MAY contain spaces (parametrize ids), so it is captured
+# greedily to end of line and the reason is split off afterwards by _split_summary_rest().
+_PYTEST_LINE = re.compile(r"^(PASSED|FAILED|ERROR|XFAIL|XPASS)\s+(.+?)\s*$")
+
+
+def _split_summary_rest(rest: str) -> str:
+    """Strip a trailing ` - <reason>` from the text after the outcome, returning the node id.
+
+    The separator is the first ` - ` that sits outside the `[...]` parametrize brackets, so
+    an id such as `test_x[a - b]` survives while `test_x[a - b] - AssertionError` is cut.
+    """
+    depth = 0
+    i = 0
+    n = len(rest)
+    while i < n:
+        ch = rest[i]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth = max(0, depth - 1)
+        elif ch == " " and depth == 0 and rest.startswith(" - ", i):
+            return rest[:i]
+        i += 1
+    return rest
 
 
 def _parse_pytest_output(out: str) -> dict[str, str]:
-    """Read pytest's `-rA` short summary. Anything not reported PASSED counts as not passed."""
+    """Read pytest's `-rA` short summary. Anything not reported PASSED counts as not passed.
+
+    >>> _parse_pytest_output("PASSED tests/test_a.py::test_plain")
+    {'tests/test_a.py::test_plain': 'passed'}
+    >>> _parse_pytest_output("PASSED tests/test_dates.py::test_parse[2020-01-01 00:00:00-utc]")
+    {'tests/test_dates.py::test_parse[2020-01-01 00:00:00-utc]': 'passed'}
+    >>> _parse_pytest_output("FAILED tests/test_a.py::test_x - AssertionError: 1 - 2")
+    {'tests/test_a.py::test_x': 'failed'}
+    >>> _parse_pytest_output("FAILED tests/test_a.py::test_x[a - b] - assert 1 == 2")
+    {'tests/test_a.py::test_x[a - b]': 'failed'}
+    >>> _parse_pytest_output("ERROR tests/test_b.py::test_setup - ValueError: boom")
+    {'tests/test_b.py::test_setup': 'error'}
+    >>> _parse_pytest_output("ERROR tests/test_c.py - ImportError: no module")
+    {'tests/test_c.py': 'error'}
+    >>> _parse_pytest_output("XFAIL tests/test_a.py::test_y\\n  known bug")
+    {'tests/test_a.py::test_y': 'xfail'}
+    >>> _parse_pytest_output("  PASSED tests/test_a.py::test_z  \\n=== 1 passed in 0.01s ===")
+    {'tests/test_a.py::test_z': 'passed'}
+    >>> _parse_pytest_output("tests/test_a.py::test_q PASSED\\nPASSED\\n")
+    {}
+    """
     statuses: dict[str, str] = {}
     for line in out.splitlines():
         m = _PYTEST_LINE.match(line.strip())
         if not m:
             continue
-        outcome, nodeid = m.group(1), m.group(2)
-        statuses[nodeid.rstrip(":")] = "passed" if outcome == "PASSED" else outcome.lower()
+        outcome = m.group(1)
+        nodeid = _split_summary_rest(m.group(2)).rstrip(":").strip()
+        if not nodeid:
+            continue
+        statuses[nodeid] = "passed" if outcome == "PASSED" else outcome.lower()
     return statuses
+
+
+def _selftest_parse_pytest_output() -> None:
+    """Unit test for the -rA parser (finding [8]). Run: `python3 -m doctest` on this file, or
+    `python3 -c "from harness.adapters import agenttask as a; a._selftest_parse_pytest_output()"`."""
+    space_id = "tests/test_dates.py::test_parse[2020-01-01 00:00:00-utc]"
+    out = "\n".join([
+        "=== short test summary info ===",
+        "PASSED tests/test_a.py::test_plain",
+        f"PASSED {space_id}",
+        "FAILED tests/test_a.py::test_x - AssertionError: 1 - 2",
+        "ERROR tests/test_b.py::test_setup - ValueError: boom",
+        "XPASS tests/test_a.py::test_xp",
+        "=== 2 passed, 1 failed, 1 error in 0.10s ===",
+    ])
+    got = _parse_pytest_output(out)
+    assert got["tests/test_a.py::test_plain"] == "passed", got
+    assert got[space_id] == "passed", got
+    assert got["tests/test_a.py::test_x"] == "failed", got
+    assert got["tests/test_b.py::test_setup"] == "error", got
+    assert got["tests/test_a.py::test_xp"] == "xpass", got
+    assert len(got) == 5, got
+    assert _split_summary_rest("t[a - b] - reason") == "t[a - b]"
+    assert _split_summary_rest("t[a - b]") == "t[a - b]"
+    assert _split_summary_rest("t - r - s") == "t"
 
 
 def _parse_json_report(path: Path) -> dict[str, str] | None:

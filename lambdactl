@@ -6,7 +6,8 @@
 #   ./lambdactl up <instance-type> [region] launch, wait until active, print IP
 #   ./lambdactl ls                          running instances
 #   ./lambdactl ip <id|name>                public IP of an instance
-#   ./lambdactl down <id|name>              terminate one instance
+#   ./lambdactl down <id|name>              terminate one instance (a name matching >1 is an error)
+#   ./lambdactl down --all-named <name>     terminate EVERY instance carrying that name (CI teardown)
 #   ./lambdactl down --all                  terminate EVERYTHING (CI safety net)
 #   ./lambdactl reap [hours] [name-prefix]  terminate instances older than N hours (default 24)
 #
@@ -30,14 +31,29 @@ req() { # method path [json-body]
   fi
 }
 
-resolve_id() { # accept instance id or name
+resolve_id() { # accept instance id or name; prints exactly one id, or nothing if none matches.
+  # A name that matches MORE THAN ONE instance is an error, never a silent first-match: CI
+  # re-run attempts can leave a still-terminating instance carrying the same name, and
+  # picking it would leave the live one billing. Use `down --all-named` for that case.
   local q="$1"
   req GET /instances | python3 -c "
 import json,sys
-q='$q'
-for i in json.load(sys.stdin)['data']:
-    if i['id']==q or i.get('name')==q: print(i['id']); break
-"
+q=sys.argv[1]
+ids=[i['id'] for i in json.load(sys.stdin)['data'] if i['id']==q or i.get('name')==q]
+if len(ids)>1:
+    print('error: %r matches %d instances: %s -- use: ./lambdactl down --all-named %s' % (q,len(ids),' '.join(ids),q), file=sys.stderr)
+    sys.exit(1)
+print(ids[0] if ids else '')
+" "$q"
+}
+
+resolve_all_named() { # every instance id whose name equals $1 (space-separated, may be empty)
+  local q="$1"
+  req GET /instances | python3 -c "
+import json,sys
+q=sys.argv[1]
+print(' '.join(i['id'] for i in json.load(sys.stdin)['data'] if i.get('name')==q))
+" "$q"
 }
 
 cmd_types() {
@@ -110,16 +126,17 @@ print(i['status'], i.get('ip') or '-')")
   echo "$id $ip"
 }
 
-cmd_ls() {
+cmd_ls() { # one line per instance: <id> <name> <type> <status> <ip>. A failed API call FAILS —
+           # CI teardown reads this listing to confirm termination, so it must not read as "empty".
   req GET /instances | python3 -c "
 import json,sys
 for i in json.load(sys.stdin)['data']:
-    print(f\"{i['id']}  {i.get('name','-'):20s} {i['instance_type']['name']:30s} {i['status']:10s} {i.get('ip') or '-'}\")
-" || true
+    print(f\"{i['id']}  {i.get('name') or '-':20s} {i['instance_type']['name']:30s} {i['status']:10s} {i.get('ip') or '-'}\")
+"
 }
 
 cmd_ip() {
-  local id; id="$(resolve_id "$1")"
+  local id; id="$(resolve_id "$1")" || exit 1
   [[ -n "$id" ]] || { echo "error: no instance '$1'" >&2; exit 1; }
   req GET "/instances/$id" | python3 -c "import json,sys; print(json.load(sys.stdin)['data'].get('ip') or '')"
 }
@@ -139,8 +156,15 @@ cmd_down() {
     ids="$(req GET /instances | python3 -c "import json,sys; print(' '.join(i['id'] for i in json.load(sys.stdin)['data']))")"
     # shellcheck disable=SC2086
     terminate_ids $ids
+  elif [[ "${1:-}" == "--all-named" ]]; then
+    local name="${2:-}"
+    [[ -n "$name" ]] || { echo "usage: ./lambdactl down --all-named <name>" >&2; exit 1; }
+    local ids; ids="$(resolve_all_named "$name")"
+    if [[ -z "$ids" ]]; then echo "==> no instance named '$name'"; return 0; fi
+    # shellcheck disable=SC2086
+    terminate_ids $ids
   else
-    local id; id="$(resolve_id "$1")"
+    local id; id="$(resolve_id "$1")" || exit 1
     [[ -n "$id" ]] || { echo "error: no instance '$1'" >&2; exit 1; }
     terminate_ids "$id"
   fi
@@ -177,7 +201,7 @@ case "${1:-}" in
   up)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl up <instance-type> [region]" >&2; exit 1; }; cmd_up "$2" "${3:-}" ;;
   ls)    cmd_ls ;;
   ip)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl ip <id|name>" >&2; exit 1; }; cmd_ip "$2" ;;
-  down)  [[ $# -ge 2 ]] || { echo "usage: ./lambdactl down <id|name|--all>" >&2; exit 1; }; cmd_down "$2" ;;
+  down)  [[ $# -ge 2 ]] || { echo "usage: ./lambdactl down <id|name> | --all-named <name> | --all" >&2; exit 1; }; cmd_down "$2" "${3:-}" ;;
   reap)  cmd_reap "${2:-}" "${3:-}" ;;
-  *) sed -n '2,13p' "$0"; exit 1 ;;
+  *) sed -n '2,14p' "$0"; exit 1 ;;
 esac

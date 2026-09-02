@@ -15,11 +15,14 @@
 #   2. manifest builds and REQUIRED fields resolve                       (tier 2)
 #   3. grading preflight passes for the suite                            (tier 3)
 #   4. attempts execute and results.jsonl gets one record per attempt
-#   5. every record carries the run_id and the manifest's environment_digest (§2.3)
+#   5. every record carries the run_id, and every gradable record carries a grade block
+#      stamped with the manifest's environment_digest (§2.3) — an ungraded record is a FAIL
 #   6. the solved task is graded resolved=true, so the grader really ran
 #   7. aggregate.py produces a headline table with a cost-per-resolved number
 #   8. resultsctl packages a bundle whose checksums verify
-#   9. the Phase-2 leakage guard refuses the final_holdout task
+#   9. the Phase-2 leakage guard fails closed on an unproven boundary, and — with the
+#      boundary pinned — rejects the final_holdout attempt by name and builds a dataset
+#      that holds the train task only
 #
 # Exit 0 = the pipeline is wired correctly. Anything else prints the failing stage.
 set -euo pipefail
@@ -122,12 +125,33 @@ for r in recs:
         die("record %s carries a foreign run_id" % r.get("attempt_id"))
 print("  \033[32mok\033[0m   every record carries the run_id")
 want = (man.get("harness") or {}).get("environment_digest")
-if want:
-    bad = [r.get("attempt_id") for r in recs
-           if (r.get("grade") or {}).get("environment_digest") not in (want, None)]
-    if bad:
-        die("environment_digest mismatch on %s (CONTRACTS 2.3)" % bad)
-    print("  \033[32mok\033[0m   environment_digest matches the manifest (2.3)")
+if not want:
+    die("manifest has no harness.environment_digest (CONTRACTS 2.3)")
+# §2.3: every record that reached grading MUST carry grade.environment_digest equal to the
+# manifest's. A missing grade block is only legitimate when the attempt never reached a
+# gradable state (INFRA_*) or produced nothing to grade (NO_PATCH); anywhere else it is a
+# FAIL — a None grade must never read as "matches".
+def may_be_ungraded(code):
+    return code.startswith("INFRA_") or code == "NO_PATCH"
+bad = []
+graded = 0
+for r in recs:
+    code = str(r.get("error_code") or "")
+    grade = r.get("grade")
+    if not isinstance(grade, dict):
+        if not may_be_ungraded(code):
+            bad.append("%s: no grade block (error_code %s)" % (r.get("attempt_id"), code or "?"))
+        continue
+    graded += 1
+    got = grade.get("environment_digest")
+    if got != want:
+        bad.append("%s: grade.environment_digest %r != manifest %r" % (r.get("attempt_id"), got, want))
+if bad:
+    die("environment_digest check failed (CONTRACTS 2.3):\n         " + "\n         ".join(bad))
+if graded == 0:
+    die("no record carries a grade block — nothing was graded")
+print("  \033[32mok\033[0m   %d/%d records graded, every grade carries the manifest's environment_digest (2.3)"
+      % (graded, len(recs)))
 resolved = [r for r in recs if r.get("resolved") is True]
 codes = sorted({r.get("error_code") for r in recs})
 print("  \033[32mok\033[0m   error codes: %s" % codes)
@@ -165,22 +189,91 @@ else
 fi
 
 step "9. leakage guard"
-# Two things must hold, and they are different: the guard must FAIL CLOSED when the holdout
-# boundary is not provable, and it must REJECT a holdout id when it is.
+# Three things must hold, and they are different:
+#   (a) the guard FAILS CLOSED when the holdout boundary is not provable — the committed
+#       constant is UNFROZEN, or frozen against a partitions.json that is not this pack's;
+#   (b) with the boundary pinned, it REJECTS a run containing a holdout attempt, BY NAME;
+#   (c) with the boundary pinned, a run of train-only attempts builds a dataset that holds
+#       smoke-0001 and not smoke-0002.
+# (b) and (c) run against a COPY of the guard pinned to this pack's holdout checksum, so they
+# exercise the real code paths whatever the repo's constant says.
 set +e
 python3 training/build_dataset.py --manifests "$RUN_DIR/run-manifest.json" \
-  --partitions "$PACK/partitions.json" --split train --out "$WORK/ds" --dry-run \
+  --partitions "$PACK/partitions.json" --split train --dry-run \
   >"$WORK/ds.out" 2>&1
 DS=$?
 set -e
 if [[ $DS -eq 0 ]]; then
-  grep -q "smoke-0002" "$WORK/ds.out" && fail "final_holdout task leaked into the training set"
-  ok "final_holdout excluded from the training set"
-elif grep -qi "not pinned\|FINAL_HOLDOUT_SHA256" "$WORK/ds.out"; then
-  ok "fails closed when the holdout boundary is not frozen (exit $DS)"
+  # This run CONTAINS the final_holdout attempt (smoke-0002); guard 3 must refuse it, so a
+  # zero exit means the guard let a holdout attempt through.
+  tail -6 "$WORK/ds.out"; fail "guard accepted a run containing final_holdout attempt smoke-0002 (exit 0)"
+elif grep -qi "not pinned\|FINAL_HOLDOUT_SHA256\|modified since freeze" "$WORK/ds.out"; then
+  ok "(a) fails closed when the holdout boundary is not provable (exit $DS)"
+elif grep -q "agenttask::smoke-0002" "$WORK/ds.out"; then
+  ok "(a) boundary provable in-tree: rejects the final_holdout attempt by name (exit $DS)"
 else
   tail -12 "$WORK/ds.out"; fail "guard failed for an unexpected reason (exit $DS)"
 fi
+
+# pin a copy of the guard to THIS pack's holdout checksum (the value --freeze would compile in)
+HOLDOUT_SHA="$(python3 - "$PACK/partitions.json" <<'PY'
+import json, sys
+sys.path.insert(0, "training")
+import build_dataset as bd
+parts = json.load(open(sys.argv[1]))
+print(bd.id_list_sha256(sorted(bd.holdout_ids(parts))))
+PY
+)" || fail "could not compute the pack's holdout checksum"
+[[ "$HOLDOUT_SHA" =~ ^[0-9a-f]{64}$ ]] || fail "holdout checksum is not hex64: '$HOLDOUT_SHA'"
+mkdir -p "$WORK/guard"
+sed "s/^FINAL_HOLDOUT_SHA256 = \".*\"\$/FINAL_HOLDOUT_SHA256 = \"$HOLDOUT_SHA\"/" \
+  training/build_dataset.py >"$WORK/guard/build_dataset.py"
+grep -q "^FINAL_HOLDOUT_SHA256 = \"$HOLDOUT_SHA\"" "$WORK/guard/build_dataset.py" \
+  || fail "could not pin a guard copy to the pack holdout"
+GUARD="$WORK/guard/build_dataset.py"
+
+# (b) the run as produced holds the holdout attempt -> refused, and smoke-0002 is NAMED
+set +e
+python3 "$GUARD" --manifests "$RUN_DIR/run-manifest.json" \
+  --partitions "$PACK/partitions.json" --split train --dry-run >"$WORK/ds-reject.out" 2>&1
+DR=$?
+set -e
+[[ $DR -ne 0 ]] || { tail -6 "$WORK/ds-reject.out"; fail "pinned guard accepted a run containing the final_holdout attempt"; }
+grep -q "agenttask::smoke-0002" "$WORK/ds-reject.out" \
+  || { tail -8 "$WORK/ds-reject.out"; fail "pinned guard refused the run but did not name smoke-0002 (exit $DR)"; }
+ok "(b) boundary pinned: rejects the final_holdout attempt by name (exit $DR)"
+
+# (c) a train-only copy of the run (holdout record removed) -> exactly the train task is kept
+SRC="$WORK/ds-src/$RUN_ID"
+mkdir -p "$WORK/ds-src" && cp -R "$RUN_DIR" "$SRC"
+python3 - "$SRC/results.jsonl" <<'PY' || fail "could not derive the train-only results copy"
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+keep = [l for l in p.read_text().splitlines()
+        if l.strip() and json.loads(l).get("instance_id") != "smoke-0002"]
+assert keep, "no train records left"
+p.write_text("\n".join(keep) + "\n")
+PY
+python3 "$GUARD" --manifests "$SRC/run-manifest.json" --partitions "$PACK/partitions.json" \
+  --split train --dry-run >"$WORK/ds-dry.out" 2>"$WORK/ds-dry.err" \
+  || { tail -8 "$WORK/ds-dry.err"; fail "pinned guard dry-run failed on a train-only run"; }
+python3 - "$WORK/ds-dry.out" <<'PY' || fail "dry-run stats do not show exactly the train task kept"
+import json, sys
+last = [l for l in open(sys.argv[1]).read().splitlines() if l.strip()][-1]
+d = json.loads(last)
+st = d["stats"]
+assert d["split"] == "train", d
+assert st["considered"] == 1 and st["kept"] == 1, st
+print("  \033[32mok\033[0m   (c) dry-run stats: considered=%d kept=%d" % (st["considered"], st["kept"]))
+PY
+python3 "$GUARD" --manifests "$SRC/run-manifest.json" --partitions "$PACK/partitions.json" \
+  --split train --out "$WORK/ds" >"$WORK/ds-write.out" 2>"$WORK/ds-write.err" \
+  || { tail -8 "$WORK/ds-write.err"; fail "pinned guard could not write the train-only dataset"; }
+DATA="$(awk 'NF{p=$1} END{print p}' "$WORK/ds-write.out")"
+[[ -n "$DATA" && -f "$DATA" ]] || fail "build_dataset.py printed no dataset path (got: '$DATA')"
+grep -q "smoke-0001" "$DATA" || fail "train task smoke-0001 missing from the written dataset $DATA"
+if grep -q "smoke-0002" "$DATA"; then fail "final_holdout task smoke-0002 leaked into the written dataset $DATA"; fi
+ok "(c) written dataset holds smoke-0001 and not smoke-0002 ($(basename "$DATA"))"
 
 # and the rejection path itself, which is unit-tested
 set +e

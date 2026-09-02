@@ -48,22 +48,37 @@ vLLM args). Add a model = add a file. Current lineup:
 `lambdactl` drives the Lambda Cloud API (needs `LAMBDA_API_KEY`):
 
 ```bash
-./lambdactl types                    # instance types + live availability
+./lambdactl types                    # instance types + live availability ("<name>  $ 23.92/hr  <regions>")
 ./lambdactl up gpu_8x_b200_sxm6      # launch, wait for active + SSH, print "id ip"
 ./lambdactl ls
+./lambdactl down <id|name>           # one instance; a name matching >1 instance is an ERROR, not a guess
+./lambdactl down --all-named <name>  # every instance carrying that name tag (what CI teardown uses)
 ./lambdactl down --all               # kill everything
 ./lambdactl reap 24                  # kill anything older than 24h
 ```
 
 CI (`.github/workflows/`):
 
-- **benchmark.yml** — `workflow_dispatch(model, instance_type, suite)`: launch instance →
-  attach persistent weights filesystem → `modelctl serve` → run harness (3 passes) →
-  upload results + instance-hours cost log → **teardown in an `if: always()` step**.
-  A `concurrency: gpu-run` group means only one GPU run at a time.
-- **reaper.yml** — every 6h, terminates any instance alive >24h. The credit's seatbelt.
+- **benchmark.yml** — `workflow_dispatch(model, suite)`; the instance type derives from
+  `models.d/<model>.env` `INSTANCE_TYPE`. Launch instance (name tag
+  `ci-<model>-<run_id>-<run_attempt>`, unique per re-run attempt) → attach persistent weights
+  filesystem → `modelctl serve` → run harness (3 passes) → `resultsctl package` each run
+  directory named in the `RUN` lines on the instance → pull back **only**
+  `run-manifest.json`, `SHA256SUMS`, `run-status.json` and the sealed bundle + `.sha256` into
+  `results/<run_id>/` (never loose `trajectories/`, `patches/` or `results.jsonl` — §7.4) →
+  **teardown in an `if: always()` step** that terminates by id AND by name tag and FAILS
+  unless a follow-up `lambdactl ls` shows nothing live → cost ledger (`results/cost-log.jsonl`,
+  priced from the run manifest's `price.effective_cents_per_hour`, falling back to the parsed
+  list price; a zero is recorded as unknown). A package failure fails the job but never
+  skips teardown. A `concurrency: gpu-run` group means only one GPU run at a time.
+- **reaper.yml** — every 2h, terminates `ci-*` instances alive >14h and any instance alive
+  >24h. The credit's seatbelt.
+- **ci.yml** — on every push: shell syntax on every script (any failure fails the step),
+  py_compile, adapter imports, the leakage-guard self-test, `resultsctl verify
+  --git-hygiene --all` over the whole tracked tree, and the smoke test below.
 
-Secrets: `LAMBDA_API_KEY`, `LAMBDA_SSH_PRIVATE_KEY`. Variables: `LAMBDA_SSH_KEY`, `LAMBDA_FS`.
+Secrets: `LAMBDA_API_KEY`, `LAMBDA_SSH_PRIVATE_KEY`. Variables: `LAMBDA_SSH_KEY`, `LAMBDA_FS`,
+`VLLM_VERSION` (pinned vLLM release installed on the instance).
 Note: `harness/run.sh` is the interface CI expects — built under AI-2957.
 
 ## Smoke test — run this before spending a cent

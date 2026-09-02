@@ -15,6 +15,10 @@ Terminology: MUST / MUST NOT / SHOULD / MAY as in RFC 2119.
 1. **The harness is the control variable.** Prompt text, iteration budget, retry policy, sampling
    params, `--max-model-len`, tool set and grading are byte-identical across models. Anything that
    varies per model is a *model* property (weights, TP/PP, instance type), never a harness property.
+   `modelctl` places `$EXTRA_ARGS` from `models.d/<model>.env` **before** the held-constant serving
+   flags (`--served-model-name`, `--max-model-len`) on the vLLM command line, so under argparse
+   last-wins a per-model env file cannot override them; an `EXTRA_ARGS` that names one anyway sets
+   `flags.nonconformant` (§2.2).
 2. **Every run is self-describing.** `harness/run.sh` writes `run-manifest.json` *before* the first
    model call. A result without a manifest is not a result.
 3. **Raw results never enter git.** Bundles go to object storage; git holds manifests, checksums,
@@ -100,7 +104,7 @@ Unknown flags are a usage error. Flags are order-independent. `--` terminates fl
 | `0` | ok | Every planned attempt was executed and graded; `results.jsonl` complete; `SHA256SUMS` written; manifest `status = "complete"`. **Tasks failing to resolve is a normal `0`.** |
 | `1` | usage | Bad/missing/conflicting flags. Nothing written. |
 | `2` | config | Unknown model or suite, missing/invalid seed file, seed-file checksum mismatch, partitions file invalid, prompt directory missing. Nothing written. |
-| `3` | preflight | Endpoint unreachable/unhealthy, served model name ≠ `--model`, weights directory missing, provenance value that is `REQUIRED` in §2 could not be resolved, or a grading dependency (docker, the suite's evaluation module) is missing on this host — detected before the first model call; `HARNESS_SKIP_GRADING_PREFLIGHT=1` overrides. Manifest written with `status = "failed"`. |
+| `3` | preflight | Endpoint unreachable/unhealthy, served model name ≠ `--model`, weights directory missing, provenance value that is `REQUIRED` in §2 could not be resolved, or a grading dependency (docker, the suite's evaluation module) is missing on this host — detected before the first model call; `HARNESS_SKIP_GRADING_PREFLIGHT=1` overrides. Also raised by `harness.agent run` when the adapter's live `environment_digest()` disagrees with the manifest (§2.3 — a grader or dataset upgrade across `--resume`). On a FRESH run the manifest is written with `status = "failed"`; a `--resume` refused at preflight has executed nothing and leaves `run-manifest.json` and `SHA256SUMS` exactly as found (§2.3: a resume may only advance status) — it only prints `RUN … failed`. |
 | `4` | incomplete | Started, aborted mid-flight (SIGTERM, host loss, unrecoverable server error). `results.jsonl` holds whatever completed; manifest `status = "incomplete"`. Re-runnable with `--resume`. |
 | `5` | grading | More than 2% of attempts ended `INFRA_GRADER`, or the grader environment could not be constructed. Manifest `status = "incomplete"`, `flags.grading_degraded = true`. |
 | `130` | interrupt | SIGINT. Same on-disk state as `4`. |
@@ -248,7 +252,7 @@ change between the two writes; `analysis/` may assert this.
     "max_model_len": 262144,
     "extra_args": "",
     "multinode": false,
-    "vllm_argv": "vllm serve /persistent/models/qwen3-coder-next --served-model-name qwen3-coder-next --tensor-parallel-size 1 --max-model-len 262144 --port 8000"
+    "vllm_argv": "vllm serve /persistent/models/qwen3-coder-next --tensor-parallel-size 1 --port 8000 --served-model-name qwen3-coder-next --max-model-len 262144"
   },
   "inference": {
     "endpoint": "http://localhost:8000/v1",
@@ -420,7 +424,7 @@ and every `results.jsonl` record's `grade` block carries the same value (§3).
 | `cuda_runtime` | string \| null | `nvidia-smi` header, or `torch.version.cuda` |
 | `pip_freeze_sha256` | hex | sha256 of `env/pip-freeze.txt`, itself `python3 -m pip freeze --all` sorted |
 | `requirements_lock_sha256` | hex \| null | sha256 of `harness/requirements.lock` (fully pinned, hash-pinned); `null` sets `flags.provenance_incomplete` |
-| `tensor_parallel_size`, `pipeline_parallel_size`, `max_model_len`, `extra_args`, `multinode` | int/string/bool | sourced from `models.d/<model>.env` with `modelctl`'s defaults (`TP=1 PP=1 MAX_MODEL_LEN=262144 EXTRA_ARGS="" MULTINODE=0`) |
+| `tensor_parallel_size`, `pipeline_parallel_size`, `max_model_len`, `extra_args`, `multinode` | int/string/bool | sourced from `models.d/<model>.env` with `modelctl`'s defaults (`TP=1 PP=1 MAX_MODEL_LEN=262144 EXTRA_ARGS="" MULTINODE=0`). `extra_args` is a **blocking comparability key** in `aggregate.py`; if it contains `--max-model-len` or `--served-model-name` the build sets `flags.nonconformant` with reason `EXTRA_ARGS overrides a held-constant serving flag` (`modelctl` appends `$EXTRA_ARGS` *before* those flags, so the study values still win on the command line — the run is flagged, not silently corrected) |
 | `vllm_argv` | string \| null | the single line `modelctl` writes to `$STATE_DIR/vllm-argv` when it launches the server, copied into `<run_dir>/env/vllm-args.txt`; `null` if unavailable, which sets `flags.provenance_incomplete` |
 
 `max_model_len` is a **held constant** (§0.1), not a per-model knob: `MAX_MODEL_LEN` in
@@ -471,6 +475,7 @@ with their cost columns annotated as approximate.
 | `price_cents_per_hour` | int, from `regions[*].instance_type.price_cents_per_hour` in the Lambda `/instance-types` payload |
 | `regions_with_capacity` | string[] at capture time (context only) |
 | `effective_cents_per_hour` | `price_cents_per_hour * node_count` — this is the number `aggregate.py` uses |
+| `billing_mode` | `instance_hours` when the `--endpoint` host is loopback (`localhost`, `127.0.0.1`, `::1` — the self-hosted vLLM case, billed by the GPU hour), else `per_token` (a hosted API billed per token). `aggregate.py` honours this field **first**; only a legacy manifest without it falls back to inference, and that fallback prefers a present `effective_cents_per_hour` / `hardware.lambda_instance_id` over the `--api-pricing` name lookup |
 
 Ladder: (1) `$HARNESS_PRICE_SNAPSHOT` pointing at a JSON file of the shape below (CI writes it on
 the runner *before* launch, where `LAMBDA_API_KEY` lives, and scps it over); (2) run
@@ -521,7 +526,7 @@ throws away good science or publishes bad science:
 |---|---|---|
 | `exploratory` | bool | `--limit` / `--instance` used. Excluded from all published numbers. |
 | `truncated` | bool | instance list is not the full seed list |
-| `nonconformant` | bool | a genuine **harness deviation that breaks comparability**: non-default `--max-iters`, `MAX_MODEL_LEN` ≠ the study constant, dirty (or absent) git work tree, unresolved weight revision or weight digest, unresolved `adapters_dir_sha256` / `environment_digest`, prompt-template drift. **Excluded from aggregation by default.** Set-only, never cleared. |
+| `nonconformant` | bool | a genuine **harness deviation that breaks comparability**: non-default `--max-iters`, `MAX_MODEL_LEN` ≠ the study constant, dirty (or absent) git work tree, unresolved weight revision or weight digest, unresolved `adapters_dir_sha256` / `environment_digest`, prompt-template drift, `EXTRA_ARGS` naming a held-constant serving flag, a seed set with no partitioned id (§6.2). **Excluded from aggregation by default.** Set-only, never cleared. |
 | `nonconformant_reasons` | string[] | one human-readable reason per cause, de-duplicated, in the order they were raised. Empty iff `nonconformant == false`. |
 | `provenance_incomplete` | bool | cost/provenance attribution is **imprecise, but the science is intact**: missing `LAMBDA_INSTANCE_ID` / `LAMBDA_REGION` / instance type, fallback (`static-fallback`) pricing, unresolved `requirements_lock_sha256`, unresolved `vllm_version` / `vllm_argv` / docker image digest. **Included in aggregation by default.** Set-only, never cleared. |
 | `provenance_incomplete_reasons` | string[] | as above. Empty iff `provenance_incomplete == false`. |
@@ -553,7 +558,12 @@ Rules for both flags:
   provenance — a resumed run is the same run, with the same weights and the same grading code.
 - `harness.environment_digest` MUST equal the `grade.environment_digest` recorded on every
   `results.jsonl` record of the run (§3). A record that disagrees was graded by a different
-  environment and invalidates the run.
+  environment and invalidates the run. This is enforced where grading actually happens:
+  `harness/agent.py run` calls the adapter's `environment_digest()` at start, compares it to
+  `harness.environment_digest` in the manifest, and **exits `3` before the first model call** on a
+  mismatch — which is what catches a grader upgrade between a run and its `--resume`, since the
+  resumed manifest is reused verbatim. Records are stamped with the *live* value, never copied
+  from the manifest, so the invariant is checkable after the fact.
 
 ### 2.4 Directory digest (normative algorithm)
 
@@ -577,6 +587,15 @@ This is identical to `LC_ALL=C sort -k2` over `sha256sum` output, so it is check
 `<run_dir>/results.jsonl`, one line per **task attempt** = one (instance_id, pass_idx) pair.
 `pass_idx` is **0-based**. Exactly one record per planned attempt, including failures. Records are
 written as attempts complete (order is not significant); consumers MUST sort.
+
+The one exception to append-only is `INFRA_HOST`: such a record means the attempt was never
+scored (the host itself went away — SIGTERM, reaper, disk full), so it is **retryable**.
+`manifest.py missing` treats an `INFRA_HOST` record as *not done*, and before `run.sh --resume`
+re-runs a pass it calls `manifest.py prune-retryable --run-dir D --pass-idx N`, which atomically
+rewrites `results.jsonl` (tmp file + `os.replace`) dropping that pass's `INFRA_HOST` records and
+prints `PRUNED=<count>`. A resumed pass therefore **replaces** its `INFRA_HOST` records rather than
+duplicating them, and "exactly one record per attempt" holds on the final file. Every other line —
+other passes, other error codes, malformed or foreign lines — is preserved byte for byte.
 
 ```json
 {
@@ -652,7 +671,7 @@ written as attempts complete (order is not significant); consumers MUST sort.
 | `partition` | enum | `train` \| `dev` \| `final_holdout` \| `unpartitioned`, resolved from `partitions.json` at load time |
 | `pass_idx` | int | 0-based, `0 <= pass_idx < passes` |
 | `sampling` | object | `{base_seed, seed, seed_derivation, temperature}` — what was actually sent for this attempt. `base_seed` MUST equal the manifest's `inference.seed`. Decoding is greedy (`temperature` 0.0), so `seed == base_seed` for every pass: the passes are not independent samples and MUST be reported as mean + min/max range, never a bootstrap CI over passes. |
-| `wall_clock_ms` | int | `ended_at - started_at`, includes grading |
+| `wall_clock_ms` | int | `ended_at - started_at`, includes grading AND any time the attempt waited for a grading slot (grading runs on its own pool, `HARNESS_GRADE_CONCURRENCY`, so the GPU-bound loop is never blocked by docker/tests). Per-attempt `cost.usd` is therefore contention-inclusive; the headline cost is run-level (§8) and unaffected. |
 | `resolved` | bool | suite-defined success. `resolved == true` **implies** `error_code == "OK"`; the converse does not hold (`OK` + `resolved:false` is impossible — use `TESTS_FAIL`; see §4) |
 | `error_code` | enum | closed enum from §4. Never free text. |
 | `error_detail` | string | ≤512 chars, human-readable, no secrets, no repo source snippets |
@@ -898,7 +917,11 @@ Committed to git. Ids only; **no task text, no trajectories.** `instance_id` MUS
 
 - `instance_ids` is stored **in selection order** (reproducible from seed + algorithm).
 - `instance_ids_sha256 = sha256("\n".join(sorted(instance_ids)) + "\n")` — order-independent, so it
-  is a stable identity for "this set of tasks".
+  is a stable identity for "this set of tasks". It is **REQUIRED**: `manifest.py build` exits `2`
+  when it is absent *or* mismatched. An absent seal is not "unfrozen" — it is what an edited id
+  list looks like after its stale hash was deleted, and the build must never re-seal such a set.
+  (Only a file marked `"placeholder": true` may omit it, and placeholder seed files are refused by
+  the adapters at run time anyway.)
 - `count == len(instance_ids)`; duplicates are an error.
 - `selection.algorithm` is a literal, runnable one-liner. Regenerating the file MUST reproduce it
   byte for byte; `suites/select.py --verify` asserts this in CI.
@@ -947,6 +970,13 @@ so the three suites share one namespace.
   ids across all three seed files — no id may be missing, none may appear twice.
 - Tasks not present in any partition resolve to `partition: "unpartitioned"` at run time and are a
   validation error at freeze time.
+- **The run path enforces the freeze.** `manifest.py build` exits `2` when the partitions file
+  carries `"placeholder": true` (the committed `suites/partitions.json` is such a file until the
+  real seed files exist). After loading the suite's seed ids it checks that at least one of them
+  resolves to some partition; if **zero** do, the run is marked `flags.nonconformant` with reason
+  `no seed id is partitioned — partitions.json was not frozen for this seed set` — every record
+  would be `unpartitioned` and the leakage guard would have nothing to guard. `suite.
+  partitions_sha256` is recorded either way.
 
 **Leakage guard, implemented as code in `training/build_dataset.py`:**
 
@@ -1097,4 +1127,15 @@ for a one-time cache miss. State this in the paper.
 - [ ] `patch.ref` / `trajectory.ref` are relative and resolve inside the run dir
 - [ ] `resultsctl verify` passes on a freshly packaged bundle
 - [ ] `build_dataset.py` exits `3` on a mutated `partitions.json` and on any holdout id
+- [ ] `manifest.py build` exits `2` on a seed file without `instance_ids_sha256` and on a
+      `"placeholder": true` partitions file; a seed set with no partitioned id yields
+      `flags.nonconformant` (§6.1, §6.2)
+- [ ] `harness/agent.py run` exits `3` when the live adapter `environment_digest()` differs from
+      `harness.environment_digest` in the manifest (§2.3), including on `--resume`
+- [ ] `--resume` replaces a pass's `INFRA_HOST` records (`manifest.py prune-retryable`) instead of
+      appending duplicates; `results.jsonl` ends with exactly one record per attempt (§3.1)
+- [ ] `price.billing_mode` is `instance_hours` for a loopback `--endpoint`, `per_token` otherwise,
+      and `aggregate.py` reads it before any fallback inference (§2.2)
+- [ ] `python3 -m harness.manifest dir-digest <dir> --workers 1` and the default parallel run print
+      the same digest (§2.4 is order-independent of how the per-file hashes were produced)
 - [ ] no `agenttask` trajectory, patch, or problem statement is reachable from git

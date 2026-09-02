@@ -26,7 +26,10 @@ Three things a reader should know before changing anything here.
    `python3 -m harness.adapters.swebench_verified --prefetch`.
 
 3. Grading shells out to the official SWE-bench evaluation harness.  See
-   `grade()` for the exact invocation and the report parsing.
+   `grade()` for the exact invocation and the report parsing.  The grader is
+   handed the *pinned* dataset row (the one `load_tasks` built the task from),
+   never a bare hub id: the hub id would make upstream resolve the dataset
+   HEAD, silently un-pinning the run.
 """
 
 from __future__ import annotations
@@ -97,6 +100,26 @@ DEFAULT_TEST_TIMEOUT_S = 1800
 #: neither the dataset row nor the installed swebench constants supply one.
 #: Identical for both suites, so it cannot make the harness vary by suite.
 FALLBACK_TEST_CMD = "python -m pytest"
+
+#: Upstream `swebench.harness.constants.APPLY_PATCH_FAIL` as it appears in
+#: `run_instance.log` (lower-cased for matching).  Its presence is definitive:
+#: the container was built and the model's patch did not apply.
+_PATCH_APPLY_FAIL_MARKERS = (">>>>> patch apply failed",)
+
+#: Id lists written by upstream `make_run_report` into the run summary
+#: `<tag>.<run_id>.json`.  The `*_instances` keys next to them are INTEGER
+#: COUNTS, never membership lists — do not test `instance_id in` against them.
+_SUMMARY_ID_LISTS = (
+    "resolved_ids",
+    "unresolved_ids",
+    "error_ids",
+    "empty_patch_ids",
+    "completed_ids",
+    "submitted_ids",
+)
+
+#: Upper bound on grader log text folded into the sandbox / apply-fail checks.
+_LOG_EVIDENCE_MAX = 200_000
 
 _SANDBOX_MARKERS = (
     "cannot connect to the docker daemon",
@@ -342,6 +365,13 @@ def load_seed(spec: SuiteSpec, seed_file: Path) -> Seed:
 
     declared = doc.get("instance_ids_sha256")
     computed = ids_digest(ids)
+    if not declared and not doc.get("placeholder"):
+        # Mirror harness/manifest.py: a non-placeholder seed without its seal is not a
+        # frozen seed (§6.1) — an absent hash must not pass what a wrong one fails.
+        raise AdapterConfigError(
+            f"seed file {seed_file}: instance_ids_sha256 is missing — a frozen seed file "
+            "MUST carry the seal of its id set (§6.1); regenerate it with suites/select.py"
+        )
     if declared and declared != computed:
         raise AdapterConfigError(
             f"seed file {seed_file}: instance_ids_sha256 mismatch — "
@@ -375,6 +405,17 @@ def load_seed(spec: SuiteSpec, seed_file: Path) -> Seed:
 
 _UNRESOLVED_REVISION_MARKERS = ("todo", "placeholder", "unresolved", "xxx", "fixme")
 
+#: `environment_digest()` payload value when the seed file pins no dataset
+#: revision (HARNESS_ALLOW_UNPINNED_DATASET=1 runs against the dataset head).
+UNPINNED_REVISION = "unpinned"
+
+
+def _looks_unresolved(revision: str | None) -> bool:
+    if revision is None or not str(revision).strip():
+        return True
+    lowered = str(revision).lower()
+    return any(m in lowered for m in _UNRESOLVED_REVISION_MARKERS)
+
 
 def _checked_revision(seed_file: Path, revision: str | None) -> str | None:
     """Reject a seed file whose dataset revision is still a placeholder.
@@ -384,12 +425,7 @@ def _checked_revision(seed_file: Path, revision: str | None) -> str | None:
     HARNESS_ALLOW_UNPINNED_DATASET=1 to proceed against the dataset head while
     the pin is being resolved; the run is not publication-grade.
     """
-    if revision is None:
-        looks_unresolved = True
-    else:
-        lowered = revision.lower()
-        looks_unresolved = any(m in lowered for m in _UNRESOLVED_REVISION_MARKERS)
-    if not looks_unresolved:
+    if not _looks_unresolved(revision):
         return revision
     if os.environ.get("HARNESS_ALLOW_UNPINNED_DATASET") == "1":
         print(
@@ -487,38 +523,57 @@ def _import_datasets(offline: bool):
     return datasets
 
 
+def _prefetch_hint(spec: SuiteSpec) -> str:
+    return (
+        "Prefetch once on this host with\n"
+        f"    HARNESS_ALLOW_NETWORK=1 python3 -m harness.adapters."
+        f"{spec.suite_name.replace('-', '_')} --prefetch\n"
+        "or export HARNESS_ALLOW_NETWORK=1 for this run."
+    )
+
+
+def _rows_for(spec: SuiteSpec, dataset: str, split: str, revision: str | None) -> dict[str, dict]:
+    """{instance_id: row} for one (dataset, split, revision), memoised in `_ROW_CACHE`.
+
+    Honours the §5 network gate: offline unless HARNESS_ALLOW_NETWORK=1, so a
+    miss with no local HF cache raises `DatasetUnavailable` instead of
+    downloading.  `revision=None` means the caller explicitly accepted the
+    dataset head (HARNESS_ALLOW_UNPINNED_DATASET=1); it is part of the cache key
+    so rows from different revisions are never conflated.
+    """
+    key = (dataset, split, revision)
+    cached = _ROW_CACHE.get(key)
+    if cached is not None:
+        return cached
+    offline = not _network_allowed()
+    datasets = _import_datasets(offline)
+    kwargs: dict[str, Any] = {"split": split}
+    if revision:
+        kwargs["revision"] = revision
+    try:
+        ds = datasets.load_dataset(dataset, **kwargs)
+    except Exception as exc:  # datasets raises a wide variety of types
+        hint = (
+            "No local HuggingFace cache entry and network access is disabled. " + _prefetch_hint(spec)
+            if offline
+            else "Network access was permitted but the download failed."
+        )
+        raise DatasetUnavailable(
+            f"could not load {dataset} (split={split}, "
+            f"revision={revision or UNPINNED_REVISION}): {exc}. {hint}"
+        ) from exc
+    cached = {}
+    for row in ds:
+        instance_id = row.get("instance_id")
+        if isinstance(instance_id, str):
+            cached[instance_id] = dict(row)
+    _ROW_CACHE[key] = cached
+    return cached
+
+
 def _load_rows(spec: SuiteSpec, seed: Seed) -> dict[str, dict]:
     """Return {instance_id: row} for the seeded ids only, pinned to the seed revision."""
-    key = (seed.dataset, seed.split, seed.revision)
-    cached = _ROW_CACHE.get(key)
-    if cached is None:
-        offline = not _network_allowed()
-        datasets = _import_datasets(offline)
-        kwargs: dict[str, Any] = {"split": seed.split}
-        if seed.revision:
-            kwargs["revision"] = seed.revision
-        try:
-            ds = datasets.load_dataset(seed.dataset, **kwargs)
-        except Exception as exc:  # datasets raises a wide variety of types
-            hint = (
-                "No local HuggingFace cache entry and network access is disabled. "
-                "Prefetch once on this host with\n"
-                f"    HARNESS_ALLOW_NETWORK=1 python3 -m harness.adapters."
-                f"{spec.suite_name.replace('-', '_')} --prefetch\n"
-                "or export HARNESS_ALLOW_NETWORK=1 for this run."
-                if offline
-                else "Network access was permitted but the download failed."
-            )
-            raise DatasetUnavailable(
-                f"could not load {seed.dataset} (split={seed.split}, "
-                f"revision={seed.revision or 'unpinned'}): {exc}. {hint}"
-            ) from exc
-        cached = {}
-        for row in ds:
-            instance_id = row.get("instance_id")
-            if isinstance(instance_id, str):
-                cached[instance_id] = dict(row)
-        _ROW_CACHE[key] = cached
+    cached = _rows_for(spec, seed.dataset, seed.split, seed.revision)
 
     missing = [i for i in seed.instance_ids if i not in cached]
     if missing:
@@ -592,6 +647,7 @@ def _build_task(
     row: Mapping[str, Any],
     instance_id: str,
     partitions: Mapping[str, str],
+    revision: str | None,
 ) -> Task:
     repo = str(_first_present(row, ("repo", "repository")) or "")
     base_commit = str(_first_present(row, ("base_commit", "commit")) or "")
@@ -624,9 +680,13 @@ def _build_task(
     # `metadata` is suite-specific and is never fed to the prompt (CONTRACTS §5.1).
     # `hints_text` is deliberately dropped, not stored: it is a leak of the gold
     # solution and must not be reachable from the agent.
+    # `revision` is the seed's pinned `source.revision` (None only under
+    # HARNESS_ALLOW_UNPINNED_DATASET=1).  grade() uses it to hand the evaluation
+    # harness exactly the row this task was built from — see `_pinned_row`.
     metadata = {
         "dataset": spec.dataset,
         "split": spec.split,
+        "revision": revision,
         "version": row.get("version"),
         "environment_setup_commit": row.get("environment_setup_commit"),
         "test_patch_present": bool(row.get("test_patch")),
@@ -681,7 +741,7 @@ def load_tasks(
         partitions_file if partitions_file is not None else _default_partitions_path()
     )
     rows = _load_rows(spec, seed)
-    return [_build_task(spec, rows[i], i, partitions) for i in seed.instance_ids]
+    return [_build_task(spec, rows[i], i, partitions, seed.revision) for i in seed.instance_ids]
 
 
 # --------------------------------------------------------------------------- #
@@ -749,18 +809,37 @@ def build_prompt(spec: SuiteSpec, task: Task) -> Prompt:
 # report.  That report is the sole source of the verdict.
 #
 # Inputs written into a private temp dir (nothing is written outside it):
-#   dataset.jsonl  the single pinned dataset row, so the grader evaluates exactly
-#                  the revision the seed file pins (`--dataset_name` accepts a
-#                  local .jsonl path).  Set HARNESS_DATASET_MODE=hub to pass the
-#                  hub dataset id instead.
+#   dataset.jsonl  the single pinned dataset row — the exact row `load_tasks`
+#                  built the task from, at the seed file's `source.revision`
+#                  (`--dataset_name` accepts a local .jsonl path).  The bare hub
+#                  id is NEVER passed: `run_evaluation` has no revision flag, so
+#                  a hub id makes it grade against the dataset HEAD, silently
+#                  un-pinning the run.  If the pinned rows are not cached
+#                  in-process or in the local HF cache, grade() raises
+#                  GraderError naming `--prefetch` (see `_pinned_row`).
 #   preds.json     [{"instance_id", "model_name_or_path": PREDICTION_TAG,
 #                    "model_patch": <patch>}]
 #
 # The subprocess runs with cwd=<temp dir>, so the harness's `logs/` tree and its
 # summary report land inside the temp dir and are removed with it.
 #
-# Report parsing (in order): logs/run_evaluation/<run_id>/<tag>/<id>/report.json,
-# any nested report.json, then the top-level `<tag>.<run_id>.json` summary.
+# Image cache: `--cache_level env --clean False`.  Upstream keeps the base and
+# per-environment (conda/pip) images and removes only the per-instance image
+# after the run.  With `--cache_level none` every one of the ~900 grade() calls
+# in a study — each a fresh subprocess, run_id and temp dir — rebuilt the
+# environment image from scratch (5-15 min of the ~$54/hr node per instance).
+# Caching the env layer changes nothing about the verdict: environment_digest()
+# hashes the swebench distribution (version + RECORD) and the docker server
+# version, i.e. the *recipe*, not the image cache, so reproducibility is
+# unaffected.  `--clean False` keeps images that existed before the run.
+#
+# Report parsing: the per-instance report.json
+# (logs/run_evaluation/<run_id>/<tag>/<id>/report.json, or any nested
+# report.json) is the only source of a scored verdict.  The run summary
+# `<tag>.<run_id>.json` (written by upstream `make_run_report`) is consulted
+# only when no per-instance report exists, and then it can only yield NO_PATCH,
+# PATCH_MALFORMED, INFRA_SANDBOX or GraderError — never TESTS_FAIL, because an
+# instance whose container never built also lands in the summary's `error_ids`.
 #
 # Verdict mapping (CONTRACTS §4):
 #   patch empty/whitespace                -> NO_PATCH   (no environment built)
@@ -769,7 +848,8 @@ def build_prompt(spec: SuiteSpec, task: Task) -> Prompt:
 #   all FAIL_TO_PASS pass, PASS_TO_PASS regressed -> TESTS_REGRESSION
 #   otherwise                             -> TESTS_FAIL
 #   docker/image/setup failure            -> INFRA_SANDBOX (returned, not raised)
-#   grader crash / timeout / no report    -> GraderError -> INFRA_GRADER
+#   grader crash / timeout / no report /
+#   report without a parseable tests_status -> GraderError -> INFRA_GRADER
 #
 # Both suites use this identical path.  swebench-pro differs only in
 # `spec.dataset`, `spec.grader` and `spec.eval_module`; if the Pro evaluation
@@ -816,8 +896,10 @@ def _eval_command(
         run_tag,
         "--max_workers",
         "1",
+        # Keep base+env images, drop the instance image (see the block comment
+        # above for why `none` was a 5-15 min rebuild per grade() call).
         "--cache_level",
-        "none",
+        "env",
         "--clean",
         "False",
         "--timeout",
@@ -825,11 +907,22 @@ def _eval_command(
     ]
 
 
-def _find_report(tmp: Path, instance_id: str) -> dict | None:
-    candidates: list[Path] = []
-    nested = sorted(tmp.rglob("report.json"))
-    candidates.extend(nested)
-    candidates.extend(sorted(p for p in tmp.glob("*.json") if p.name not in {"preds.json"}))
+def _find_report(tmp: Path, instance_id: str) -> tuple[dict | None, dict | None]:
+    """Locate the grader's output for `instance_id` under `tmp`.
+
+    Returns `(instance_report, summary)`:
+      * `instance_report` — the body of the per-instance report.json (upstream
+        writes `{instance_id: {...}}`), the only source of a scored verdict;
+      * `summary` — the run-level `<tag>.<run_id>.json` from `make_run_report`,
+        recognised by its `*_ids` membership lists.
+    Either may be None.  A file that is unreadable or not JSON (e.g. truncated
+    mid-write) is skipped, and the caller treats a missing per-instance report
+    as INFRA_* / GraderError — never as a scored TESTS_FAIL.
+    """
+    instance_report: dict | None = None
+    summary: dict | None = None
+    candidates: list[Path] = sorted(tmp.rglob("report.json"))
+    candidates.extend(sorted(p for p in tmp.glob("*.json") if p.name != "preds.json"))
     for path in candidates:
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
@@ -837,34 +930,82 @@ def _find_report(tmp: Path, instance_id: str) -> dict | None:
             continue
         if not isinstance(doc, dict):
             continue
-        if instance_id in doc and isinstance(doc[instance_id], dict):
-            return doc[instance_id]
-        if "tests_status" in doc or "patch_successfully_applied" in doc:
-            return doc
-        if "resolved_ids" in doc:  # summary report: usable, but counts-free
-            return {
-                "_summary_only": True,
-                "resolved": instance_id in (doc.get("resolved_ids") or []),
-                "patch_exists": instance_id not in (doc.get("empty_patch_instances") or []),
-                "patch_successfully_applied": instance_id
-                not in (doc.get("error_instances") or []),
-            }
-    return None
+        if instance_report is None:
+            if instance_id in doc and isinstance(doc[instance_id], dict):
+                instance_report = doc[instance_id]
+                continue
+            if "tests_status" in doc or "patch_successfully_applied" in doc:
+                instance_report = doc
+                continue
+        if summary is None and any(isinstance(doc.get(k), list) for k in _SUMMARY_ID_LISTS):
+            summary = doc
+    return instance_report, summary
 
 
-def _counts(block: Any, expected_total: int) -> dict:
-    if isinstance(block, dict):
-        success = block.get("success") or []
-        failure = block.get("failure") or []
-        if isinstance(success, list) and isinstance(failure, list):
-            total = len(success) + len(failure)
-            return {"passed": len(success), "total": total or expected_total}
-    return {"passed": 0, "total": expected_total}
+def _in_summary_list(summary: Mapping[str, Any], key: str, instance_id: str) -> bool:
+    """Membership in one of upstream's `*_ids` lists (the `*_instances` keys are counts)."""
+    ids = summary.get(key)
+    return isinstance(ids, list) and instance_id in ids
+
+
+def _counts(block: Any, label: str, instance_id: str, expected_total: int) -> dict:
+    """{"passed", "total"} from one `tests_status.<label>` block.
+
+    Raises GraderError (-> INFRA_GRADER) when the block is missing or malformed:
+    a verdict we cannot read must not be scored as 0/N.  `total` is what the
+    grader actually reported — an empty block is 0/0, never silently 0/N.
+    """
+    if (
+        not isinstance(block, dict)
+        or not isinstance(block.get("success"), list)
+        or not isinstance(block.get("failure"), list)
+    ):
+        raise GraderError(
+            f"unparseable verdict for {instance_id}: tests_status.{label} is missing or "
+            f"malformed (got {type(block).__name__}); the evaluation harness report "
+            "format may have changed"
+        )
+    passed = len(block["success"])
+    total = passed + len(block["failure"])
+    if total == 0 and expected_total > 0:
+        raise GraderError(
+            f"unparseable verdict for {instance_id}: tests_status.{label} lists no "
+            f"outcomes although the task has {expected_total} {label} test(s) — the "
+            "grader's log parser produced nothing"
+        )
+    return {"passed": passed, "total": total}
 
 
 def _looks_like_sandbox_failure(output: str) -> bool:
     lowered = output.lower()
     return any(marker in lowered for marker in _SANDBOX_MARKERS)
+
+
+def _looks_like_patch_apply_failure(output: str) -> bool:
+    lowered = output.lower()
+    return any(marker in lowered for marker in _PATCH_APPLY_FAIL_MARKERS)
+
+
+def _instance_log_text(tmp: Path, instance_id: str) -> str:
+    """Tail of every grader log that belongs to `instance_id` (run_instance.log,
+    build_image.log), capped at `_LOG_EVIDENCE_MAX` bytes in total."""
+    needles = (instance_id.lower(), _normalized_image_id(instance_id))
+    parts: list[str] = []
+    budget = _LOG_EVIDENCE_MAX
+    for path in sorted(tmp.rglob("*.log")):
+        if budget <= 0:
+            break
+        lowered_path = str(path).lower()
+        if not any(n in lowered_path for n in needles):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        chunk = text[-budget:]
+        budget -= len(chunk)
+        parts.append(f"===== {path.relative_to(tmp)} =====\n{chunk}")
+    return "\n".join(parts)
 
 
 def grade(spec: SuiteSpec, task: Task, patch: str) -> Verdict:
@@ -904,7 +1045,10 @@ def grade(spec: SuiteSpec, task: Task, patch: str) -> Verdict:
 
     grader_timeout = _int_env("HARNESS_GRADER_TIMEOUT", DEFAULT_GRADER_TIMEOUT_S)
     test_timeout = _int_env("HARNESS_TEST_TIMEOUT", DEFAULT_TEST_TIMEOUT_S)
-    dataset_mode = (spec.env("DATASET_MODE", "local") or "local").lower()
+
+    # Resolve the pinned row BEFORE creating the temp dir / subprocess: a miss
+    # is a GraderError (INFRA_GRADER) naming --prefetch, never a hub-id fallback.
+    row = _pinned_row(spec, task)
 
     import tempfile
 
@@ -927,19 +1071,12 @@ def grade(spec: SuiteSpec, task: Task, patch: str) -> Verdict:
             encoding="utf-8",
         )
 
-        if dataset_mode == "local":
-            row = _pinned_row(spec, task)
-            if row is None:
-                dataset_arg = spec.dataset
-            else:
-                local = tmp / "dataset.jsonl"
-                local.write_text(
-                    json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n",
-                    encoding="utf-8",
-                )
-                dataset_arg = str(local)
-        else:
-            dataset_arg = spec.dataset
+        local = tmp / "dataset.jsonl"
+        local.write_text(
+            json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        dataset_arg = str(local)
 
         run_tag = f"harness-{uuid.uuid4().hex[:12]}"
         cmd = _eval_command(spec, dataset_arg, preds, task.instance_id, run_tag, tmp, test_timeout)
@@ -968,47 +1105,170 @@ def grade(spec: SuiteSpec, task: Task, patch: str) -> Verdict:
             ) from exc
 
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        report = _find_report(tmp, task.instance_id)
+        instance_report, summary = _find_report(tmp, task.instance_id)
 
-        if report is None:
-            if _looks_like_sandbox_failure(combined):
-                return Verdict(
-                    resolved=False,
-                    error_code="INFRA_SANDBOX",
-                    detail=_clip(
-                        f"evaluation environment could not be prepared for {task.instance_id}: "
-                        + combined[-400:]
-                    ),
-                    fail_to_pass={"passed": 0, "total": len(task.fail_to_pass)},
-                    pass_to_pass={"passed": 0, "total": len(task.pass_to_pass)},
-                    grader=spec.grader,
-                    grader_version=grader_version,
-                    raw={"returncode": proc.returncode, "tail": combined[-4000:]},
-                )
-            raise GraderError(
-                f"{spec.eval_module} produced no report for {task.instance_id} "
-                f"(exit {proc.returncode}): {_clip(combined[-400:])}"
+        if instance_report is not None:
+            return _verdict_from_report(
+                spec, task, instance_report, grader_version, proc.returncode, combined
             )
 
-        return _verdict_from_report(spec, task, report, grader_version, proc.returncode, combined)
+        # No per-instance report: the verdict is unknowable from the grader's
+        # scored output.  Fold the instance's own logs into the evidence — the
+        # build failure / patch-apply failure text lives there, not on stdout.
+        evidence = combined + "\n" + _instance_log_text(tmp, task.instance_id)
+        if summary is not None:
+            return _verdict_from_summary(
+                spec, task, summary, grader_version, proc.returncode, evidence
+            )
+        if _looks_like_sandbox_failure(evidence):
+            return _sandbox_verdict(spec, task, grader_version, proc.returncode, evidence)
+        raise GraderError(
+            f"{spec.eval_module} produced no report for {task.instance_id} "
+            f"(exit {proc.returncode}): {_clip(evidence[-400:])}"
+        )
 
 
-def _pinned_row(spec: SuiteSpec, task: Task) -> dict | None:
-    """The dataset row for `task`, from the cache populated by load_tasks.
+def _pinned_row(spec: SuiteSpec, task: Task) -> dict:
+    """The dataset row for `task`, at the revision `load_tasks` pinned it to.
 
-    Returns None when the row is not cached (e.g. grade() called in isolation);
-    the caller then falls back to the hub dataset id.
+    Looks up `_ROW_CACHE` by the exact (dataset, split, revision) recorded in
+    `task.metadata`; on a miss it reads the local HF cache under the same §5
+    network gate `load_tasks` uses.  It NEVER falls back to the hub dataset id
+    (which would let the grader resolve HEAD): if the pinned rows are not
+    available it raises GraderError naming `--prefetch`, so the attempt is
+    recorded as INFRA_GRADER rather than graded against an unknown revision.
     """
-    key = (spec.dataset, str(task.metadata.get("split") or spec.split), None)
-    for (dataset, split, _rev), rows in _ROW_CACHE.items():
-        if dataset != spec.dataset:
-            continue
-        if split != key[1]:
-            continue
-        row = rows.get(task.instance_id)
-        if row is not None:
-            return _jsonable(row)
-    return None
+    split = str(task.metadata.get("split") or spec.split)
+    if "revision" not in task.metadata:
+        raise GraderError(
+            f"{task.instance_id}: task carries no dataset revision (metadata.revision) — it "
+            f"was not built by {spec.suite_name}'s load_tasks, so the pinned row cannot be "
+            "located; rebuild the task list with load_tasks(seed_file)"
+        )
+    revision = task.metadata.get("revision")  # None == explicitly unpinned
+    label = f"{spec.dataset}@{revision or UNPINNED_REVISION} (split={split})"
+    rows = _ROW_CACHE.get((spec.dataset, split, revision))
+    if rows is None:
+        try:
+            rows = _rows_for(spec, spec.dataset, split, revision)
+        except AdapterConfigError as exc:
+            raise GraderError(
+                f"pinned dataset rows for {label} are not available on this host, so "
+                f"{task.instance_id} cannot be graded against the pinned revision: {exc}. "
+                + _prefetch_hint(spec)
+            ) from exc
+    row = rows.get(task.instance_id)
+    if row is None:
+        raise GraderError(
+            f"{task.instance_id} is absent from {label}; the task list and the grader "
+            "disagree about the dataset revision"
+        )
+    return _jsonable(row)
+
+
+def _zero_counts(task: Task) -> tuple[dict, dict]:
+    return (
+        {"passed": 0, "total": len(task.fail_to_pass)},
+        {"passed": 0, "total": len(task.pass_to_pass)},
+    )
+
+
+def _sandbox_verdict(
+    spec: SuiteSpec, task: Task, grader_version: str, returncode: int, evidence: str, raw_extra: dict | None = None
+) -> Verdict:
+    f2p, p2p = _zero_counts(task)
+    raw = {"returncode": returncode, "tail": evidence[-4000:]}
+    if raw_extra:
+        raw.update(raw_extra)
+    return Verdict(
+        resolved=False,
+        error_code="INFRA_SANDBOX",
+        detail=_clip(
+            f"evaluation environment could not be prepared for {task.instance_id}: "
+            + evidence[-400:]
+        ),
+        fail_to_pass=f2p,
+        pass_to_pass=p2p,
+        grader=spec.grader,
+        grader_version=grader_version,
+        raw=raw,
+    )
+
+
+def _verdict_from_summary(
+    spec: SuiteSpec,
+    task: Task,
+    summary: Mapping[str, Any],
+    grader_version: str,
+    returncode: int,
+    evidence: str,
+) -> Verdict:
+    """Verdict when only upstream's run summary exists (no per-instance report).
+
+    The summary carries membership lists but no test counts, so it can never
+    produce a scored TESTS_FAIL / TESTS_REGRESSION / OK.  `error_ids` is where
+    upstream puts *every* submitted instance that ended without a report —
+    patch-apply failures and container-build failures alike — so the instance's
+    logs decide between PATCH_MALFORMED (definitive upstream marker),
+    INFRA_SANDBOX (docker/image markers) and GraderError (unknown).
+    """
+    iid = task.instance_id
+    f2p, p2p = _zero_counts(task)
+    raw = {
+        "returncode": returncode,
+        "summary": {k: v for k, v in summary.items() if k != "incomplete_ids"},
+        "eval_module": spec.eval_module,
+        "log_tail": evidence[-4000:],
+    }
+
+    if _in_summary_list(summary, "empty_patch_ids", iid):
+        return Verdict(
+            resolved=False,
+            error_code="NO_PATCH",
+            detail="evaluation harness saw no patch for this prediction",
+            fail_to_pass=f2p,
+            pass_to_pass=p2p,
+            grader=spec.grader,
+            grader_version=grader_version,
+            raw=raw,
+        )
+
+    completed = any(
+        _in_summary_list(summary, k, iid) for k in ("completed_ids", "resolved_ids", "unresolved_ids")
+    )
+    if _in_summary_list(summary, "error_ids", iid) or not completed:
+        if _looks_like_patch_apply_failure(evidence):
+            return Verdict(
+                resolved=False,
+                error_code="PATCH_MALFORMED",
+                detail=_clip(
+                    f"patch did not apply to {task.repo}@{task.base_commit[:12]} "
+                    "(git apply 3-way then patch -p1 both failed inside the evaluation container)"
+                ),
+                fail_to_pass=f2p,
+                pass_to_pass=p2p,
+                grader=spec.grader,
+                grader_version=grader_version,
+                raw=raw,
+            )
+        if _looks_like_sandbox_failure(evidence):
+            return _sandbox_verdict(
+                spec, task, grader_version, returncode, evidence, raw_extra={"summary": raw["summary"]}
+            )
+        where = "error_ids" if _in_summary_list(summary, "error_ids", iid) else "no id list"
+        raise GraderError(
+            f"{spec.eval_module} ended {iid} without a per-instance report (summary: {where}, "
+            f"exit {returncode}) and the logs show neither a patch-apply failure nor a "
+            f"sandbox failure: {_clip(evidence[-400:])}"
+        )
+
+    # Upstream lists it as completed, so a report.json existed when the summary
+    # was written — yet none was readable now.  Counts are unknowable.
+    raise GraderError(
+        f"unparseable verdict for {iid}: the run summary lists it as completed "
+        f"(resolved={_in_summary_list(summary, 'resolved_ids', iid)}) but no readable "
+        "per-instance report.json with tests_status was found"
+    )
 
 
 def _verdict_from_report(
@@ -1019,10 +1279,13 @@ def _verdict_from_report(
     returncode: int,
     combined: str,
 ) -> Verdict:
-    tests_status = report.get("tests_status") or {}
-    f2p = _counts(tests_status.get("FAIL_TO_PASS"), len(task.fail_to_pass))
-    p2p = _counts(tests_status.get("PASS_TO_PASS"), len(task.pass_to_pass))
-    resolved = bool(report.get("resolved"))
+    """Verdict from the per-instance report.json body.
+
+    NO_PATCH / PATCH_MALFORMED are decided from the patch flags before the test
+    counts are read; for anything else `tests_status` must be present and
+    parseable or the verdict is unknowable (GraderError -> INFRA_GRADER).
+    """
+    iid = task.instance_id
     raw = {
         "returncode": returncode,
         "report": dict(report),
@@ -1033,17 +1296,19 @@ def _verdict_from_report(
     applied = report.get("patch_successfully_applied")
     exists = report.get("patch_exists", True)
     if report.get("patch_is_None") or exists is False:
+        f2p, p2p = _zero_counts(task)
         return Verdict(
             resolved=False,
             error_code="NO_PATCH",
             detail="evaluation harness saw no patch for this prediction",
-            fail_to_pass={"passed": 0, "total": len(task.fail_to_pass)},
-            pass_to_pass={"passed": 0, "total": len(task.pass_to_pass)},
+            fail_to_pass=f2p,
+            pass_to_pass=p2p,
             grader=spec.grader,
             grader_version=grader_version,
             raw=raw,
         )
     if applied is False:
+        f2p, p2p = _zero_counts(task)
         return Verdict(
             resolved=False,
             error_code="PATCH_MALFORMED",
@@ -1051,17 +1316,25 @@ def _verdict_from_report(
                 f"patch did not apply to {task.repo}@{task.base_commit[:12]} "
                 "(git apply 3-way then patch -p1 both failed inside the evaluation container)"
             ),
-            fail_to_pass={"passed": 0, "total": len(task.fail_to_pass)},
-            pass_to_pass={"passed": 0, "total": len(task.pass_to_pass)},
+            fail_to_pass=f2p,
+            pass_to_pass=p2p,
             grader=spec.grader,
             grader_version=grader_version,
             raw=raw,
         )
 
+    tests_status = report.get("tests_status")
+    if not isinstance(tests_status, dict):
+        raise GraderError(
+            f"unparseable verdict for {iid}: report has no tests_status "
+            f"(keys: {sorted(str(k) for k in report.keys())[:12]}); the evaluation harness "
+            "report format may have changed"
+        )
+    f2p = _counts(tests_status.get("FAIL_TO_PASS"), "FAIL_TO_PASS", iid, len(task.fail_to_pass))
+    p2p = _counts(tests_status.get("PASS_TO_PASS"), "PASS_TO_PASS", iid, len(task.pass_to_pass))
+    resolved = bool(report.get("resolved"))
+
     if resolved:
-        if report.get("_summary_only"):
-            f2p = {"passed": f2p["total"], "total": f2p["total"]}
-            p2p = {"passed": p2p["total"], "total": p2p["total"]}
         return Verdict(
             resolved=True,
             error_code="OK",
@@ -1107,13 +1380,55 @@ def _verdict_from_report(
 # --------------------------------------------------------------------------- #
 
 
-def environment_digest(spec: SuiteSpec) -> str:
+def _digest_seed_file(spec: SuiteSpec, seed_file: Path | str | None) -> Path:
+    """Seed file whose `source.revision` the digest records.
+
+    `environment_digest()` takes no arguments by contract (§5), so the seed file
+    is resolved from: an explicit argument (operator CLI) -> `HARNESS_SEED_FILE`
+    (`HARNESS_SEED_FILE_<SUITE>` first) -> the suite's default seed file.  Every
+    call site in one run (manifest build, preflight, agent) must resolve the
+    same file, so a `--seed-file` override should be exported as
+    HARNESS_SEED_FILE for the whole run.
+    """
+    if seed_file is not None:
+        return Path(seed_file)
+    override = spec.env("SEED_FILE")
+    if override:
+        return Path(override)
+    return _REPO_ROOT / spec.default_seed_file
+
+
+def _seed_revision_marker(spec: SuiteSpec, seed_file: Path | str | None) -> str:
+    """The seed file's pinned `source.revision`, or `UNPINNED_REVISION`.
+
+    Deliberately lenient about the pin (unlike `load_seed`): a placeholder
+    revision yields the explicit "unpinned" marker rather than raising, so the
+    digest is computable — and different from any pinned run's — on the
+    HARNESS_ALLOW_UNPINNED_DATASET=1 path.  A missing or malformed seed file is
+    still a config error.
+    """
+    path = _digest_seed_file(spec, seed_file)
+    doc = _read_json(path, "seed file")
+    if not isinstance(doc, dict):
+        raise AdapterConfigError(f"seed file {path}: top level must be an object")
+    source = doc.get("source")
+    revision = source.get("revision") if isinstance(source, dict) else None
+    if isinstance(revision, str) and not _looks_unresolved(revision):
+        return revision
+    return UNPINNED_REVISION
+
+
+def environment_digest(spec: SuiteSpec, seed_file: Path | str | None = None) -> str:
     """`sha256:<hex>` identifying the grading environment.
 
     Covers everything that could change a verdict for a fixed (task, patch):
-    the adapter itself, the pinned dataset, the evaluation harness artifact, the
-    container runtime, and the grading knobs read from the environment.
+    the adapter itself, the pinned dataset *at its pinned revision* (or the
+    explicit "unpinned" marker), the evaluation harness artifact, the container
+    runtime, and the grading knobs read from the environment.  The docker image
+    cache is deliberately not covered: `--cache_level env` reuses environment
+    images whose recipe is fixed by the swebench distribution hashed here.
     """
+    dataset_revision = _seed_revision_marker(spec, seed_file)
     adapter_file = _REPO_ROOT / "harness" / "adapters" / f"{spec.suite_name.replace('-', '_')}.py"
     try:
         adapter_sha = _sha256_hex(adapter_file.read_bytes())
@@ -1141,12 +1456,13 @@ def environment_digest(spec: SuiteSpec) -> str:
             pass
 
     payload = {
-        "schema": "grading-environment/v1",
+        "schema": "grading-environment/v2",
         "suite": spec.suite_name,
         "adapter_version": spec.adapter_version,
         "adapter_sha256": adapter_sha,
         "adapter_base_sha256": base_sha,
         "dataset": spec.dataset,
+        "dataset_revision": dataset_revision,
         "split": spec.split,
         "grader": spec.grader,
         "grader_distribution": spec.grader_distribution,
@@ -1154,7 +1470,6 @@ def environment_digest(spec: SuiteSpec) -> str:
         "grader_record_sha256": _dist_record_sha256(spec.grader_distribution) or "unavailable",
         "eval_module": spec.eval_module,
         "eval_cmd_override": spec.env("EVAL_CMD") or "",
-        "dataset_mode": (spec.env("DATASET_MODE", "local") or "local").lower(),
         "image_template": spec.env("IMAGE_TEMPLATE") or spec.image_template or "",
         "container_runtime": f"docker/{docker_version}",
         "test_timeout_s": _int_env("HARNESS_TEST_TIMEOUT", DEFAULT_TEST_TIMEOUT_S),
@@ -1184,7 +1499,7 @@ def main(spec: SuiteSpec, argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if args.digest:
-        print(environment_digest(spec))
+        print(environment_digest(spec, seed_file=Path(args.seed_file)))
         return 0
 
     seed = load_seed(spec, Path(args.seed_file))

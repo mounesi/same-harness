@@ -28,9 +28,15 @@ jobs:
       - name: Shell syntax
         shell: bash
         run: |
-          for f in modelctl lambdactl resultsctl harness/run.sh training/train_lora.sh smoke/run-smoke.sh; do
-            bash -n "$f" && echo "ok $f"
+          # Every file is checked and ANY failure fails the step. (The previous
+          # `bash -n "$f" && echo ok` form was exempt from -e and reported only the last
+          # iteration's status, so a syntax error anywhere but the last file passed green.)
+          fail=0
+          for f in modelctl lambdactl resultsctl harness/run.sh training/train_lora.sh smoke/run-smoke.sh \
+                   $(find . -name '*.sh' -not -path './.git/*' | sort); do
+            if bash -n "$f"; then echo "ok $f"; else echo "SYNTAX ERROR: $f" >&2; fail=1; fi
           done
+          exit "$fail"
 
       - name: Python compiles
         run: |
@@ -47,8 +53,10 @@ jobs:
       - name: Leakage guard self-test
         run: python training/build_dataset.py --self-test
 
-      - name: Git hygiene (no raw results or restricted content staged)
-        run: ./resultsctl verify --git-hygiene
+      - name: Git hygiene (no raw results or restricted content in the tree)
+        # --all scans every TRACKED file. The default scope is the staged diff, which is
+        # empty after actions/checkout — without --all this step inspected nothing.
+        run: ./resultsctl verify --git-hygiene --all
 
       - name: End-to-end smoke (mock endpoint, synthetic suite, no GPU)
         run: ./smoke/run-smoke.sh

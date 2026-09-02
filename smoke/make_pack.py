@@ -181,6 +181,12 @@ def main() -> int:
                       "stratified_by": None},
         "count": len(ids),
         "instance_ids": ids,
+        # The seal manifest.py requires of every non-placeholder seed (§6.1): sha256 of the
+        # sorted ids joined by newlines, trailing newline — the same recipe as
+        # harness.manifest.id_set_sha256, so the freeze check passes for a genuine set.
+        "instance_ids_sha256": hashlib.sha256(
+            ("\n".join(sorted(ids)) + "\n").encode("utf-8")
+        ).hexdigest(),
     }
     (out / "seed.json").write_text(json.dumps(seed, indent=2, sort_keys=True) + "\n",
                                    encoding="utf-8")
