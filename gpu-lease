@@ -84,9 +84,9 @@ cmd_status() {
       if (( expires_in > 0 )); then state="valid"; else state="expired"; fi
     fi
   fi
-  local procs; procs="$(pgrep -fc "$JOB_PATTERN" 2>/dev/null || true)"; procs="${procs:-0}"
-  # pgrep -c counts itself on some systems; a plain-text scan is the portable check.
-  procs="$(ps -eo args= 2>/dev/null | grep -Ec "$JOB_PATTERN" | tr -d ' ' || echo 0)"
+  # pgrep never matches its own process (a `ps | grep` scan does, and would report "busy"
+  # forever — the watchdog would then never reap anything). Count matching pids explicitly.
+  local procs; procs="$(pgrep -f "$JOB_PATTERN" 2>/dev/null | grep -c . || true)"; procs="${procs:-0}"
   local vllm=0; curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 && vllm=1
   local util; util="$(gpu_util)"
   local verdict="idle"
