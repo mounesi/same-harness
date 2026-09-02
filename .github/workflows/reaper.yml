@@ -3,8 +3,12 @@
 #  - every 2h: kill ANY instance older than 24h
 name: instance-reaper
 on:
-  schedule:
-    - cron: "0 */2 * * *"
+  # Schedule DISABLED until the LAMBDA_API_KEY repo secret exists: every scheduled run was
+  # failing at `./lambdactl ls` on the key guard (lambdactl:22) and producing nothing but
+  # red runs. Re-enable by uncommenting once AI-2955 item 3 (secrets) is done — the reaper
+  # is the credit's seatbelt and MUST be back on before the first paid dispatch.
+  # schedule:
+  #   - cron: "0 */2 * * *"
   workflow_dispatch: {}
 jobs:
   reap:
