@@ -25,7 +25,7 @@ If this is red, do not spend a cent. CI runs it on every push (`.github/workflow
 
 ### 1.2 Pre-flight — once, before any paid run (blocking)
 
-These are one-time and every one of them blocks the first dispatch:
+These are one-time and every one of them blocks the first dispatch (the reaper needs no setup — it is on, and skips cleanly until the secrets exist):
 
 | # | Step | Command / where |
 |---|---|---|
@@ -35,7 +35,6 @@ These are one-time and every one of them blocks the first dispatch:
 | 4 | Create the Lambda persistent filesystem for weights | Lambda console; its name is `LAMBDA_FS` |
 | 5 | Accept the Kimi K3 (and Qwen3.8-Max) license on Hugging Face | from the org account, or `hf download` fails at instance time |
 | 6 | Pin the vLLM version | set `VLLM_VERSION`; on the first instance re-resolve `harness/requirements.lock` |
-| 7 | Re-enable the reaper schedule | uncomment the `schedule:` block in `.github/workflows/reaper.yml` |
 
 The harness enforces (2): `manifest.py build` refuses a `"placeholder": true` partitions
 file, and `benchmark.yml` checks it **before** launching an instance. Freezing partitions
@@ -63,19 +62,25 @@ before anything expensive.
 ### 1.4 A benchmark run — by hand (on a Lambda instance)
 
 ```bash
-# machine
-export LAMBDA_API_KEY=...
-./lambdactl up gpu_8x_b200_sxm6                 # prints "<id> <ip>"; terminate with ./lambdactl down <id>
+# your machine — one command up, one command down
+export LAMBDA_API_KEY=... LAMBDA_FS=...
+./gpuctl up kimi-k3 --serve --hold 6h          # launches the model's instance type, leases it to
+                                               # you for 6 h, ships the repo, starts vLLM
+./gpuctl ssh
 
 # on the instance
-pip install "vllm==$VLLM_VERSION" hf_transfer && pip install -r harness/requirements.lock
-export WEIGHTS_DIR=/home/ubuntu/$LAMBDA_FS/models
-./modelctl serve kimi-k3                        # downloads if needed, serves, waits for health
 ./harness/run.sh --model kimi-k3 --suite swebench-verified --passes 3 --out ~/results
 ./resultsctl package ~/results/runs/<run_id>    # run_id is field 2 of the RUN line run.sh prints
 ./resultsctl upload dist/<run_id>.tar.gz && ./resultsctl index dist/<run_id>.tar.gz
-./modelctl stop
+
+# your machine
+./gpuctl down
 ```
+
+**The instance turns itself off if you forget.** It lives only while leased or while a harness
+process is running; `./gpuwatch` (CI, every 15 min) terminates it otherwise. Running long?
+`./gpuctl hold 4h`. Want to see the meter? `./gpuctl status`. The low-level tools
+(`lambdactl`, `modelctl`) are still there underneath.
 
 `run.sh` prints exactly one machine-readable line per run on stdout —
 `RUN <run_id> <suite> <run_dir> <status>` — and everything human on stderr.
@@ -248,7 +253,7 @@ pocket**, billed per token and classified `per_token` by the aggregator automati
 
 | leak | guard |
 |---|---|
-| an instance left running | teardown is `if: always()`, discovers the instance by name tag, and **fails the step** if termination is unconfirmed; the reaper kills `ci-*` >14 h and anything >24 h — **re-enable its schedule before the first paid dispatch** |
+| an instance left running | three layers: CI teardown is `if: always()` and **fails the step** if termination is unconfirmed; every instance is **leased** to its job (CI: 12 h, manual: 2 h default) and `./gpuwatch` terminates anything unleased with no harness process every 15 min; hard caps of 24 h age and $500 accrued spend on top. The reaper is safe to leave on before the secrets exist — it skips cleanly |
 | discovering at the first `grade()` that the host cannot grade | grading preflight refuses before the first model call, naming the missing dependency |
 | hashing hundreds of GB of weights on every dispatch | the digest cache lives with the weights on the persistent FS; hashing is parallel |
 | rebuilding SWE-bench docker environments per grade | `--cache_level env` |
