@@ -43,7 +43,28 @@ vLLM args). Add a model = add a file. Current lineup:
 - [ ] resolve MiniMax M3 spec conflict (~230B vs 428B) → set TP=4 or 8
 - [ ] dry-run the Ray two-node launch for qwen3.8-max
 
-## GPU lifecycle — lambdactl + CI
+## GPU on / off — gpuctl
+
+```bash
+export LAMBDA_API_KEY=...
+./gpuctl up kimi-k3 --serve      # launch the right instance for the model, lease it to you, start vLLM
+./gpuctl status                  # what is alive, $/h, accrued, busy or idle
+./gpuctl hold 4h                 # "still working on it"
+./gpuctl ssh
+./gpuctl down                    # off
+```
+
+**It turns itself off.** An instance stays alive only while it is *leased* (a job claimed it
+with an expiry) or a harness process is running on it. `./gpuwatch` — run by CI every
+15 minutes (`.github/workflows/reaper.yml`) — terminates anything else carrying this
+project's `sh-` name prefix, plus hard caps (older than 24 h, or more than $500 accrued
+across everything alive). `gpuctl up` leases for 2 h by default; a CI run leases for its
+own 12 h ceiling. Forget a box and it costs you at most the lease, not the night.
+
+The watchdog only ever touches `sh-*` names. Nothing in this repo can terminate an instance
+that belongs to something else on the account.
+
+## GPU lifecycle — lambdactl + CI (the low-level layer gpuctl sits on)
 
 `lambdactl` drives the Lambda Cloud API (needs `LAMBDA_API_KEY`):
 
