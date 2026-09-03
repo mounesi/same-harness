@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# gpuctl — the one command for turning a GPU on and off for this project.
+#
+#   ./gpuctl up <model> [--hold 2h] [--serve]   launch the instance the model needs, lease it to
+#                                               you, (optionally) ship the repo and start vLLM
+#   ./gpuctl down [name | --all] [--yes]        terminate your instance(s); --all = every sh-*
+#   ./gpuctl status                             what is alive, what it costs, busy or idle
+#   ./gpuctl hold <ttl> [name]                  "I'm working on it" — extend the lease
+#   ./gpuctl release [name]                     drop the lease so the watchdog may reap it
+#   ./gpuctl ssh [name]                         open a shell on it
+#   ./gpuctl reap                               run the watchdog now (what CI does every 15 min)
+#
+# Safety model: an instance stays alive only while it is LEASED (a job claimed it, with an
+# expiry) or a harness process is running on it. `./gpuwatch` — run by CI every 15 minutes
+# — terminates anything else carrying this project's name prefix. `up` leases for --hold
+# (default 2h); when your session runs long, `hold` again. Forget, and it turns itself off.
+#
+# Names: manual instances are "sh-<user>-<model>", CI's are "sh-ci-<model>-<run>-<attempt>".
+# Only "sh-*" is ever touched by anything in this repo.
+#
+# Env: LAMBDA_API_KEY (required), LAMBDA_SSH_KEY, LAMBDA_FS, GPU_PROJECT_PREFIX (sh-)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PREFIX="${GPU_PROJECT_PREFIX:-sh-}"
+ME="${GPU_USER:-${USER:-me}}"
+SSH_USER="${SSH_USER:-ubuntu}"
+die() { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*" >&2; }
+need_key() { [[ -n "${LAMBDA_API_KEY:-}" ]] || die "LAMBDA_API_KEY not set (https://cloud.lambdalabs.com/api-keys)"; }
+
+mine() { # list my instances: id name ip
+  "$HERE/lambdactl" ls | awk -v p="${PREFIX}${ME}-" '$2 ~ "^"p {print $1, $2, $5}'
+}
+pick() { # [name] -> "id name ip" (my only instance when no name given)
+  local want="${1:-}"
+  local list; list="$(mine)"
+  if [[ -n "$want" ]]; then
+    "$HERE/lambdactl" ls | awk -v n="$want" '$2==n {print $1, $2, $5}' | head -1
+  else
+    local n; n="$(grep -c . <<<"$list" || true)"
+    [[ "$n" -eq 1 ]] || die "you have $n instances — name one: $(awk '{print $2}' <<<"$list" | tr '\n' ' ')"
+    echo "$list"
+  fi
+}
+sshto() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$1" "${@:2}"; }
+
+cmd_up() {
+  need_key
+  local model="" hold="2h" serve=0
+  while [[ $# -gt 0 ]]; do case "$1" in
+    --hold) hold="$2"; shift 2 ;; --serve) serve=1; shift ;; -*) die "unknown flag $1" ;;
+    *) model="$1"; shift ;; esac; done
+  [[ -n "$model" ]] || die "usage: gpuctl up <model> [--hold 2h] [--serve]"
+  local env="$HERE/models.d/$model.env"; [[ -f "$env" ]] || die "no models.d/$model.env"
+  local INSTANCE_TYPE=""; # shellcheck source=/dev/null
+  source "$env"
+  [[ -n "$INSTANCE_TYPE" ]] || die "$env has no INSTANCE_TYPE"
+  [[ "${MULTINODE:-0}" == "1" ]] && die "$model is multi-node; gpuctl handles single-node instances only"
+
+  local name="${PREFIX}${ME}-${model}"
+  if [[ -n "$(mine | awk -v n="$name" '$2==n')" ]]; then die "'$name' already exists — gpuctl status / gpuctl down $name"; fi
+
+  info "instance type for $model: $INSTANCE_TYPE"
+  local id ip
+  read -r id ip < <(INSTANCE_NAME="$name" "$HERE/lambdactl" up "$INSTANCE_TYPE" | tail -n1)
+  info "up: $name ($id) at $ip"
+
+  # The lease goes on BEFORE anything else: from this moment the watchdog knows it is yours.
+  scp -q -o StrictHostKeyChecking=accept-new "$HERE/gpu-lease" "$SSH_USER@$ip:~/gpu-lease"
+  sshto "$ip" "chmod +x ~/gpu-lease && ~/gpu-lease claim '$hold' 'manual:$model' '$ME'"
+
+  if (( serve )); then
+    info "shipping the repo and starting vLLM (this is the slow part — weights download on first use)"
+    tar -czf /tmp/gpuctl-repo.tgz -C "$HERE" --exclude=.git --exclude=.github --exclude=.state .
+    scp -q /tmp/gpuctl-repo.tgz "$SSH_USER@$ip:~/"
+    sshto "$ip" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo 2>/dev/null || tar -xzf ~/gpuctl-repo.tgz -C ~/harness-repo"
+    sshto "$ip" "cd ~/harness-repo && WEIGHTS_DIR=/home/$SSH_USER/${LAMBDA_FS:-persistent}/models ./modelctl serve '$model'"
+  fi
+  cat >&2 <<EOF
+
+  $name is leased to you for $hold. It will be TERMINATED by the watchdog once the lease
+  expires and no harness process is running — extend with:  ./gpuctl hold 4h
+  shell:  ./gpuctl ssh          off:  ./gpuctl down          cost: ./gpuctl status
+EOF
+  echo "$id $ip"
+}
+
+cmd_down() {
+  need_key
+  local yes=0 all=0 name=""
+  for a in "$@"; do case "$a" in --yes|-y) yes=1 ;; --all) all=1 ;; *) name="$a" ;; esac; done
+  local targets
+  if (( all )); then
+    targets="$("$HERE/lambdactl" ls | awk -v p="$PREFIX" '$2 ~ "^"p {print $1, $2}')"
+  elif [[ -n "$name" ]]; then
+    targets="$("$HERE/lambdactl" ls | awk -v n="$name" '$2==n {print $1, $2}')"
+  else
+    targets="$(mine | awk '{print $1, $2}')"
+  fi
+  [[ -n "$targets" ]] || { info "nothing to terminate"; return 0; }
+  echo "will terminate:" >&2; sed 's/^/   /' <<<"$targets" >&2
+  if (( ! yes )); then read -r -p "proceed? [y/N] " ans; [[ "$ans" =~ ^[Yy]$ ]] || die "aborted"; fi
+  while read -r id _; do [[ -n "$id" ]] && "$HERE/lambdactl" down "$id"; done <<<"$targets"
+}
+
+cmd_status() { need_key; "$HERE/gpuwatch" --dry-run; }
+cmd_reap()   { need_key; "$HERE/gpuwatch"; }
+
+cmd_hold() {
+  need_key
+  [[ $# -ge 1 ]] || die "usage: gpuctl hold <ttl> [name]"
+  local ttl="$1"; read -r _ name ip < <(pick "${2:-}")
+  sshto "$ip" "~/harness-repo/gpu-lease renew '$ttl' 2>/dev/null || ~/gpu-lease renew '$ttl' 2>/dev/null || (~/gpu-lease claim '$ttl' 'manual' '$ME')"
+  info "$name held for $ttl"
+}
+cmd_release() {
+  need_key; read -r _ name ip < <(pick "${1:-}")
+  sshto "$ip" "~/harness-repo/gpu-lease release 2>/dev/null || ~/gpu-lease release"
+  info "$name released — the watchdog may terminate it within 15 minutes"
+}
+cmd_ssh() { need_key; read -r _ name ip < <(pick "${1:-}"); info "$name"; exec ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$ip"; }
+
+case "${1:-}" in
+  up)      shift; cmd_up "$@" ;;
+  down)    shift; cmd_down "$@" ;;
+  status)  cmd_status ;;
+  hold)    shift; cmd_hold "$@" ;;
+  release) shift; cmd_release "$@" ;;
+  ssh)     shift; cmd_ssh "$@" ;;
+  reap)    cmd_reap ;;
+  *) sed -n '2,11p' "$0" >&2; exit 1 ;;
+esac

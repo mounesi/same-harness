@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# gpuwatch — the watchdog. Terminates any instance of THIS project that is not doing a job.
+#
+#   ./gpuwatch [--dry-run] [--json]
+#
+# For every Lambda instance whose name starts with $GPU_PROJECT_PREFIX (default "sh-"):
+#   1. ask the machine itself (ssh → ./gpu-lease status): unexpired lease? harness process?
+#   2. decide:
+#        busy                      keep
+#        idle                      TERMINATE  (no lease, no job process — the classic leak)
+#        idle but GPU visibly busy keep + WARN (unleased manual work — run `gpuctl hold`)
+#        unreachable               keep while younger than $UNREACHABLE_GRACE_MIN, then TERMINATE
+#        younger than $IDLE_GRACE_MIN                     keep (still booting / provisioning)
+#        older than $MAX_AGE_H                            TERMINATE regardless
+#   3. spend cap: if the accrued cost of everything alive exceeds $MAX_ACCRUED_USD,
+#      TERMINATE EVERYTHING and exit 1 loudly.
+#
+# Anything NOT carrying the project prefix is never touched — this repo must not be able to
+# kill instances that belong to something else on the same account.
+#
+# Env:   LAMBDA_API_KEY (required)   GPU_PROJECT_PREFIX=sh-   IDLE_GRACE_MIN=20
+#        UNREACHABLE_GRACE_MIN=30    MAX_AGE_H=24              MAX_ACCRUED_USD=500
+#        GPU_IDLE_UTIL_MAX=5 (percent)   SSH_USER=ubuntu       GITHUB_STEP_SUMMARY (optional)
+# Exit:  0 nothing wrong (terminations by the idle/age rules are reported as warnings)
+#        1 spend cap tripped or the API failed — a human must look
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+API="https://cloud.lambdalabs.com/api/v1"
+PREFIX="${GPU_PROJECT_PREFIX:-sh-}"
+IDLE_GRACE_MIN="${IDLE_GRACE_MIN:-20}"
+UNREACHABLE_GRACE_MIN="${UNREACHABLE_GRACE_MIN:-30}"
+MAX_AGE_H="${MAX_AGE_H:-24}"
+MAX_ACCRUED_USD="${MAX_ACCRUED_USD:-500}"
+GPU_IDLE_UTIL_MAX="${GPU_IDLE_UTIL_MAX:-5}"
+SSH_USER="${SSH_USER:-ubuntu}"
+DRY=0; JSON=0
+for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; --json) JSON=1 ;; *) echo "usage: gpuwatch [--dry-run] [--json]" >&2; exit 2 ;; esac; done
+
+[[ -n "${LAMBDA_API_KEY:-}" ]] || { echo "error: LAMBDA_API_KEY not set" >&2; exit 1; }
+req() { curl -sf -X "$1" "$API$2" -H "Authorization: Bearer $LAMBDA_API_KEY" -H 'Content-Type: application/json' ${3:+-d "$3"}; }
+
+# ---- inventory: id name type status ip age_min price_per_hour -------------------------------
+INVENTORY="$(req GET /instances | python3 -c '
+import json, sys, datetime
+data = json.load(sys.stdin)["data"]
+now = datetime.datetime.now(datetime.timezone.utc)
+prefix = sys.argv[1]
+for i in data:
+    name = i.get("name") or ""
+    if not name.startswith(prefix):
+        continue
+    ts = i.get("launched_at")
+    age = ""
+    if ts:
+        try:
+            age = int((now - datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() // 60)
+        except ValueError:
+            age = ""
+    it = i.get("instance_type") or {}
+    price = it.get("price_cents_per_hour")
+    price = "%.2f" % (price / 100) if isinstance(price, (int, float)) else ""
+    print(i["id"], name, it.get("name", "?"), i.get("status", "?"), i.get("ip") or "-", age if age != "" else "?", price or "?")
+' "$PREFIX")" || { echo "error: could not list instances" >&2; exit 1; }
+
+# price fallback from the instance-types endpoint when /instances omits it
+price_of() { req GET /instance-types | python3 -c 'import json,sys; t=json.load(sys.stdin)["data"].get(sys.argv[1]); print("%.2f" % (t["instance_type"]["price_cents_per_hour"]/100) if t else "?")' "$1" 2>/dev/null || echo "?"; }
+
+probe() { # ip -> gpu-lease status lines, or "UNREACHABLE"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+      "$SSH_USER@$1" 'test -x ~/harness-repo/gpu-lease && ~/harness-repo/gpu-lease status || (test -x ~/gpu-lease && ~/gpu-lease status) || echo NO_LEASE_TOOL' 2>/dev/null \
+    || echo UNREACHABLE
+}
+
+terminate() { # id
+  if (( DRY )); then echo "   (dry-run) would terminate $1" >&2; return 0; fi
+  req POST /instance-operations/terminate "{\"instance_ids\": [\"$1\"]}" >/dev/null
+}
+
+rows=(); kill_ids=(); total_accrued=0; exit_code=0
+while read -r id name itype status ip age price; do
+  [[ -n "$id" ]] || continue
+  [[ "$price" == "?" ]] && price="$(price_of "$itype")"
+  accrued="?"
+  if [[ "$age" != "?" && "$price" != "?" ]]; then
+    accrued="$(awk -v a="$age" -v p="$price" 'BEGIN{printf "%.2f", a/60*p}')"
+    total_accrued="$(awk -v t="$total_accrued" -v x="$accrued" 'BEGIN{printf "%.2f", t+x}')"
+  fi
+
+  lease="?"; procs="?"; util="?"; verdict="?"; action="keep"; why=""
+  if [[ "$status" != "active" ]]; then
+    action="keep"; why="status=$status"
+  else
+    report="$(probe "$ip")"
+    if [[ "$report" == UNREACHABLE* ]]; then
+      verdict="unreachable"
+      if [[ "$age" != "?" && "$age" -ge "$UNREACHABLE_GRACE_MIN" ]]; then action="TERMINATE"; why="unreachable for >${UNREACHABLE_GRACE_MIN}m"; else why="unreachable, within grace"; fi
+    elif [[ "$report" == NO_LEASE_TOOL* ]]; then
+      verdict="no-tool"; why="gpu-lease not installed — provisioned outside this repo?"
+      if [[ "$age" != "?" && "$age" -ge "$((IDLE_GRACE_MIN * 3))" ]]; then action="TERMINATE"; fi
+    else
+      lease="$(sed -n 's/^LEASE=//p' <<<"$report")"
+      procs="$(sed -n 's/^HARNESS_PROCS=//p' <<<"$report")"
+      util="$(sed -n 's/^GPU_UTIL=//p' <<<"$report")"
+      verdict="$(sed -n 's/^VERDICT=//p' <<<"$report")"
+      job="$(sed -n 's/^LEASE_JOB=//p' <<<"$report")"
+      if [[ "$verdict" == "busy" ]]; then
+        why="lease=$lease${job:+ ($job)} procs=$procs"
+      elif [[ "$age" != "?" && "$age" -lt "$IDLE_GRACE_MIN" ]]; then
+        why="idle but younger than ${IDLE_GRACE_MIN}m (booting?)"
+      elif [[ -n "$util" && "$util" != "?" && "$util" -gt "$GPU_IDLE_UTIL_MAX" ]]; then
+        why="NO LEASE but GPU at ${util}% — unleased work? run: gpuctl hold 2h"
+        echo "::warning::$name: $why" >&2
+      else
+        action="TERMINATE"; why="idle: no lease, no harness process (gpu ${util:-?}%)"
+      fi
+    fi
+  fi
+  if [[ "$age" != "?" ]] && (( age >= MAX_AGE_H * 60 )); then action="TERMINATE"; why="older than ${MAX_AGE_H}h ($why)"; fi
+
+  [[ "$action" == "TERMINATE" ]] && kill_ids+=("$id|$name|$why")
+  rows+=("| $name | $itype | ${age}m | \$$price | \$$accrued | $lease | $procs | ${util}% | $verdict | **$action** — $why |")
+done <<<"$INVENTORY"
+
+# ---- spend cap ---------------------------------------------------------------------------
+cap_tripped=0
+if awk -v t="$total_accrued" -v c="$MAX_ACCRUED_USD" 'BEGIN{exit !(t>c)}'; then
+  cap_tripped=1; exit_code=1
+  echo "::error::SPEND CAP: \$$total_accrued accrued across live '$PREFIX*' instances > \$$MAX_ACCRUED_USD — terminating everything" >&2
+  kill_ids=()
+  while read -r id name _ status _ _ _; do [[ -n "$id" && "$status" == "active" ]] && kill_ids+=("$id|$name|spend cap"); done <<<"$INVENTORY"
+fi
+
+# ---- act -----------------------------------------------------------------------------------
+for k in "${kill_ids[@]:-}"; do
+  [[ -n "$k" ]] || continue
+  IFS='|' read -r id name why <<<"$k"
+  echo "::warning::terminating $name ($id): $why" >&2
+  terminate "$id" || { echo "::error::terminate failed for $name ($id)" >&2; exit_code=1; }
+done
+
+# ---- report --------------------------------------------------------------------------------
+{
+  echo "### gpuwatch — $(date -u +%FT%TZ)$( (( DRY )) && echo ' (dry-run)')"
+  echo
+  if [[ ${#rows[@]} -eq 0 ]]; then
+    echo "No '$PREFIX*' instances alive. Accrued: \$0."
+  else
+    echo "| name | type | age | \$/h | accrued | lease | procs | gpu | verdict | action |"
+    echo "|---|---|---|---|---|---|---|---|---|---|"
+    printf '%s\n' "${rows[@]}"
+    echo
+    echo "Accrued across live instances: **\$$total_accrued** (cap \$$MAX_ACCRUED_USD)$( (( cap_tripped )) && echo ' — **CAP TRIPPED**')"
+    echo "Terminated this pass: ${#kill_ids[@]}"
+  fi
+} | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}" >&2
+(( JSON )) && printf '{"live": %d, "terminated": %d, "accrued_usd": %s, "cap_tripped": %d}\n' "${#rows[@]}" "${#kill_ids[@]}" "$total_accrued" "$cap_tripped"
+exit "$exit_code"

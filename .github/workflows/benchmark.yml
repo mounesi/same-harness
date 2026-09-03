@@ -1,5 +1,5 @@
 # Benchmark run: bring a Lambda GPU server up, serve the model, run the harness, tear down.
-# Teardown discovers the instance BY NAME TAG (ci-<model>-<run_id>-<run_attempt>), not only by
+# Teardown discovers the instance BY NAME TAG (sh-ci-<model>-<run_id>-<run_attempt>), not only by
 # step output, so a launch that dies mid-wait still gets cleaned up. The attempt number is part
 # of the tag: a GitHub re-run must never resolve to the previous attempt's terminating instance.
 #
@@ -37,7 +37,7 @@ jobs:
       LAMBDA_SSH_KEY: ${{ vars.LAMBDA_SSH_KEY }}
       LAMBDA_FS: ${{ vars.LAMBDA_FS }}
       VLLM_VERSION: ${{ vars.VLLM_VERSION }}
-      INSTANCE_NAME: ci-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      INSTANCE_NAME: sh-ci-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
       WEIGHTS_DIR: /home/ubuntu/${{ vars.LAMBDA_FS }}/models
     steps:
       - uses: actions/checkout@v4
@@ -95,6 +95,10 @@ jobs:
           tar -czf /tmp/repo.tgz --exclude=.github .
           scp -o StrictHostKeyChecking=accept-new /tmp/repo.tgz "ubuntu@$IP:~/"
           ssh "ubuntu@$IP" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo"
+          # Lease the box to this job for the job's own ceiling: from here on the 15-minute
+          # watchdog (reaper.yml -> ./gpuwatch) knows it is busy. If this workflow dies before
+          # its teardown, the lease expires with the job and the watchdog finishes the cleanup.
+          ssh "ubuntu@$IP" "cd ~/harness-repo && ./gpu-lease claim 12h 'ci:${{ inputs.model }}/${{ inputs.suite }}' github-actions"
 
       - name: Provision + serve model
         id: serve

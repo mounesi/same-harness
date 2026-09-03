@@ -1,22 +1,53 @@
-# Safety net (two tiers, per codex review):
-#  - every 2h: kill ci-* instances older than 14h (12h job ceiling + 2h grace)
-#  - every 2h: kill ANY instance older than 24h
+# The safety net. Every 15 minutes: terminate any instance of THIS project (name prefix
+# "sh-") that is not doing a job — no unexpired lease and no harness process on the box —
+# plus hard caps: older than 24 h, or total accrued spend over $500. See ./gpuwatch.
+#
+# It is safe to have this ON before the secrets exist: with no LAMBDA_API_KEY there is
+# nothing to watch, and the job skips cleanly instead of failing.
 name: instance-reaper
 on:
-  # Schedule DISABLED until the LAMBDA_API_KEY repo secret exists: every scheduled run was
-  # failing at `./lambdactl ls` on the key guard (lambdactl:22) and producing nothing but
-  # red runs. Re-enable by uncommenting once AI-2955 item 3 (secrets) is done — the reaper
-  # is the credit's seatbelt and MUST be back on before the first paid dispatch.
-  # schedule:
-  #   - cron: "0 */2 * * *"
-  workflow_dispatch: {}
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "report only, terminate nothing"
+        type: boolean
+        default: false
+
 jobs:
   reap:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
+      MAX_ACCRUED_USD: ${{ vars.MAX_ACCRUED_USD || '500' }}
+      MAX_AGE_H: ${{ vars.MAX_AGE_H || '24' }}
     steps:
       - uses: actions/checkout@v4
-      - run: ./lambdactl ls
-      - run: ./lambdactl reap 14 ci-    # CI-tagged, tighter TTL
-      - run: ./lambdactl reap 24        # everything, standing net
+
+      - name: Configured?
+        id: cfg
+        run: |
+          if [[ -z "$LAMBDA_API_KEY" ]]; then
+            echo "::notice::LAMBDA_API_KEY is not configured — no instances can exist yet, nothing to watch"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SSH key (lets the watchdog ask each instance whether it is busy)
+        if: steps.cfg.outputs.configured == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          if [[ -n "${{ secrets.LAMBDA_SSH_PRIVATE_KEY }}" ]]; then
+            echo "${{ secrets.LAMBDA_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          else
+            echo "::warning::LAMBDA_SSH_PRIVATE_KEY not set — instances will read as unreachable and be reaped by the age rule only"
+          fi
+
+      - name: Watch
+        if: steps.cfg.outputs.configured == 'true'
+        shell: bash
+        run: |
+          if [[ "${{ inputs.dry_run }}" == "true" ]]; then ./gpuwatch --dry-run; else ./gpuwatch; fi

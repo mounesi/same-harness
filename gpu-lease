@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# gpu-lease — runs ON the GPU instance. Answers one question for the watchdog:
+# "is a job dedicated to this project running here, or is this machine just burning money?"
+#
+#   ./gpu-lease claim <ttl> <job> [owner]   this instance is busy with <job> for <ttl> (e.g. 2h, 90m)
+#   ./gpu-lease renew <ttl>                 push the expiry out (a running job heartbeats with this)
+#   ./gpu-lease release                     drop the lease — the watchdog may terminate at once
+#   ./gpu-lease status                      KEY=VALUE report + VERDICT=busy|idle (read by gpuwatch)
+#
+# The verdict is deliberately simple and conservative in ONE direction only:
+#   busy  = an unexpired lease exists   OR  a harness/modelctl process is running
+#   idle  = neither
+# A vLLM server that is up but nobody is asking anything of it is idle — that is exactly the
+# leak this exists to stop. GPU utilisation is REPORTED (gpuwatch treats visible load without
+# a lease as "busy but nagging") so a manual job you forgot to `hold` is not killed silently.
+#
+# Lease file: ~/.harness/lease.json — {job, owner, created_at, expires_at} (epoch seconds).
+set -euo pipefail
+
+LEASE_DIR="${GPU_LEASE_DIR:-$HOME/.harness}"
+LEASE="$LEASE_DIR/lease.json"
+PORT="${PORT:-8000}"
+# Processes that count as "a job dedicated to this project". modelctl serve on its own does
+# NOT count (see header) — only the harness driving it, or a download in flight.
+JOB_PATTERN='harness\.agent|harness/run\.sh|modelctl (download|switch)|hf download|train_lora|build_dataset'
+
+now() { date +%s; }
+die() { echo "error: $*" >&2; exit 2; }
+
+ttl_seconds() { # 2h | 90m | 3600s | 3600
+  local t="$1"
+  case "$t" in
+    *h) echo $(( ${t%h} * 3600 )) ;;
+    *m) echo $(( ${t%m} * 60 )) ;;
+    *s) echo "${t%s}" ;;
+    ''|*[!0-9]*) die "bad ttl '$t' (use 2h, 90m, 3600s)" ;;
+    *) echo "$t" ;;
+  esac
+}
+
+write_lease() { # job owner expires_at [created_at]
+  mkdir -p "$LEASE_DIR"
+  local created="${4:-$(now)}"
+  printf '{"job": "%s", "owner": "%s", "created_at": %d, "expires_at": %d}\n' \
+    "$1" "$2" "$created" "$3" >"$LEASE.tmp" && mv -f "$LEASE.tmp" "$LEASE"
+}
+
+read_field() { # field -> value or empty
+  [[ -f "$LEASE" ]] || return 0
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$LEASE" "$1" 2>/dev/null || true
+}
+
+cmd_claim() {
+  [[ $# -ge 2 ]] || die "usage: gpu-lease claim <ttl> <job> [owner]"
+  local ttl job="$2" owner="${3:-${USER:-unknown}}"
+  ttl="$(ttl_seconds "$1")"
+  write_lease "$job" "$owner" $(( $(now) + ttl ))
+  echo "leased to '$job' ($owner) for $1 — expires $(date -u -r $(( $(now) + ttl )) +%FT%TZ 2>/dev/null || date -u -d @$(( $(now) + ttl )) +%FT%TZ)"
+}
+
+cmd_renew() {
+  [[ $# -ge 1 ]] || die "usage: gpu-lease renew <ttl>"
+  [[ -f "$LEASE" ]] || die "no lease to renew — use: gpu-lease claim <ttl> <job>"
+  local ttl; ttl="$(ttl_seconds "$1")"
+  write_lease "$(read_field job)" "$(read_field owner)" $(( $(now) + ttl )) "$(read_field created_at)"
+  echo "renewed for $1"
+}
+
+cmd_release() { rm -f "$LEASE"; echo "released"; }
+
+gpu_util() { # mean utilisation across GPUs, or empty when there is no nvidia-smi
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null \
+    | awk '{s+=$1; n++} END { if (n) printf "%d", s/n }'
+}
+
+cmd_status() {
+  local state="none" job="" owner="" expires_in=""
+  if [[ -f "$LEASE" ]]; then
+    job="$(read_field job)"; owner="$(read_field owner)"
+    local exp; exp="$(read_field expires_at)"
+    if [[ -n "$exp" ]]; then
+      expires_in=$(( exp - $(now) ))
+      if (( expires_in > 0 )); then state="valid"; else state="expired"; fi
+    fi
+  fi
+  # pgrep never matches its own process (a `ps | grep` scan does, and would report "busy"
+  # forever — the watchdog would then never reap anything). Count matching pids explicitly.
+  local procs; procs="$(pgrep -f "$JOB_PATTERN" 2>/dev/null | grep -c . || true)"; procs="${procs:-0}"
+  local vllm=0; curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 && vllm=1
+  local util; util="$(gpu_util)"
+  local verdict="idle"
+  if [[ "$state" == "valid" || "$procs" -gt 0 ]]; then verdict="busy"; fi
+
+  printf 'LEASE=%s\nLEASE_JOB=%s\nLEASE_OWNER=%s\nLEASE_EXPIRES_IN_S=%s\n' "$state" "$job" "$owner" "${expires_in:-}"
+  printf 'HARNESS_PROCS=%s\nVLLM_UP=%s\nGPU_UTIL=%s\nHOST=%s\nVERDICT=%s\n' "$procs" "$vllm" "$util" "$(hostname)" "$verdict"
+}
+
+case "${1:-}" in
+  claim)   shift; cmd_claim "$@" ;;
+  renew)   shift; cmd_renew "$@" ;;
+  release) cmd_release ;;
+  status)  cmd_status ;;
+  *) sed -n '2,9p' "$0" >&2; exit 1 ;;
+esac
