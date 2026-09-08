@@ -838,6 +838,33 @@ COMPARABILITY_KEYS = (
     # reasoning parsers, ...) can change what the model emits, so it may not vary silently.
     # None and "" are the same value: "no extra args" (see _COMPARABILITY_NORMALISERS).
     ("runtime.extra_args", ("runtime", "extra_args"), True),
+    # --- the serving stack -------------------------------------------------------------
+    # Every field below was already RECORDED by manifest.py and compared by nothing, so a
+    # run served by one engine could be aggregated with a run served by another without a
+    # word. That is the study's central claim failing silently: the harness being constant
+    # is worth nothing if what executes the weights is not.
+    #
+    # Not hypothetical. Two AI-P167 shakedown attempts ran on driver 570.148.08 because the
+    # instance image was unpinned, while the image Lambda publishes carries 580.126.20 —
+    # same account, same week, same command. Nothing here would have flagged the mixture.
+    #
+    # vLLM version decides kernels, sampling implementation and quantisation handling.
+    ("runtime.vllm_version", ("runtime", "vllm_version"), True),
+    # The GPU driver gates which kernels exist at all, so it can change what a model emits.
+    ("runtime.nvidia_driver", ("runtime", "nvidia_driver"), True),
+    # FP8 vs BF16 vs MXFP4 weights are numerically different models. Mixing them and
+    # reporting one number is the single most misleading thing this report could do — and
+    # it is a live question for qwen3-coder-next, which does not fit one H100 unquantised.
+    ("model.quantization", ("model", "quantization"), True),
+    # Soft: real drift worth surfacing, but each is largely DERIVED from a blocking field
+    # above (torch and transformers are pinned by vLLM; cuda_runtime is the driver's
+    # ceiling), so blocking on them would report one cause as four violations.
+    ("runtime.torch_version", ("runtime", "torch_version"), False),
+    ("runtime.cuda_runtime", ("runtime", "cuda_runtime"), False),
+    ("runtime.transformers_version", ("runtime", "transformers_version"), False),
+    # Grading dependencies rather than serving ones — and note this hashes the lock FILE,
+    # not the installed set, so it can agree across runs whose environments differ.
+    ("runtime.requirements_lock_sha256", ("runtime", "requirements_lock_sha256"), False),
     ("harness.result_schema", ("harness", "result_schema"), False),
     # §1.2: concurrency affects throughput and latency percentiles, NOT verdicts.
     ("inference.concurrency", ("inference", "concurrency"), False),
