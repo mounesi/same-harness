@@ -38,7 +38,11 @@ jobs:
       LAMBDA_FS: ${{ vars.LAMBDA_FS }}
       VLLM_VERSION: ${{ vars.VLLM_VERSION }}
       INSTANCE_NAME: sh-ci-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
-      WEIGHTS_DIR: /home/ubuntu/${{ vars.LAMBDA_FS }}/models
+      # WEIGHTS_DIR is NOT hardcoded here. Lambda mounts persistent filesystems at
+      # /lambda/nfs/<name>, not under $HOME, and only the API knows the mount point — the
+      # old `/home/ubuntu/<fs>/models` resolved to ephemeral disk, which fails silently:
+      # the run works and simply re-downloads the weights, on the meter, every time.
+      # The serve step resolves it with `lambdactl fs` and asserts it is really a mount.
     steps:
       - uses: actions/checkout@v4
 
@@ -104,6 +108,20 @@ jobs:
         id: serve
         run: |
           IP=${{ steps.up.outputs.ip }}
+
+          # Resolve the real mount point, then PROVE it is a mount before downloading onto
+          # it. Both halves matter: the path is not derivable from the name, and a wrong
+          # path is otherwise invisible until someone notices the download happening twice.
+          MOUNT=$(./lambdactl fs "$LAMBDA_FS" | awk '{print $3}')
+          [ -n "$MOUNT" ] && [ "$MOUNT" != "-" ] || { echo "::error::filesystem '$LAMBDA_FS' has no mount point"; exit 1; }
+          WEIGHTS_DIR="$MOUNT/models"
+          echo "weights dir: $WEIGHTS_DIR"
+          # Shell variables do not survive between steps; the harness step needs this too.
+          echo "WEIGHTS_DIR=$WEIGHTS_DIR" >> "$GITHUB_ENV"
+          ssh "ubuntu@$IP" "mountpoint -q '$MOUNT'" \
+            || { echo "::error::'$MOUNT' is not a mount on the instance — the filesystem did not attach (region mismatch?). Refusing to download weights onto ephemeral disk."; exit 1; }
+          ssh "ubuntu@$IP" "mkdir -p '$WEIGHTS_DIR'"
+
           ssh "ubuntu@$IP" "pip install -q 'vllm==${VLLM_VERSION}' hf_transfer"
           # grading dependencies are pinned in harness/requirements.lock (codex invariant 5)
           ssh "ubuntu@$IP" "cd ~/harness-repo && pip install -q -r harness/requirements.lock"

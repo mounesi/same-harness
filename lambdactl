@@ -5,6 +5,7 @@
 #   ./lambdactl types                       instance types + availability
 #   ./lambdactl up <instance-type> [region] launch, wait until active, print IP
 #   ./lambdactl ls                          running instances
+#   ./lambdactl fs [name]                   persistent filesystems: "<name> <region> <mount-point>"
 #   ./lambdactl ip <id|name>                public IP of an instance
 #   ./lambdactl down <id|name>              terminate one instance (a name matching >1 is an error)
 #   ./lambdactl down --all-named <name>     terminate EVERY instance carrying that name (CI teardown)
@@ -135,6 +136,25 @@ for i in json.load(sys.stdin)['data']:
 "
 }
 
+cmd_fs() { # [name] -> one line per filesystem: <name> <region> <mount-point>
+  # The mount point is NOT derivable from the name. Lambda mounts persistent filesystems
+  # at /lambda/nfs/<name>, not under $HOME, and the API is the only authority on it — so
+  # WEIGHTS_DIR is built from this rather than from a guess. Getting it wrong is silent:
+  # the weights land on the instance's ephemeral disk, the run works, and 60-160 GB is
+  # re-downloaded on the meter every time and thrown away at teardown.
+  req GET /file-systems | python3 -c "
+import json,sys
+want = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+rows = [f for f in json.load(sys.stdin)['data'] if want is None or f.get('name') == want]
+if want is not None and not rows:
+    sys.stderr.write('error: no filesystem named %r on this account\n' % want)
+    sys.exit(1)
+for f in rows:
+    print('%s %s %s' % (f.get('name'), (f.get('region') or {}).get('name') or '-',
+                        f.get('mount_point') or '-'))
+" "${1:-}"
+}
+
 cmd_ip() {
   local id; id="$(resolve_id "$1")" || exit 1
   [[ -n "$id" ]] || { echo "error: no instance '$1'" >&2; exit 1; }
@@ -200,6 +220,7 @@ case "${1:-}" in
   types) cmd_types ;;
   up)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl up <instance-type> [region]" >&2; exit 1; }; cmd_up "$2" "${3:-}" ;;
   ls)    cmd_ls ;;
+  fs)    cmd_fs "${2:-}" ;;
   ip)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl ip <id|name>" >&2; exit 1; }; cmd_ip "$2" ;;
   down)  [[ $# -ge 2 ]] || { echo "usage: ./lambdactl down <id|name> | --all-named <name> | --all" >&2; exit 1; }; cmd_down "$2" "${3:-}" ;;
   reap)  cmd_reap "${2:-}" "${3:-}" ;;
