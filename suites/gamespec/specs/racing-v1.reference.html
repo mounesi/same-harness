@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<!--
+  racing-v1 REFERENCE IMPLEMENTATION — not a submission, not a target to imitate.
+
+  It exists for one reason: to prove the spec is implementable and unambiguous, and that
+  floor_check.py passes something. Writing the reference BEFORE the models run is how you
+  discover the spec was vague — every place this implementation had to guess is a place a
+  model would have guessed differently, and each one was pushed back into racing-v1.md.
+
+  Deliberately ugly. The rendering is the minimum that makes it playable, because the
+  rendering is exactly what the human channel is supposed to differentiate on, and a
+  polished reference would anchor judges.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>racing-v1 reference</title>
+<style>
+  body { margin:0; background:#111; color:#ddd; font:14px system-ui, sans-serif; }
+  canvas { display:block; margin:12px auto; background:#1a1a1a; border:1px solid #333; }
+  #hud { text-align:center; }
+</style></head>
+<body>
+<div id="hud">arrows / WASD — reference implementation, deliberately plain</div>
+<canvas id="c" width="1000" height="800"></canvas>
+<script>
+'use strict';
+// ---------------------------------------------------------------------------------------
+// SimCore — pure. No DOM, no Math.random, no clock. See racing-v1.md §2.
+// ---------------------------------------------------------------------------------------
+(function () {
+  var ACCEL = 220.0, BRAKE = 400.0, DRAG = 0.9, TURN_RATE = 2.6, MAX_SPEED = 320.0;
+
+  function clone(s) {
+    // Structural copy without JSON round-tripping, so step() stays cheap.
+    return {
+      seed: s.seed, x: s.x, y: s.y, heading: s.heading, speed: s.speed,
+      lap: s.lap, nextCheckpoint: s.nextCheckpoint, t: s.t, track: s.track,
+    };
+  }
+
+  function create(config) {
+    var cps = config.track.checkpoints;
+    var start = cps[0], aim = cps[1 % cps.length];
+    return {
+      seed: config.seed >>> 0,
+      x: start.x, y: start.y,
+      heading: Math.atan2(aim.y - start.y, aim.x - start.x),
+      speed: 0, lap: 0, nextCheckpoint: 1, t: 0,
+      track: {width: config.track.width, height: config.track.height,
+              checkpoints: cps.map(function (c) { return {x: c.x, y: c.y, r: c.r}; })},
+    };
+  }
+
+  function step(state, input, dt) {
+    var s = clone(state);
+    var thr = Math.min(1, Math.max(0, input.throttle || 0));
+    var brk = Math.min(1, Math.max(0, input.brake || 0));
+    var str = Math.min(1, Math.max(-1, input.steer || 0));
+
+    s.speed += (ACCEL * thr - BRAKE * brk) * dt;      // 1
+    s.speed *= Math.pow(DRAG, dt);                     // 2
+    if (s.speed < 0) s.speed = 0;                      // 3
+    if (s.speed > MAX_SPEED) s.speed = MAX_SPEED;
+    s.heading += str * TURN_RATE * Math.min(1, s.speed / 60) * dt;  // 4
+    s.x += Math.cos(s.heading) * s.speed * dt;         // 5
+    s.y += Math.sin(s.heading) * s.speed * dt;
+
+    var w = s.track.width, h = s.track.height, hit = false;
+    if (s.x < 0) { s.x = 0; hit = true; } else if (s.x > w) { s.x = w; hit = true; }
+    if (s.y < 0) { s.y = 0; hit = true; } else if (s.y > h) { s.y = h; hit = true; }
+    if (hit) s.speed = 0;
+
+    // 6 — ordered checkpoints. Only the NEXT one counts; that is the anti-cut rule.
+    var cps = s.track.checkpoints, tgt = cps[s.nextCheckpoint];
+    var dx = s.x - tgt.x, dy = s.y - tgt.y;
+    if (dx * dx + dy * dy <= tgt.r * tgt.r) {
+      s.nextCheckpoint = (s.nextCheckpoint + 1) % cps.length;
+      if (s.nextCheckpoint === 0) s.lap += 1;   // wrapped past the last -> a full circuit
+    }
+    s.t += dt;
+    return s;
+  }
+
+  function hash(state) {
+    // Key-order independent, and floats rounded so mathematically-equal states agree.
+    var seen = [];
+    function norm(v) {
+      if (typeof v === 'number') return Math.round(v * 1e6) / 1e6;
+      if (Array.isArray(v)) return v.map(norm);
+      if (v && typeof v === 'object') {
+        var out = {}, keys = Object.keys(v).sort();
+        for (var i = 0; i < keys.length; i++) out[keys[i]] = norm(v[keys[i]]);
+        return out;
+      }
+      return v;
+    }
+    var text = JSON.stringify(norm(state));
+    // FNV-1a, 64-bit-ish via two 32-bit lanes. Any stable digest satisfies the spec.
+    var h1 = 0x811c9dc5, h2 = 0x01000193;
+    for (var i = 0; i < text.length; i++) {
+      h1 ^= text.charCodeAt(i); h1 = Math.imul(h1, 0x01000193) >>> 0;
+      h2 = (h2 + text.charCodeAt(i) * (i + 1)) >>> 0; h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+    }
+    seen = null;
+    return ('00000000' + h1.toString(16)).slice(-8) + ('00000000' + h2.toString(16)).slice(-8);
+  }
+
+  globalThis.SimCore = {create: create, step: step, hash: hash};
+})();
+
+// ---------------------------------------------------------------------------------------
+// Rendering + input. Free to use the DOM, timers, anything — it is never graded.
+// ---------------------------------------------------------------------------------------
+(function () {
+  if (typeof document === 'undefined' || !document.getElementById) return;
+  var canvas = document.getElementById('c');
+  if (!canvas || !canvas.getContext) return;
+  var ctx = canvas.getContext('2d');
+  var CFG = {seed: 1, track: {width: 1000, height: 800, checkpoints: [
+    {x: 120, y: 400, r: 42}, {x: 500, y: 120, r: 42},
+    {x: 880, y: 400, r: 42}, {x: 500, y: 680, r: 42}]}};
+  var state = SimCore.create(CFG), keys = {};
+  addEventListener('keydown', function (e) { keys[e.key] = true; });
+  addEventListener('keyup', function (e) { keys[e.key] = false; });
+
+  function input() {
+    var up = keys.ArrowUp || keys.w, down = keys.ArrowDown || keys.s;
+    var left = keys.ArrowLeft || keys.a, right = keys.ArrowRight || keys.d;
+    return {throttle: up ? 1 : 0, brake: down ? 1 : 0,
+            steer: (right ? 1 : 0) - (left ? 1 : 0)};
+  }
+
+  function frame() {
+    state = SimCore.step(state, input(), 1 / 60);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    var cps = CFG.track.checkpoints;
+    for (var i = 0; i < cps.length; i++) {
+      ctx.beginPath();
+      ctx.arc(cps[i].x, cps[i].y, cps[i].r, 0, Math.PI * 2);
+      ctx.strokeStyle = (i === state.nextCheckpoint) ? '#6f6' : '#444';
+      ctx.stroke();
+    }
+    ctx.save();
+    ctx.translate(state.x, state.y);
+    ctx.rotate(state.heading);
+    ctx.fillStyle = '#e44';
+    ctx.fillRect(-10, -6, 20, 12);
+    ctx.restore();
+    ctx.fillStyle = '#ddd';
+    ctx.fillText('lap ' + state.lap + '  next cp ' + state.nextCheckpoint +
+                 '  speed ' + state.speed.toFixed(0), 10, 20);
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+</script>
+</body>
+</html>
