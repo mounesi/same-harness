@@ -19,7 +19,9 @@
 # Only "sh-*" is ever touched by anything in this repo.
 #
 # Env: LAMBDA_API_KEY (required), LAMBDA_SSH_KEY, LAMBDA_FS (required for --serve),
-#      VLLM_VERSION (required for --serve), WEIGHTS_DIR_OVERRIDE, VENV_NAME (harness-venv),
+#      VLLM_VERSION (required for --serve), LAMBDA_IMAGE (family:version — the GPU DRIVER
+#      ships with it; unset lets Lambda pick an older build), WEIGHTS_DIR_OVERRIDE,
+#      VENV_NAME (harness-venv),
 #      GPU_PROJECT_PREFIX (sh-)
 set -euo pipefail
 

@@ -36,6 +36,10 @@ jobs:
       LAMBDA_API_KEY: ${{ secrets.LAMBDA_API_KEY }}
       LAMBDA_SSH_KEY: ${{ vars.LAMBDA_SSH_KEY }}
       LAMBDA_FS: ${{ vars.LAMBDA_FS }}
+      # The GPU driver ships with the image. Unpinned, Lambda picks an older build
+      # (570.148.08 / CUDA 12.8) than it publishes (580.126.20 / CUDA 13.0), which
+      # silently caps which vLLM can run. Measured 2026-09-07; see AI-3166.
+      LAMBDA_IMAGE: ${{ vars.LAMBDA_IMAGE }}
       VLLM_VERSION: ${{ vars.VLLM_VERSION }}
       INSTANCE_NAME: sh-ci-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
       # WEIGHTS_DIR is NOT hardcoded here. Lambda mounts persistent filesystems at

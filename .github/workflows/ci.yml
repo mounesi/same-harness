@@ -73,6 +73,13 @@ jobs:
           assert a._pytest_version() is not None, 'pytest not runnable as %s -m pytest' % a.GRADER_PYTHON
           print('grader interpreter:', a.GRADER_PYTHON, '/', a._grader_python_version())"
 
+      # JVM suites grade from Surefire/Gradle XML rather than build stdout. The parser
+      # has to survive reports Surefire genuinely emits: illegal XML control bytes inside
+      # stack traces, and truncated files from killed forks. Raising on those would turn
+      # a slow build into what reads as a model failure.
+      - name: JUnit report parser self-test
+        run: python3 -m harness.adapters._junit --self-test
+
       # The gamespec floor is what protects human judging time, so it has to be correct
       # before any judge sees anything. Running it against the reference implementation on
       # every push is the cheapest way to keep it honest — and the reference is also what
