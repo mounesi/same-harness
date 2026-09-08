@@ -327,6 +327,52 @@ ids are already committed in `suites/` — but nothing else from a restricted ru
 files. `summary.json` records each run's `consent_class` so a reviewer can see that AgentTask
 runs contributed counts only.
 
+## Figures — `plots.py`
+
+`aggregate.py` stops at markdown and CSV, which is right for the paper and useless for a
+camera. `plots.py` turns the same `summary.json` into 1920x1080 images:
+
+```bash
+python3 -m pip install matplotlib     # the only non-stdlib dependency in this repo
+python3 analysis/plots.py --summary analysis/tables/summary.json --out-dir analysis/figures
+```
+
+| Figure | Reads | Shows |
+|---|---|---|
+| `cost-per-resolved.png` | `by_model` | the headline: USD per resolved task, cheapest first |
+| `resolve-rate.png` | `by_model_suite` | resolve rate per model x suite, whiskers = `resolve_rate_pass_min/max` |
+| `failure-taxonomy.png` | `failure_counts` | 100% stacked breakdown over the §4 codes; infra codes hatched |
+| `contamination-slope.png` | `contamination` | Verified -> Pro -> AgentTask per model, flagged models in red |
+| `instance-dots.png` | each run's `results.jsonl` | one square per instance: resolved on every pass / some / none / infra |
+
+It **computes nothing**. Every number drawn is read straight out of the report, so a figure
+cannot disagree with the table it came from. The dot grid is the one figure that needs the
+raw records; it finds `results.jsonl` beside each manifest named in `inputs.manifests`, or
+under `--results-root`, and it only draws runs the aggregator actually **included** — an
+excluded run cannot re-enter the story through a picture.
+
+Three properties are enforced in the drawing code rather than left to a caption:
+
+1. `comparability.mixed` puts a red banner on **every** figure. Cropping the header off a
+   mixed aggregate must not turn it into a like-for-like comparison.
+2. A cost from a `cost_approximate` group is suffixed `*` with a footnote naming
+   `provenance_incomplete`, instead of being quietly rounded into the bar.
+3. The resolve-rate whiskers are labelled a **range**, never a confidence interval —
+   decoding is greedy, so passes are not independent samples (see §0.1).
+
+| Option | Effect |
+|---|---|
+| `--only cost resolve taxonomy contamination dots` | render a subset |
+| `--theme dark\|light` | default `dark` |
+| `--transparent` | no background fill, for compositing over video |
+| `--width/--height/--dpi` | default 1920x1080 @160; fonts scale with the frame |
+| `--format png\|svg\|pdf` | vector output for print |
+| `--demo` | synthetic watermarked figures; `--summary` is not read |
+
+A figure with nothing to draw is skipped with a reason on stderr (one suite scored, no cost
+and no resolved attempt, no `results.jsonl`) and the others still render. Exit `1` if none
+could be rendered or matplotlib is missing, `3` if `--summary` is unreadable.
+
 ## Exit codes
 
 | Code | Meaning |

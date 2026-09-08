@@ -32,7 +32,8 @@ jobs:
           # `bash -n "$f" && echo ok` form was exempt from -e and reported only the last
           # iteration's status, so a syntax error anywhere but the last file passed green.)
           fail=0
-          for f in modelctl lambdactl resultsctl harness/run.sh training/train_lora.sh smoke/run-smoke.sh \
+          for f in modelctl lambdactl resultsctl gpuctl gpuwatch gpu-lease \
+                   harness/run.sh training/train_lora.sh smoke/run-smoke.sh \
                    $(find . -name '*.sh' -not -path './.git/*' | sort); do
             if bash -n "$f"; then echo "ok $f"; else echo "SYNTAX ERROR: $f" >&2; fail=1; fi
           done
@@ -60,3 +61,14 @@ jobs:
 
       - name: End-to-end smoke (mock endpoint, synthetic suite, no GPU)
         run: ./smoke/run-smoke.sh
+
+      # The figures are how the result actually leaves this repo, so they get the same
+      # treatment as everything else: if plots.py cannot render, CI is red. --demo needs
+      # no run bundle, which keeps this a one-command check on every push.
+      - name: Figures render
+        run: |
+          python -m pip install --quiet matplotlib
+          python analysis/plots.py --demo --out-dir "$RUNNER_TEMP/figures"
+          n=$(ls -1 "$RUNNER_TEMP/figures"/*.png | wc -l)
+          [ "$n" -eq 5 ] || { echo "expected 5 figures, got $n" >&2; exit 1; }
+          echo "ok: $n figures"
