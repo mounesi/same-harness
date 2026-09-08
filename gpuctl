@@ -105,14 +105,30 @@ install_stack() { # ip — build a HERMETIC venv and put the pinned stack in it
   # for a newer CUDA than the host driver imports fine and only reveals itself when the
   # engine starts: the AI-P167 shakedown lost three serve attempts to
   # "The NVIDIA driver on your system is too old (found version 12080)".
-  info "checking the GPU is visible to this stack"
+  # Import vLLM's CUDA platform module, not merely torch. Checking torch alone is what the
+  # first version of this guard did, and it was not enough: with a force-installed cu128
+  # torch, torch.cuda.is_available() returned True and the check passed — then vLLM died at
+  # serve time, AFTER the weights, on
+  #     ImportError: libcudart.so.13  (vllm._C_stable_libtorch)
+  # because vLLM ships its OWN compiled extension linked against a CUDA runtime that has
+  # nothing to do with torch's. The two can disagree. Only importing the thing that will
+  # actually serve proves the stack is coherent, and it costs a second here versus a full
+  # download there.
+  info "checking the GPU is visible to this stack, and that vLLM itself loads"
   sshto "$ip" "~/$VENV_NAME/bin/python -c \"
-import torch, sys
+import sys
+import torch
 if not torch.cuda.is_available():
-    sys.exit('torch %s (cuda %s) cannot see the GPU — the driver is older than this build. '
-             'Pin a vLLM whose torch has a wheel for this host driver.' % (torch.__version__, torch.version.cuda))
-print('  gpu ok:', torch.cuda.get_device_name(0), '| torch', torch.__version__, 'cuda', torch.version.cuda)
-\"" || die "the installed stack cannot use this instance's GPU — see the message above.
+    sys.exit('torch %s (cuda %s) cannot see the GPU — the host driver is older than this '
+             'build. Pin a vLLM whose torch targets this driver.' % (torch.__version__, torch.version.cuda))
+try:
+    import vllm.platforms.cuda  # the compiled extension, linked to its own CUDA runtime
+except Exception as exc:
+    sys.exit('torch works, but vLLM will not load on this host: %s: %s. vLLM ships its own '
+             'CUDA extension; a torch that runs here does not imply a vLLM that runs here.'
+             % (type(exc).__name__, exc))
+print('  gpu ok:', torch.cuda.get_device_name(0), '| torch', torch.__version__, 'cuda', torch.version.cuda, '| vllm loads')
+\"" || die "the installed stack cannot serve on this instance — see the message above.
        Nothing has been downloaded yet; pick a compatible VLLM_VERSION and re-run."
 }
 
