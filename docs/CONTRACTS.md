@@ -1096,9 +1096,11 @@ resolve_rate       = resolved_attempts / attempts_scored
 cost_per_resolved  = cost_usd / resolved_attempts                       # THE headline number
 ```
 
-Reported alongside: `resolve_rate` with a bootstrap CI over the 3 passes, `pass@1` (mean over
-passes) and `pass@3` (any pass resolved), the §4 failure-taxonomy histogram, median tokens
-in/out per attempt, and the count of `nonconformant` runs excluded.
+Reported alongside: `resolve_rate` with the **min/max range** over the 3 passes (per §3,
+decoding is greedy and the passes are not independent samples, so this is a range and MUST
+NOT be reported as a bootstrap CI over passes), a cluster-bootstrap CI over **instances**,
+`pass@1` (mean over passes) and `pass@3` (any pass resolved), the §4 failure-taxonomy
+histogram, median tokens in/out per attempt, and the count of `nonconformant` runs excluded.
 
 Instance-hour cost is charged **whole**: model download and server warm-up time are outside
 `timing.wall_clock_s` and are reported separately as `setup_cost_usd` from CI's

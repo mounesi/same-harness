@@ -165,8 +165,8 @@ resolve_rate      = count(resolved = true) / attempts_scored
 |---|---|
 | `resolve_rate` | pooled over all attempts in the (model, suite) group |
 | `pass_rate_mean` / `min` / `max` | one rate per **pass slice** — a pass slice is one `(run_id, pass_idx)` pair — then mean and range. This is the "mean + range over 3 passes" number. |
-| `resolve_rate_ci95_*` | percentile bootstrap over the pass-level rates (§8). With 3 passes this interval is coarse by construction; quote the range alongside it. |
-| `resolve_rate_ci95_*_instance_bootstrap` | secondary cluster bootstrap that resamples **instances** and recomputes the pooled rate. Usually the more honest interval; reported in `summary.json` only. |
+| `resolve_rate_pass_min` / `_max` | the lowest and highest pass-slice rate observed — the "range over passes" column in `summary.md`. Decoding is greedy (temperature 0.0) against one held-constant seed, so the passes are not independent draws: this is a **range, not a confidence interval**. Numerically identical to `pass_rate_min` / `_max`; both names appear in `by_model_suite.csv`. |
+| `resolve_rate_ci95_*_instance_bootstrap` | cluster bootstrap that resamples **instances** and recomputes the pooled rate. The only interval the aggregator emits — instances genuinely were sampled — and it lands in `summary.json` only, never in the CSVs. |
 | `pass_at_1` | mean of the per-pass rates |
 | `pass_at_k` | share of instances resolved by **at least one** pass (`k` = number of pass slices observed) |
 | `all_passes_resolved_rate` | share of instances resolved by *every* pass — a stability signal |
@@ -175,8 +175,9 @@ resolve_rate      = count(resolved = true) / attempts_scored
 | `ttft_ms_median_of_attempt_p50` | median across attempts of each attempt's own TTFT p50 (the raw records carry per-attempt percentiles, not raw samples) |
 | tokens | median and sum of `tokens.prompt` / `completion` / `total` per attempt |
 
-Percentiles use linear interpolation between order statistics. Bootstraps use a fixed seed
-(`20260830`), so re-running the aggregator reproduces identical intervals byte for byte.
+Percentiles use linear interpolation between order statistics. The instance bootstrap is
+seeded from a fixed constant (`20260830`), so re-running the aggregator reproduces identical
+intervals byte for byte.
 
 ## Cost — two billing modes, one headline
 
@@ -355,7 +356,7 @@ runs contributed counts only.
 --require-checksums        fail when a run has no SHA256SUMS
 --verify-refs              also verify every patches/ and trajectories/ file
 --lenient                  per-record validation failures become warnings
---bootstrap-iters N        resamples for the CI (default 10000; 0 disables)
+--bootstrap-iters N        resamples for the instance-level CI (default 10000; 0 disables)
 --contamination-threshold  Verified-gap fraction that raises the flag (default 0.10)
 ```
 
@@ -374,7 +375,11 @@ runs contributed counts only.
    pooling two 3-pass runs yields six pass slices, not three.
 4. **`pass@k` uses `k` = the number of pass slices observed**, which is 3 for a standard run
    and larger when runs are pooled. The column header says so; the prose should too.
-5. **The §8 bootstrap is over pass-level rates**, as written in the contract. With three
-   passes that CI is essentially the min/max. The instance-cluster CI in `summary.json` is the
-   one worth quoting if the writeup wants a real interval — that choice is not settled by the
-   contract.
+5. **No CI is reported over passes, and the contract agrees.** §3 fixes decoding at
+   temperature 0.0 with `seed == base_seed` on every pass, so the passes differ only by
+   serving nondeterminism and a bootstrap over them would claim a precision the sampler
+   cannot deliver. The aggregator reports mean + min/max range instead;
+   `bootstrap_ci_over_passes` survives in `aggregate.py` marked RETIRED and is never called.
+   Re-enabling it requires temperature > 0 **and** a per-pass seed, and `harness/agent.py`
+   must move in the same commit. The instance-cluster CI in `summary.json` is the one
+   interval worth quoting.
