@@ -80,6 +80,41 @@ jobs:
       - name: JUnit report parser self-test
         run: python3 -m harness.adapters._junit --self-test
 
+      # A run's numbers are only comparable to another's if the same engine produced them.
+      # Every serving-stack field was recorded by manifest.py and compared by nothing, so
+      # mixing two vLLM versions — or FP8 weights with BF16 — aggregated silently into one
+      # headline number. Assert the guard actually refuses each case.
+      - name: Serving stack is a comparability constant
+        run: |
+          python3 -c "
+          import sys; sys.path.insert(0, 'analysis')
+          import aggregate as A
+          def mk(vllm, driver, quant):
+              return {'run_id': 'r', 'manifest': {
+                  'harness': {'version':'1','prompt_dir_sha256':'x','prompt_template_id':'t',
+                              'agent_config_sha256':'y','adapters_dir_sha256':'z','result_schema':'s'},
+                  'inference': {'temperature':0.0,'top_p':1.0,'top_k':-1,'seed':1,'max_iters':40,
+                                'max_tokens':1,'max_attempt_tokens':1,'task_timeout_s':1800,
+                                'concurrency':4,'passes':3},
+                  'runtime': {'max_model_len':262144,'extra_args':'','vllm_version':vllm,
+                              'nvidia_driver':driver,'torch_version':'t','cuda_runtime':'c',
+                              'transformers_version':'tr','requirements_lock_sha256':'l'},
+                  'model': {'quantization':quant}, 'suite': {'name':'swebench-verified'}}}
+          class Args: allow_mixed=False; strict=False
+          class Diag:
+              def __getattr__(self, n): return lambda *a, **k: None
+          def blocking(runs):
+              rep = A.comparability_report(runs, Args(), Diag())
+              return sorted(f['field'] for f in rep['fields'] if f['blocking'] and len(f['values']) > 1)
+          base = mk('0.28.0', '580.126.20', 'fp8')
+          assert blocking([base, mk('0.28.0','580.126.20','fp8')]) == [], 'identical stacks must not trip'
+          for other, expect in ((mk('0.19.1','580.126.20','fp8'), 'runtime.vllm_version'),
+                                (mk('0.28.0','570.148.08','fp8'), 'runtime.nvidia_driver'),
+                                (mk('0.28.0','580.126.20','none'), 'model.quantization')):
+              got = blocking([base, other])
+              assert got == [expect], 'expected %r to block, got %r' % (expect, got)
+          print('serving-stack comparability: vllm_version, nvidia_driver, quantization all blocking')"
+
       - name: Leakage guard self-test
         run: python training/build_dataset.py --self-test
 
