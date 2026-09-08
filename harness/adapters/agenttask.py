@@ -89,7 +89,20 @@ INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # DEFAULT_TEST_TIMEOUT_S is the budget for grading ONE ATTEMPT (all node ids, both runners,
 # see the module docstring) — not per test and not per process. DEFAULT_SETUP_TIMEOUT_S is
 # per setup command.
-DEFAULT_TEST_CMD = "python -m pytest -rA -p no:cacheprovider {tests}"
+# The interpreter the grader invokes, as a PATH name resolved by the shell in _run().
+# It is deliberately not `sys.executable`: the recorded default_test_cmd (below) goes into
+# environment_digest AND into the model-facing prompt, so it must be a stable string rather
+# than a per-host absolute path. `python3` — not `python` — because PEP 394 guarantees the
+# former on every platform the harness runs on, while the latter is absent from stock macOS
+# and from Debian/Ubuntu images without python-is-python3.
+#
+# Whatever this names, grading_requirements() MUST probe it the same way _run() invokes it.
+# Those two drifting apart is what AI-3155 fixed: preflight probed `sys.executable -m pytest`
+# and passed, then every attempt ran `python -m pytest` through a shell and died rc=127 —
+# after the agent loop had already spent its iteration budget on a rented GPU node.
+GRADER_PYTHON = "python3"
+
+DEFAULT_TEST_CMD = GRADER_PYTHON + " -m pytest -rA -p no:cacheprovider {tests}"
 DEFAULT_TEST_TIMEOUT_S = 900
 DEFAULT_SETUP_TIMEOUT_S = 1800
 TIMEOUT_SCOPE = "per_attempt_batch"  # recorded in Verdict.raw["timeout_scope"]
@@ -563,18 +576,38 @@ def _verdict(
     )
 
 
-def _pytest_version() -> str | None:
-    """Version of the pytest that will actually grade, or None if it is not importable."""
+def _probe(argv_str: str) -> str | None:
+    """Run `argv_str` THROUGH A SHELL and return its first output line, or None if it could
+    not run or exited non-zero.
+
+    The shell is not incidental. `_run()` executes test_cmd with `shell=True`, so PATH
+    resolution, and therefore which interpreter actually grades, happens in the shell — not
+    in this process. A probe that bypasses the shell is measuring a different thing than the
+    one it claims to be checking (AI-3155).
+    """
     try:
-        out = subprocess.run(
-            [sys.executable, "-m", "pytest", "--version"],
-            capture_output=True, text=True, timeout=60,
-        )
+        out = subprocess.run(argv_str, shell=True, capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return None
     if out.returncode != 0:
         return None
-    return (out.stdout or out.stderr).strip().splitlines()[0] if (out.stdout or out.stderr) else "unknown"
+    text = (out.stdout or out.stderr).strip()
+    return text.splitlines()[0] if text else "unknown"
+
+
+def _grader_python_version() -> str | None:
+    """Version of the interpreter GRADER_PYTHON resolves to, or None if there is none."""
+    return _probe("%s --version" % GRADER_PYTHON)
+
+
+def _pytest_version() -> str | None:
+    """Version of the pytest that will actually grade, or None if it cannot be run.
+
+    Probed as `GRADER_PYTHON -m pytest --version` through a shell — the exact form
+    _run() will use — so this answers "will grading work here?" rather than "is pytest
+    importable by the interpreter that happens to be running the harness?".
+    """
+    return _probe("%s -m pytest --version" % GRADER_PYTHON)
 
 
 def grading_requirements() -> list[tuple[str, bool, str]]:
@@ -584,12 +617,25 @@ def grading_requirements() -> list[tuple[str, bool, str]]:
     running the hidden tests with pytest in-process, so a missing pytest means the suite
     cannot be graded at all — and would otherwise be discovered only at the first grade(),
     reported as TESTS_FAIL 0/N, and published as if the model had failed.
+
+    Every probe here goes through a shell, naming GRADER_PYTHON exactly as DEFAULT_TEST_CMD
+    does, so a pass here means grading will genuinely work rather than merely that this
+    process could import something (AI-3155).
+
+    Limitation worth knowing: a task whose pack record overrides `environment.test_cmd` can
+    name any interpreter it likes, and preflight cannot see task records — it runs before the
+    suite is loaded. This checks the default, which is what all 50 tasks currently use.
     """
     reqs = []
     reqs.append((
+        "%s (the interpreter the grader invokes)" % GRADER_PYTHON,
+        _grader_python_version() is not None,
+        "install python3, or put it on PATH for the shell that runs the harness",
+    ))
+    reqs.append((
         "pytest (the agenttask test runner)",
         _pytest_version() is not None,
-        "%s -m pip install pytest" % sys.executable,
+        "%s -m pip install pytest" % GRADER_PYTHON,
     ))
     reqs.append((
         "git (workspace base for the attempt diff)",
@@ -620,7 +666,12 @@ def environment_digest() -> str:
         "grader": GRADER,
         "grader_version": GRADER_VERSION,
         "pack": pack,
+        # Two different interpreters, and the distinction matters: `python` is the one
+        # running the harness, `grader_python` is the one the shell resolves GRADER_PYTHON
+        # to and which actually executes the hidden tests. On a venv or conda host they are
+        # routinely not the same, and it is the latter that determines a verdict.
         "python": platform.python_version(),
+        "grader_python": _grader_python_version(),
         "git": _tool_version("git"),
         "default_test_cmd": DEFAULT_TEST_CMD,
         # The test runner IS the grader here: without it every attempt grades TESTS_FAIL
