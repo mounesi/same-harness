@@ -18,7 +18,8 @@
 # Names: manual instances are "sh-<user>-<model>", CI's are "sh-ci-<model>-<run>-<attempt>".
 # Only "sh-*" is ever touched by anything in this repo.
 #
-# Env: LAMBDA_API_KEY (required), LAMBDA_SSH_KEY, LAMBDA_FS, GPU_PROJECT_PREFIX (sh-)
+# Env: LAMBDA_API_KEY (required), LAMBDA_SSH_KEY, LAMBDA_FS (required for --serve),
+#      VLLM_VERSION (required for --serve), WEIGHTS_DIR_OVERRIDE, GPU_PROJECT_PREFIX (sh-)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,6 +45,59 @@ pick() { # [name] -> "id name ip" (my only instance when no name given)
   fi
 }
 sshto() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$1" "${@:2}"; }
+
+weights_dir_for_fs() { # -> absolute WEIGHTS_DIR on the instance
+  # Ask the API where the filesystem is actually mounted rather than assuming a layout.
+  # Lambda mounts persistent filesystems at /lambda/nfs/<name>; this used to hardcode
+  # /home/$SSH_USER/$LAMBDA_FS, which is an ordinary directory on the instance's ephemeral
+  # disk. That failure is SILENT — the run succeeds, the weights are simply re-downloaded
+  # on the meter every time and lost at teardown.
+  if [[ -n "${WEIGHTS_DIR_OVERRIDE:-}" ]]; then echo "$WEIGHTS_DIR_OVERRIDE"; return; fi
+  if [[ -z "${LAMBDA_FS:-}" ]]; then
+    die "LAMBDA_FS is not set — weights would land on ephemeral disk and be re-downloaded
+       (60-160 GB) on every run. Create one (./lambdactl fs lists them) and export its name.
+       Set WEIGHTS_DIR_OVERRIDE=<path> only if you deliberately want a throwaway cache."
+  fi
+  local line; line="$("$HERE/lambdactl" fs "$LAMBDA_FS")" || die "no filesystem named '$LAMBDA_FS'"
+  local mount; mount="$(awk '{print $3}' <<<"$line")"
+  [[ -n "$mount" && "$mount" != "-" ]] || die "filesystem '$LAMBDA_FS' reports no mount point"
+  echo "$mount/models"
+}
+
+install_stack() { # ip — put the PINNED serving + grading stack on the instance
+  # modelctl runs $VLLM_BIN (default `vllm`) and assumes it exists; nothing outside CI ever
+  # installed it, so the RUNBOOK's by-hand recipe could only work on an instance that
+  # happened to ship a vLLM — of unknown version, which is exactly what VLLM_VERSION exists
+  # to prevent. The manifest records the resolved version either way, so an unpinned box
+  # produces a run whose serving stack is unreproducible.
+  local ip="$1"
+  [[ -n "${VLLM_VERSION:-}" ]] || die "VLLM_VERSION is not set — the serving stack would be
+       whatever the image happens to carry, and the run would not be reproducible.
+       Pin it (same value CI uses) and re-run: export VLLM_VERSION=x.y.z"
+  info "installing pinned stack: vllm==$VLLM_VERSION + harness/requirements.lock"
+  sshto "$ip" "pip install -q 'vllm==$VLLM_VERSION' hf_transfer" \
+    || die "could not install vllm==$VLLM_VERSION on the instance"
+  sshto "$ip" "cd ~/harness-repo && pip install -q -r harness/requirements.lock" \
+    || die "could not install harness/requirements.lock on the instance"
+}
+
+assert_weights_mounted() { # ip dir — refuse to download onto ephemeral disk
+  # Cheap, and it runs BEFORE the download rather than after. If the API's mount point and
+  # the instance's reality ever disagree, this is what turns a silent 60-160 GB re-download
+  # into a one-line failure while nothing has been spent yet.
+  local ip="$1" dir="$2" parent; parent="$(dirname "$dir")"
+  if [[ -n "${WEIGHTS_DIR_OVERRIDE:-}" ]]; then
+    info "WEIGHTS_DIR_OVERRIDE set — skipping the persistent-mount check (weights are throwaway)"
+    sshto "$ip" "mkdir -p '$dir'"; return
+  fi
+  sshto "$ip" "test -d '$parent'" \
+    || die "'$parent' does not exist on the instance — the filesystem did not attach.
+       Check its region matches the instance's: ./lambdactl fs '$LAMBDA_FS'"
+  sshto "$ip" "mountpoint -q '$parent' || findmnt -T '$parent' | tail -n +2 | grep -qv ' / '" \
+    || die "'$parent' exists on the instance but is NOT a mount point — it is ephemeral disk.
+       Weights would be re-downloaded on every run. Refusing to start."
+  sshto "$ip" "mkdir -p '$dir'"
+}
 
 cmd_up() {
   need_key
@@ -71,11 +125,15 @@ cmd_up() {
   sshto "$ip" "chmod +x ~/gpu-lease && ~/gpu-lease claim '$hold' 'manual:$model' '$ME'"
 
   if (( serve )); then
+    local weights_dir; weights_dir="$(weights_dir_for_fs)"
+    info "weights dir: $weights_dir"
     info "shipping the repo and starting vLLM (this is the slow part — weights download on first use)"
     tar -czf /tmp/gpuctl-repo.tgz -C "$HERE" --exclude=.git --exclude=.github --exclude=.state .
     scp -q /tmp/gpuctl-repo.tgz "$SSH_USER@$ip:~/"
     sshto "$ip" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo 2>/dev/null || tar -xzf ~/gpuctl-repo.tgz -C ~/harness-repo"
-    sshto "$ip" "cd ~/harness-repo && WEIGHTS_DIR=/home/$SSH_USER/${LAMBDA_FS:-persistent}/models ./modelctl serve '$model'"
+    assert_weights_mounted "$ip" "$weights_dir"
+    install_stack "$ip"
+    sshto "$ip" "cd ~/harness-repo && WEIGHTS_DIR='$weights_dir' ./modelctl serve '$model'"
   fi
   cat >&2 <<EOF
 
