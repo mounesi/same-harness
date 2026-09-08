@@ -19,13 +19,15 @@
 # Only "sh-*" is ever touched by anything in this repo.
 #
 # Env: LAMBDA_API_KEY (required), LAMBDA_SSH_KEY, LAMBDA_FS (required for --serve),
-#      VLLM_VERSION (required for --serve), WEIGHTS_DIR_OVERRIDE, GPU_PROJECT_PREFIX (sh-)
+#      VLLM_VERSION (required for --serve), WEIGHTS_DIR_OVERRIDE, VENV_NAME (harness-venv),
+#      GPU_PROJECT_PREFIX (sh-)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${GPU_PROJECT_PREFIX:-sh-}"
 ME="${GPU_USER:-${USER:-me}}"
 SSH_USER="${SSH_USER:-ubuntu}"
+VENV_NAME="${VENV_NAME:-harness-venv}"
 die() { echo "error: $*" >&2; exit 1; }
 info() { echo "==> $*" >&2; }
 need_key() { [[ -n "${LAMBDA_API_KEY:-}" ]] || die "LAMBDA_API_KEY not set (https://cloud.lambdalabs.com/api-keys)"; }
@@ -64,21 +66,54 @@ weights_dir_for_fs() { # -> absolute WEIGHTS_DIR on the instance
   echo "$mount/models"
 }
 
-install_stack() { # ip — put the PINNED serving + grading stack on the instance
-  # modelctl runs $VLLM_BIN (default `vllm`) and assumes it exists; nothing outside CI ever
-  # installed it, so the RUNBOOK's by-hand recipe could only work on an instance that
-  # happened to ship a vLLM — of unknown version, which is exactly what VLLM_VERSION exists
-  # to prevent. The manifest records the resolved version either way, so an unpinned box
-  # produces a run whose serving stack is unreproducible.
+install_stack() { # ip — build a HERMETIC venv and put the pinned stack in it
+  # Why a venv and not `pip install --user`: the Lambda image ships an apt-managed
+  # scientific stack in /usr/lib/python3/dist-packages, compiled against numpy 1.x. A
+  # --user install upgrades numpy to 2.x underneath it, and the two shadow each other:
+  #   apt scipy 1.8.0   -> ImportError: cannot import name 'Inf' from 'numpy'
+  #   apt sklearn       -> ValueError: numpy.dtype size changed (ABI mismatch)
+  # Both observed on the AI-P167 shakedown, one after the other, each costing a serve
+  # attempt on a billing GPU. Upgrading them one at a time does not converge — there is no
+  # bound on how many apt packages the transitive import graph touches.
+  #
+  # A venv without --system-site-packages makes dist-packages invisible, so the conflict
+  # cannot arise. It also makes runtime.requirements_lock_sha256 mean something: the lock
+  # then describes the environment that actually ran, which is the whole point of recording
+  # it. A --user install describes only a delta against an image nobody pinned.
   local ip="$1"
   [[ -n "${VLLM_VERSION:-}" ]] || die "VLLM_VERSION is not set — the serving stack would be
        whatever the image happens to carry, and the run would not be reproducible.
        Pin it (same value CI uses) and re-run: export VLLM_VERSION=x.y.z"
+
+  info "building hermetic venv at ~/$VENV_NAME (dist-packages excluded)"
+  sshto "$ip" "test -x ~/$VENV_NAME/bin/python || python3 -m venv ~/$VENV_NAME" \
+    || die "could not create the venv on the instance"
+  sshto "$ip" "~/$VENV_NAME/bin/pip install -q --upgrade pip setuptools wheel" \
+    || die "could not bootstrap pip in the venv"
+
+  # ONE resolution pass. Installing vLLM and then the lock separately lets the second
+  # install silently downgrade a dependency out from under the first — that is how
+  # huggingface_hub landed on 0.27.1 while vLLM required >=1.27.0, with only a pip
+  # warning to show for it. Resolved together, an incompatibility is an error instead.
   info "installing pinned stack: vllm==$VLLM_VERSION + harness/requirements.lock"
-  sshto "$ip" "pip install -q 'vllm==$VLLM_VERSION' hf_transfer" \
-    || die "could not install vllm==$VLLM_VERSION on the instance"
-  sshto "$ip" "cd ~/harness-repo && pip install -q -r harness/requirements.lock" \
-    || die "could not install harness/requirements.lock on the instance"
+  sshto "$ip" "cd ~/harness-repo && ~/$VENV_NAME/bin/pip install -q 'vllm==$VLLM_VERSION' hf_transfer -r harness/requirements.lock" \
+    || die "could not install the pinned stack — the pins in harness/requirements.lock and
+       vllm==$VLLM_VERSION may be mutually unsatisfiable. Resolve them together, do not
+       install them in sequence."
+
+  # Fail here, cheaply, rather than after the weights load. A vLLM whose torch was built
+  # for a newer CUDA than the host driver imports fine and only reveals itself when the
+  # engine starts: the AI-P167 shakedown lost three serve attempts to
+  # "The NVIDIA driver on your system is too old (found version 12080)".
+  info "checking the GPU is visible to this stack"
+  sshto "$ip" "~/$VENV_NAME/bin/python -c \"
+import torch, sys
+if not torch.cuda.is_available():
+    sys.exit('torch %s (cuda %s) cannot see the GPU — the driver is older than this build. '
+             'Pin a vLLM whose torch has a wheel for this host driver.' % (torch.__version__, torch.version.cuda))
+print('  gpu ok:', torch.cuda.get_device_name(0), '| torch', torch.__version__, 'cuda', torch.version.cuda)
+\"" || die "the installed stack cannot use this instance's GPU — see the message above.
+       Nothing has been downloaded yet; pick a compatible VLLM_VERSION and re-run."
 }
 
 assert_weights_mounted() { # ip dir — refuse to download onto ephemeral disk
@@ -136,7 +171,13 @@ cmd_up() {
     sshto "$ip" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo 2>/dev/null || tar -xzf ~/gpuctl-repo.tgz -C ~/harness-repo"
     assert_weights_mounted "$ip" "$weights_dir"
     install_stack "$ip"
-    sshto "$ip" "cd ~/harness-repo && WEIGHTS_DIR='$weights_dir' ./modelctl serve '$model'"
+    # modelctl must use the venv for BOTH jobs: HARNESS_PYTHON drives the weights download
+    # (huggingface_hub lives in the venv, not in the system python), VLLM_BIN drives the
+    # server. Leaving either pointed at the system interpreter reintroduces the apt/pip
+    # split this venv exists to remove.
+    sshto "$ip" "cd ~/harness-repo && WEIGHTS_DIR='$weights_dir' \
+      HARNESS_PYTHON=\$HOME/$VENV_NAME/bin/python VLLM_BIN=\$HOME/$VENV_NAME/bin/vllm \
+      ./modelctl serve '$model'"
   fi
   cat >&2 <<EOF
 
