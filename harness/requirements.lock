@@ -16,7 +16,12 @@
 # --hash entries. The pins below are the intended majors, not verified resolutions.
 
 datasets==3.2.0
-huggingface_hub==0.27.1
+# Resolved together with vllm, never installed after it: a second pip pass silently
+# downgraded this to 0.27.1 under a vLLM that requires >=1.27.0 (AI-P167, 2026-09-07).
+# swebench stays on 3.0.x deliberately — 5.x drops MAP_REPO_VERSION_TO_SPECS, which
+# _swebench.py uses to build the test_cmd PROMPT variable, so bumping it silently
+# changes the prompt every model sees. See AI-3162 before touching that pin.
+huggingface_hub>=1.27.0
 
 # SWE-bench official evaluation harness (grading). Docker is a system prerequisite.
 swebench==3.0.3
