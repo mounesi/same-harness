@@ -6,6 +6,7 @@
 #   ./lambdactl up <instance-type> [region] launch, wait until active, print IP
 #   ./lambdactl ls                          running instances
 #   ./lambdactl fs [name]                   persistent filesystems: "<name> <region> <mount-point>"
+#   ./lambdactl images [region]             available images: "<family> <version> <id>"
 #   ./lambdactl ip <id|name>                public IP of an instance
 #   ./lambdactl down <id|name>              terminate one instance (a name matching >1 is an error)
 #   ./lambdactl down --all-named <name>     terminate EVERY instance carrying that name (CI teardown)
@@ -16,6 +17,8 @@
 #   LAMBDA_API_KEY   required — https://cloud.lambdalabs.com/api-keys
 #   LAMBDA_SSH_KEY   name of the SSH key registered in Lambda (default: first key)
 #   LAMBDA_FS        name of persistent filesystem to attach (optional, region-bound)
+#   LAMBDA_IMAGE     "family:version" or an image id. THE GPU DRIVER SHIPS WITH THE IMAGE:
+#                    unset means Lambda picks, and its default is not the newest build.
 #   INSTANCE_NAME    name tag for launched instance (default: harness-run)
 set -euo pipefail
 
@@ -92,6 +95,37 @@ print(rs[0]['name'] if rs else '')
   local fs_json="[]"
   [[ -n "${LAMBDA_FS:-}" ]] && fs_json="[\"$LAMBDA_FS\"]"
 
+  # Pin the image, because the GPU DRIVER ships with it and the driver decides which CUDA
+  # runtime — and therefore which vLLM — can run at all. Left unset, Lambda picks, and its
+  # pick is not the newest build: two AI-P167 shakedown runs landed on driver 570.148.08
+  # (CUDA 12.8) and could not run any vLLM newer than 0.19.1, while the newest published
+  # image carries 580.126.20 (CUDA 13.0) and runs current vLLM fine. Same account, same
+  # week, same command — a difference the study would otherwise have absorbed silently.
+  #
+  # LAMBDA_IMAGE takes "family:version" (resolved per region, since ids differ by region for
+  # the same build) or a raw image id. Unset keeps the old floating behaviour and says so.
+  local image_json=""
+  if [[ -n "${LAMBDA_IMAGE:-}" ]]; then
+    local img_id="$LAMBDA_IMAGE"
+    if [[ "$LAMBDA_IMAGE" == *:* ]]; then
+      local fam="${LAMBDA_IMAGE%%:*}" ver="${LAMBDA_IMAGE##*:}"
+      img_id="$(req GET /images | python3 -c "
+import json,sys
+fam, ver, region = sys.argv[1], sys.argv[2], sys.argv[3]
+for i in json.load(sys.stdin)['data']:
+    if i.get('family') == fam and i.get('version') == ver \
+       and (i.get('region') or {}).get('name') == region:
+        print(i['id']); break
+" "$fam" "$ver" "$region")"
+      [[ -n "$img_id" ]] || { echo "error: no image $fam:$ver in $region (./lambdactl images)" >&2; exit 1; }
+    fi
+    image_json=", \"image\": {\"id\": \"$img_id\"}"
+    echo "==> image: $LAMBDA_IMAGE -> $img_id" >&2
+  else
+    echo "==> image: UNPINNED — Lambda chooses, and its choice carries the GPU driver." >&2
+    echo "==>        Set LAMBDA_IMAGE=family:version for a reproducible stack." >&2
+  fi
+
   echo "==> launching $itype in $region (ssh key: $sshkey, fs: ${LAMBDA_FS:-none})" >&2
   local id
   id="$(req POST /instance-operations/launch "{
@@ -99,7 +133,7 @@ print(rs[0]['name'] if rs else '')
     \"instance_type_name\": \"$itype\",
     \"ssh_key_names\": [\"$sshkey\"],
     \"file_system_names\": $fs_json,
-    \"name\": \"$name\"
+    \"name\": \"$name\"$image_json
   }" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['instance_ids'][0])")"
   # emit the id IMMEDIATELY — if the wait below fails, the caller still knows what to terminate
   echo "==> instance $id (name: $name) — waiting for active" >&2
@@ -152,6 +186,22 @@ if want is not None and not rows:
 for f in rows:
     print('%s %s %s' % (f.get('name'), (f.get('region') or {}).get('name') or '-',
                         f.get('mount_point') or '-'))
+" "${1:-}"
+}
+
+cmd_images() { # [region] -> "<family> <version> <id>", newest first
+  req GET /images | python3 -c "
+import json,sys
+want = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+rows = [i for i in json.load(sys.stdin)['data']
+        if want is None or (i.get('region') or {}).get('name') == want]
+seen = set()
+for i in sorted(rows, key=lambda x: (x.get('family') or '', x.get('version') or ''), reverse=True):
+    key = (i.get('family'), i.get('version'), (i.get('region') or {}).get('name'))
+    if key in seen: continue
+    seen.add(key)
+    print('%-22s %-16s %-16s %s' % (i.get('family'), i.get('version'),
+                                    (i.get('region') or {}).get('name') or '-', i.get('id')))
 " "${1:-}"
 }
 
@@ -221,6 +271,7 @@ case "${1:-}" in
   up)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl up <instance-type> [region]" >&2; exit 1; }; cmd_up "$2" "${3:-}" ;;
   ls)    cmd_ls ;;
   fs)    cmd_fs "${2:-}" ;;
+  images) cmd_images "${2:-}" ;;
   ip)    [[ $# -ge 2 ]] || { echo "usage: ./lambdactl ip <id|name>" >&2; exit 1; }; cmd_ip "$2" ;;
   down)  [[ $# -ge 2 ]] || { echo "usage: ./lambdactl down <id|name> | --all-named <name> | --all" >&2; exit 1; }; cmd_down "$2" "${3:-}" ;;
   reap)  cmd_reap "${2:-}" "${3:-}" ;;
