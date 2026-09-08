@@ -22,8 +22,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      # python3, not python: the agenttask grader shells out to `python3 -m pytest`
+      # (adapters/agenttask.py GRADER_PYTHON), so pytest must land in THAT interpreter.
+      # They coincide under setup-python, but installing into the one that does not grade
+      # is exactly the class of mismatch AI-3155 was about.
       - name: Install (pytest is the agenttask grader)
-        run: python -m pip install --quiet pytest
+        run: python3 -m pip install --quiet pytest
 
       - name: Shell syntax
         shell: bash
@@ -50,6 +54,24 @@ jobs:
           import harness.adapters as A
           assert not A.IMPORT_ERRORS, A.IMPORT_ERRORS
           print('adapters:', sorted(A.ADAPTERS))"
+
+      # AI-3155 regression guard. The defect was preflight and the grader disagreeing about
+      # which interpreter runs the hidden tests: preflight probed sys.executable, the grader
+      # shelled out to a hardcoded `python`. Preflight passed, then every attempt died
+      # rc=127 at grade time — on a rented GPU, after the agent loop had already run.
+      # Asserting the two agree is cheap; rediscovering it at $3.29/hr is not.
+      - name: Grader interpreter is the one preflight probes
+        run: |
+          python3 -c "
+          from harness.adapters import agenttask as a
+          head = a.DEFAULT_TEST_CMD.split()[0]
+          assert head == a.GRADER_PYTHON, (
+              'DEFAULT_TEST_CMD invokes %r but GRADER_PYTHON is %r' % (head, a.GRADER_PYTHON))
+          names = [n for n, _, _ in a.grading_requirements()]
+          assert any(a.GRADER_PYTHON in n for n in names), (
+              'grading_requirements() does not check %r: %s' % (a.GRADER_PYTHON, names))
+          assert a._pytest_version() is not None, 'pytest not runnable as %s -m pytest' % a.GRADER_PYTHON
+          print('grader interpreter:', a.GRADER_PYTHON, '/', a._grader_python_version())"
 
       - name: Leakage guard self-test
         run: python training/build_dataset.py --self-test
