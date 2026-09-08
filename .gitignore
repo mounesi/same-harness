@@ -17,6 +17,10 @@ prompt-preview.txt
 !**/SHA256SUMS
 !index.jsonl
 
+# Rendered figures are derived artefacts: one command (analysis/plots.py) regenerates them
+# byte-for-byte from the committed summary.json, so the PNGs themselves are not history.
+analysis/figures/
+
 # Python
 __pycache__/
 *.py[cod]

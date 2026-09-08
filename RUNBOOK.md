@@ -107,6 +107,17 @@ checksums, refuses to mix runs whose harness constants differ (`--allow-mixed` t
 loudly), excludes `flags.nonconformant` runs by default, and includes
 `flags.provenance_incomplete` runs with their cost columns marked approximate.
 
+Then turn the same report into figures — 1920x1080 PNGs, one per section of `summary.md`:
+
+```bash
+python3 -m pip install matplotlib          # the only non-stdlib dependency in the repo
+python3 analysis/plots.py --summary report/summary.json --out-dir report/figures
+```
+
+`plots.py` computes nothing: every number it draws is read out of the aggregator's report,
+so a figure cannot disagree with the table it came from. `--demo` renders watermarked
+sample figures if you want to settle chart design before spending anything.
+
 ---
 
 ## 2. What variables to set
@@ -207,6 +218,9 @@ trajectories, bundles, anything from the AgentTask suite beyond ids and counts.
 - `summary.md` — paste-ready tables: headline (cost per resolved), resolve rates with
   ranges, latency, tokens, failure taxonomy, comparability table
 - `summary.json`, `by_model_suite.csv`, `runs.csv`, `failures.csv`, `contamination.csv`
+- `figures/*.png` (`analysis/plots.py`) — cost per resolved task, resolve rate with the
+  pass-to-pass range, the failure-taxonomy breakdown, the Verified-vs-fresh slope, and a
+  one-square-per-instance grid; 1920x1080, light/dark, `--transparent` for compositing
 - the open-sourced repo itself: `modelctl`, `lambdactl`, `resultsctl`, the harness, the seed
   files and frozen partitions — enough for a reader to reproduce the exact subset and config
 
