@@ -34,6 +34,17 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS_D="$BASE_DIR/models.d"
 STATE_DIR="${STATE_DIR:-$BASE_DIR/.state}"
 PORT="${PORT:-8000}"
+# pip installs console scripts into ~/.local/bin, which is NOT on PATH for a
+# non-interactive `ssh host "cmd"` — the exact way CI and gpuctl invoke this script. An
+# interactive login shell sources ~/.profile and picks it up, so this failure appears only
+# in automation, only after the instance is billing, and reads as "vllm: No such file or
+# directory" with no hint that the binary is right there. Observed on the AI-P167 shakedown
+# 2026-09-07: it cost one download cycle. Put the user bin dir on PATH before resolving.
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) PATH="$HOME/.local/bin:$PATH"; export PATH ;;
+esac
+
 VLLM_BIN="${VLLM_BIN:-vllm}"
 mkdir -p "$STATE_DIR"
 
@@ -87,7 +98,19 @@ cmd_download() {
   load_model "$1"
   mkdir -p "$MODEL_DIR"
   info "downloading $HF_REPO -> $MODEL_DIR (hf_transfer on)"
-  HF_HUB_ENABLE_HF_TRANSFER=1 hf download "$HF_REPO" --local-dir "$MODEL_DIR"
+  # Downloaded through the PYTHON API, not the `hf` CLI. Two reasons, both observed on a
+  # live instance (AI-P167 shakedown, 2026-09-07): the console script lands in
+  # ~/.local/bin, which is NOT on PATH for a non-interactive ssh command, and the CLI was
+  # renamed — huggingface_hub < 0.34 ships `huggingface-cli`, newer ships `hf`. Depending
+  # on either fact means `modelctl serve` dies with "hf: command not found" AFTER the
+  # instance is up and billing. The library entry point is stable across both.
+  # HF_REVISION, when the model env pins one, is what makes the weights reproducible.
+  HF_HUB_ENABLE_HF_TRANSFER=1 "${HARNESS_PYTHON:-python3}" - "$HF_REPO" "$MODEL_DIR" "${HF_REVISION:-}" <<'PYDL'
+import sys
+from huggingface_hub import snapshot_download
+repo, dest, rev = sys.argv[1], sys.argv[2], (sys.argv[3] or None)
+snapshot_download(repo_id=repo, local_dir=dest, revision=rev)
+PYDL
   info "done: $(du -sh "$MODEL_DIR" | cut -f1)"
 }
 
