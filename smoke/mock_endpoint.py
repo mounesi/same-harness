@@ -190,6 +190,17 @@ def main() -> int:
     ap.add_argument("--enable-auto-tool-choice", action="store_true")
     ap.add_argument("--tool-call-parser", default=None)
     args = ap.parse_args()
+    # Refuse half a configuration at startup rather than at the first request. Neither flag
+    # does anything alone here — the request gate below needs both — so a launch line with
+    # only one of them is a misconfiguration, and the cheapest place to see it is the
+    # launch. (This is the mock's own rule; no claim is made here about what vLLM's arg
+    # parser does with the same pair, which is not checkable from this repo.)
+    if args.enable_auto_tool_choice != bool(args.tool_call_parser):
+        sys.stderr.write(
+            "mock: --enable-auto-tool-choice and --tool-call-parser must be given "
+            "together; got enable=%s parser=%r\n" % (args.enable_auto_tool_choice, args.tool_call_parser)
+        )
+        return 2
     globals()["MODEL"] = args.model
     globals()["ENABLE_AUTO_TOOL_CHOICE"] = args.enable_auto_tool_choice
     globals()["TOOL_CALL_PARSER"] = args.tool_call_parser

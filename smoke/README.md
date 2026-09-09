@@ -9,7 +9,7 @@ Three pieces:
 
 | file | what it is |
 |---|---|
-| `mock_endpoint.py` | a fake OpenAI-compatible server. Speaks `/v1/models` and `/v1/chat/completions`, and drives a scripted read → edit → finish tool loop. `MOCK_MODE=solve\|noop\|flaky`. Tool calling is off unless started with `--enable-auto-tool-choice --tool-call-parser <name>`, exactly as in vLLM. |
+| `mock_endpoint.py` | a fake OpenAI-compatible server. Speaks `/v1/models` and `/v1/chat/completions`, and drives a scripted read → edit → finish tool loop. `MOCK_MODE=solve\|noop\|flaky`. Tool calling is off unless started with `--enable-auto-tool-choice --tool-call-parser <name>`, spelled as vLLM spells them; one without the other is refused at startup. |
 | `make_pack.py` | builds a synthetic 2-task AgentTask pack: a real python package with a real bug (`divide()` raises on a zero denominator) and real hidden tests. Written outside the repo — a data pack is task content, and CONTRACTS §7.4 keeps that out of git. |
 | `run-smoke.sh` | runs the whole path and asserts nine things about it. |
 
@@ -51,13 +51,19 @@ costume of a model result.
    way a mock can lie that matters — being *more permissive* than the thing it stands in
    for — and it cost a live GPU to find. The mock now takes the same two flags and refuses
    `"auto"` without them, with vLLM's own error string, and assertion 1 exercises both
-   directions.
+   directions. What that fixes is the mock. Whether a given `models.d` entry carries the
+   flags is a separate question this suite still cannot answer: on this branch six of the
+   seven entries do not, and the smoke is green.
 
 ## What it asserts
 
 1. mock endpoint answers `/v1/models` — run.sh preflight tier 1 — and, launched *without*
-   the tool-calling flags, refuses the payload `harness/agent.py` actually builds with the
-   same HTTP 400 vLLM gives (the negative test: proof the net has no hole here)
+   the tool-calling flags, refuses the request envelope `harness/agent.py` actually builds
+   (from `LLMClient._payload`, so it cannot drift from the loop) with the same HTTP 400
+   vLLM gives. That is the negative test, and its scope is the mock: it proves the mock is
+   no longer more permissive than vLLM here. It does **not** check a real serve line — the
+   smoke never launches vLLM, and writes its own profile with `EXTRA_ARGS=""` — so a
+   `models.d` entry missing the flags still passes this suite.
 2. the manifest builds and every REQUIRED provenance field resolves — tier 2
 3. grading dependencies are present — tier 3
 4. attempts execute; one record per attempt in `results.jsonl`
