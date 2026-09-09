@@ -22,6 +22,7 @@ __all__ = [
     "Verdict",
     "GraderError",
     "PARTITIONS",
+    "PROMPT_VARIABLE_SOURCES_KEY",
     "canonical_json",
     "canonical_sha256",
 ]
@@ -32,6 +33,20 @@ __all__ = [
 _SLOTS: Dict[str, bool] = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 PARTITIONS = ("train", "dev", "final_holdout", "unpartitioned")
+
+#: The one key in ``Task.metadata`` the harness reads back (CONTRACTS.md §5.1): a map from
+#: a §5.2 prompt variable name to the name of the place that supplied its value. It lives
+#: here, in the module both the adapters and the agent loop already import, so the writer
+#: and the reader cannot drift apart on the spelling — a divergence would silently record
+#: ``{}`` on every attempt, which reads as "this adapter declares no sources" rather than
+#: as a bug.
+#:
+#: Why it exists: ``prompt_template_id`` and ``prompt_dir_sha256`` pin the TEMPLATE, not the
+#: values substituted into it. Those resolve per instance, from places the harness does not
+#: hash — a dataset column that a mirror renames, or a third-party constants table that a
+#: release repackages. When one of them answers differently, every model reads a different
+#: prompt and every provenance hash in the manifest stays identical (AI-3162).
+PROMPT_VARIABLE_SOURCES_KEY = "prompt_variable_sources"
 
 
 def canonical_json(obj: Any) -> str:

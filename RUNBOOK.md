@@ -55,9 +55,18 @@ install pinned deps → `modelctl serve` → `harness/run.sh` (3 passes) → pac
 the cost ledger → **tear the instance down in an `if: always()` step**. Only one GPU job
 runs at a time (`concurrency: gpu-run`).
 
-Run **`qwen3-coder-next` on `swebench-verified` first.** It is the cheapest model (~$2.49/hr)
-and exists to shake down the real path — weights download, vLLM at TP=1, docker grading —
-before anything expensive.
+Shake the paid path down cheaply before anything expensive — weights download, vLLM boot,
+docker grading, teardown, cost ledger. That is what `models.d/shakedown-qwen30b.env` exists
+for (`TP=1`, `gpu_1x_h100_pcie`, 329¢/hr in `pricing/fallback-prices.json`). It is
+deliberately not a study model and it is **not** in the `model` options above, so today it
+runs by hand (§1.4), not from this dispatch.
+
+`qwen3-coder-next` is **not** that shakedown any more. Its env file sets `TP=2` /
+`gpu_2x_h100_sxm5` — see the registry section of README.md for the arithmetic — and its
+FP8-vs-BF16 question is still open, so the "cheapest model at ~$2.49/hr, vLLM at TP=1" this
+paragraph used to say was wrong on the price, the instance type and the TP.
+
+`minimax-m3` is currently unlaunchable (see `models.d/minimax-m3.env`): do not dispatch it.
 
 ### 1.4 A benchmark run — by hand (on a Lambda instance)
 
@@ -68,7 +77,13 @@ export LAMBDA_API_KEY=... LAMBDA_FS=...
                                                # you for 6 h, ships the repo, starts vLLM
 ./gpuctl ssh
 
-# on the instance
+# on the instance — everything gpuctl installed is in the hermetic venv (~/$VENV_NAME,
+# default harness-venv; change the two paths below if you overrode it), and nothing is in
+# the image's python3: the harness modules need the locked deps, and the agenttask grader
+# shells out to `python3 -m pytest`, so put the venv first and pin run.sh's own driver.
+# benchmark.yml exports exactly these two on its harness step; without them run.sh fails
+# preflight (exit 3) with the stack sitting installed next to it.
+export PATH="$HOME/harness-venv/bin:$PATH" HARNESS_PYTHON="$HOME/harness-venv/bin/python"
 ./harness/run.sh --model kimi-k3 --suite swebench-verified --passes 3 --out ~/results
 ./resultsctl package ~/results/runs/<run_id>    # run_id is field 2 of the RUN line run.sh prints
 ./resultsctl upload dist/<run_id>.tar.gz && ./resultsctl index dist/<run_id>.tar.gz
@@ -76,6 +91,22 @@ export LAMBDA_API_KEY=... LAMBDA_FS=...
 # your machine
 ./gpuctl down
 ```
+
+**"Command not found", and it is installed.** This is the project's most expensive
+recurring failure: the program is present, and invisible only because its directory is not
+on PATH for a non-interactive `ssh host "cmd"` (which never sources `~/.profile`). It has
+killed four live-GPU runs — the grader's `python` (AI-3155), the `hf` CLI and the `vllm`
+binary (both AI-3157), and `ninja`, which vLLM's FlashInfer JIT execs during *engine
+startup*, after the weights are resolved (AI-P167 shakedown, 2026-09-07 — fixed directly in
+`modelctl`, no ticket). `modelctl serve` now asserts every program a launch will exec
+**before** it downloads anything, and `./modelctl preflight <model>` runs that same check on
+its own in a second. A refusal names where the missing program actually is.
+
+Two things it deliberately does *not* do. `ninja` is **advisory**: nothing in this repo pins
+it, so a missing `ninja` warns and continues rather than refusing (`MODELCTL_SKIP_LAUNCH_PREFLIGHT=1`
+turns the whole check off if you need it). And the preflight proves only that programs
+*resolve* — GPU, driver/CUDA match and vLLM's own import are checked separately, by
+`./gpuctl up --serve`. Case notes and the functions: `lib/pathguard.sh`.
 
 **The instance turns itself off if you forget.** It lives only while leased or while a harness
 process is running; `./gpuwatch` (CI, every 15 min) terminates it otherwise. Running long?
@@ -143,7 +174,7 @@ sample figures if you want to settle chart design before spending anything.
 | variable | `LAMBDA_FS` | name of the persistent filesystem holding `models/` |
 | variable | `VLLM_VERSION` | exact pinned vLLM version, e.g. `0.11.0` |
 
-### 2.3 Harness — environment variables read by `run.sh` / `agent.py` / `manifest.py`
+### 2.3 Harness — environment variables read by `run.sh` / `agent.py` / `manifest.py` (and `modelctl`)
 
 | variable | default | when to set |
 |---|---|---|
@@ -158,6 +189,8 @@ sample figures if you want to settle chart design before spending anything.
 | `HARNESS_ALLOW_NETWORK=1` | off | allow the HfApi weight-revision lookup |
 | `HARNESS_SKIP_WEIGHT_DIGEST=1` | off | skip hashing the weights tree — marks `nonconformant` |
 | `HARNESS_SKIP_GRADING_PREFLIGHT=1` | off | start even though this host cannot grade — you will get `INFRA_GRADER` on every attempt |
+| `MODELCTL_SKIP_LAUNCH_PREFLIGHT=1` | off | `modelctl serve/switch/preflight`: launch even though a program a launch execs is missing — it then surfaces at engine startup, after the weights. A missing `ninja` already only warns, so you should rarely need this |
+| `VLLM_BIN` / `HARNESS_PYTHON` | `vllm` / `python3` | absolute paths into a venv are fine: `modelctl` puts their bin dir on PATH, because a console script does not (`lib/pathguard.sh`) |
 
 ### 2.4 The held constants — `harness/agent_config.json` (do not change per model)
 
@@ -242,15 +275,23 @@ and ~1–2 h of setup (weights download + vLLM load) per dispatch. Per-hour bill
 
 | model | instance | $/hr | est. hours | est. run cost |
 |---|---|---|---|---|
-| qwen3-coder-next | 1× H100 PCIe | 2.49 | 15 | **~$40** |
-| minimax-m3 | 4× H100 SXM | 15.96 | 15 | **~$240** |
-| deepseek-v4-flash | 8× H100 SXM | 23.92 | 15 | **~$360** |
-| glm-5.3 *(blocked on weights)* | 8× B200 | 39.92 | 15 | **~$600** |
-| kimi-k3 | 8× B200 | 39.92 | 15 | **~$600** |
-| **Phase 1 total, 5 models** | | | | **~$1,850** + setup ~$150 = **~$2,000** |
-| qwen3.8-max *(reserve; multi-node, not CI-supported)* | 2× 8× B200 | ~80 | 18 | ~$1,450 |
+| qwen3-coder-next | 2× H100 SXM | 8.38 | 15 | **~$126** |
+| minimax-m3 *(UNLAUNCHABLE — see models.d/minimax-m3.env)* | 8× H100 SXM | 31.92 | 15 | **~$479** |
+| deepseek-v4-flash | 8× H100 SXM | 31.92 | 15 | **~$479** |
+| glm-5.3 *(weights are out; Phase 1 vs reserve is a scheduling call)* | 8× B200 | 53.52 | 15 | **~$803** |
+| kimi-k3 | 8× B200 | 53.52 | 15 | **~$803** |
+| **Phase 1 total, 5 models** | | | | **~$2,456** + setup ~$150 = **~$2,600** |
+| qwen3.8-max *(reserve; multi-node, not CI-supported)* | 2× 8× B200 | 107.04 | 18 | ~$1,927 |
 
-Against the **$7,500 Lambda credit** (expires ~Aug 2027), the allocation is:
+The `instance` column is each model's `INSTANCE_TYPE` from `models.d/<model>.env`; the `$/hr`
+column is that type's rate in `pricing/fallback-prices.json` (2026-09-09), × 2 nodes for
+qwen3.8-max. `est. run cost` is rate × est. hours, rounded. The setup line is a carry-over
+estimate that has not been re-derived against the new rates — treat it as a floor.
+
+Against the **$7,500 Lambda credit** (expires ~Aug 2027), the allocation below still reflects
+the pre-2026-09-09 rates and **has not been re-planned**. Phase 1 alone rose from ~$1,833 to
+~$2,456 (rate refresh, plus qwen3-coder-next moving from 1× H100 PCIe to 2× H100 SXM5), so the
+$500 buffer no longer covers the gap and the split needs a human decision:
 
 | item | budget |
 |---|---|

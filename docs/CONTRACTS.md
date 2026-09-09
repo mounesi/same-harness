@@ -104,7 +104,7 @@ Unknown flags are a usage error. Flags are order-independent. `--` terminates fl
 | `0` | ok | Every planned attempt was executed and graded; `results.jsonl` complete; `SHA256SUMS` written; manifest `status = "complete"`. **Tasks failing to resolve is a normal `0`.** |
 | `1` | usage | Bad/missing/conflicting flags. Nothing written. |
 | `2` | config | Unknown model or suite, missing/invalid seed file, seed-file checksum mismatch, partitions file invalid, prompt directory missing. Nothing written. |
-| `3` | preflight | Endpoint unreachable/unhealthy, served model name ≠ `--model`, weights directory missing, provenance value that is `REQUIRED` in §2 could not be resolved, or a grading dependency (docker, the suite's evaluation module) is missing on this host — detected before the first model call; `HARNESS_SKIP_GRADING_PREFLIGHT=1` overrides. Also raised by `harness.agent run` when the adapter's live `environment_digest()` disagrees with the manifest (§2.3 — a grader or dataset upgrade across `--resume`). On a FRESH run the manifest is written with `status = "failed"`; a `--resume` refused at preflight has executed nothing and leaves `run-manifest.json` and `SHA256SUMS` exactly as found (§2.3: a resume may only advance status) — it only prints `RUN … failed`. |
+| `3` | preflight | Endpoint unreachable/unhealthy, served model name ≠ `--model`, weights directory missing, provenance value that is `REQUIRED` in §2 could not be resolved, a program the run itself execs by name is not on PATH (currently `curl`, the only way the script talks to the endpoint — asserted first so that a `curl` off PATH is not reported as an unreachable endpoint), or a grading dependency (docker, the suite's evaluation module) is missing on this host — detected before the first model call; `HARNESS_SKIP_GRADING_PREFLIGHT=1` overrides the grading-dependency case only. Also raised by `harness.agent run` when the adapter's live `environment_digest()` disagrees with the manifest (§2.3 — a grader or dataset upgrade across `--resume`). On a FRESH run the manifest is written with `status = "failed"`; a `--resume` refused at preflight has executed nothing and leaves `run-manifest.json` and `SHA256SUMS` exactly as found (§2.3: a resume may only advance status) — it only prints `RUN … failed`. |
 | `4` | incomplete | Started, aborted mid-flight (SIGTERM, host loss, unrecoverable server error). `results.jsonl` holds whatever completed; manifest `status = "incomplete"`. Re-runnable with `--resume`. |
 | `5` | grading | More than 2% of attempts ended `INFRA_GRADER`, or the grader environment could not be constructed. Manifest `status = "incomplete"`, `flags.grading_degraded = true`. |
 | `130` | interrupt | SIGINT. Same on-disk state as `4`. |
@@ -423,7 +423,7 @@ and every `results.jsonl` record's `grade` block carries the same value (§3).
 | `nvidia_driver` | string \| null | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` (first line) |
 | `cuda_runtime` | string \| null | `nvidia-smi` header, or `torch.version.cuda` |
 | `pip_freeze_sha256` | hex | sha256 of `env/pip-freeze.txt`, itself `python3 -m pip freeze --all` sorted |
-| `requirements_lock_sha256` | hex \| null | sha256 of `harness/requirements.lock` (fully pinned, hash-pinned); `null` sets `flags.provenance_incomplete` |
+| `requirements_lock_sha256` | hex \| null | sha256 of `harness/requirements.lock` (every line an exact `==` pin; **not** hash-pinned, and see that file's header for what the pins are and are not evidence of); `null` sets `flags.provenance_incomplete` |
 | `tensor_parallel_size`, `pipeline_parallel_size`, `max_model_len`, `extra_args`, `multinode` | int/string/bool | sourced from `models.d/<model>.env` with `modelctl`'s defaults (`TP=1 PP=1 MAX_MODEL_LEN=262144 EXTRA_ARGS="" MULTINODE=0`). `extra_args` is a **blocking comparability key** in `aggregate.py`; if it contains `--max-model-len` or `--served-model-name` the build sets `flags.nonconformant` with reason `EXTRA_ARGS overrides a held-constant serving flag` (`modelctl` appends `$EXTRA_ARGS` *before* those flags, so the study values still win on the command line — the run is flagged, not silently corrected) |
 | `vllm_argv` | string \| null | the single line `modelctl` writes to `$STATE_DIR/vllm-argv` when it launches the server, copied into `<run_dir>/env/vllm-args.txt`; `null` if unavailable, which sets `flags.provenance_incomplete` |
 
@@ -607,6 +607,21 @@ other passes, other error codes, malformed or foreign lines — is preserved byt
   "partition": "train",
   "model": "qwen3-coder-next",
   "pass_idx": 0,
+  "sampling": {
+    "base_seed": 20260830,
+    "seed": 20260830,
+    "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
+    "temperature": 0.0
+  },
+  "prompt": {
+    "template_id": "agent-v1",
+    "prompt_sha256": "3f1c8a0d5e6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f",
+    "variable_sources": {
+      "problem_statement": "dataset_column:problem_statement",
+      "repo": "dataset_column:repo",
+      "test_cmd": "swebench_constants"
+    }
+  },
   "started_at": "2026-08-30T14:22:19Z",
   "ended_at": "2026-08-30T14:29:11Z",
   "wall_clock_ms": 412330,
@@ -671,6 +686,7 @@ other passes, other error codes, malformed or foreign lines — is preserved byt
 | `partition` | enum | `train` \| `dev` \| `final_holdout` \| `unpartitioned`, resolved from `partitions.json` at load time |
 | `pass_idx` | int | 0-based, `0 <= pass_idx < passes` |
 | `sampling` | object | `{base_seed, seed, seed_derivation, temperature}` — what was actually sent for this attempt. `base_seed` MUST equal the manifest's `inference.seed`. Decoding is greedy (`temperature` 0.0), so `seed == base_seed` for every pass: the passes are not independent samples and MUST be reported as mean + min/max range, never a bootstrap CI over passes. |
+| `prompt` | object | `{template_id, prompt_sha256, variable_sources}` — provenance for the prompt this attempt actually sent. `template_id` MUST equal the manifest's `harness.prompt_template_id`. `prompt_sha256` is the §5.2 value (`null` only when the attempt died before the prompt was rendered). `variable_sources` is `{variable name: source name}` copied verbatim from the task's `metadata.prompt_variable_sources` (§5.1) — one entry per §5.2 template variable, so `{}` means the record came from an adapter that predates the §5.1 rule, not that the values had no source. **Why it is here:** `prompt_template_id` and `prompt_dir_sha256` pin the TEMPLATE; the values substituted into it are per instance and resolve independently. SWE-bench's `test_cmd` comes from the dataset row, else the installed swebench constants table, else a generic fallback — so a dependency that repackages that table (5.x dropped `MAP_REPO_VERSION_TO_SPECS`) changes the prompt every model reads while every hash in the manifest stays identical. `prompt_sha256` shows that the bytes differ; `variable_sources` shows which resolution rung is responsible. |
 | `wall_clock_ms` | int | `ended_at - started_at`, includes grading AND any time the attempt waited for a grading slot (grading runs on its own pool, `HARNESS_GRADE_CONCURRENCY`, so the GPU-bound loop is never blocked by docker/tests). Per-attempt `cost.usd` is therefore contention-inclusive; the headline cost is run-level (§8) and unaffected. |
 | `resolved` | bool | suite-defined success. `resolved == true` **implies** `error_code == "OK"`; the converse does not hold (`OK` + `resolved:false` is impossible — use `TESTS_FAIL`; see §4) |
 | `error_code` | enum | closed enum from §4. Never free text. |
@@ -805,13 +821,39 @@ class Task:
     pass_to_pass: tuple[str, ...] # test node ids that must stay green
     environment: dict             # {"image": "...", "setup_cmds": [...], "test_cmd": "..."}
     partition: str                # "train"|"dev"|"final_holdout"|"unpartitioned"
-    metadata: dict                # suite-specific, JSON-serializable, never read by the harness
+    metadata: dict                # suite-specific, JSON-serializable; the harness never
+                                  # BRANCHES on it. One reserved key is copied out — see below
     source_sha256: str            # sha256 of the canonical JSON of the upstream task record
 ```
 
 Rules: `problem_statement` is passed through unmodified — no suite-specific preambles, no hints, no
 formatting differences between suites. Anything an adapter wants to add goes in `metadata` and is
 ignored by the prompt.
+
+**Reserved metadata key `prompt_variable_sources`.** `{variable name: source name}`, both strings.
+It is the only key the harness reads: `harness/agent.py` copies it into every attempt record's
+`prompt.variable_sources` (§3.1) and does nothing else with it — no harness behaviour may depend on
+`metadata`, and this key does not change that.
+
+An adapter MUST supply one entry for **every** §5.2 prompt variable it passes to `render()`, naming
+the place that answered. Every variable, not only the obviously multi-source ones: "this one always
+comes from the same place" is exactly the claim that stops being true without anyone noticing, and a
+map covering all of them is a map a reader can check against the template instead of against an
+adapter's judgement. Source names are the adapter's own closed vocabulary, listed next to the
+resolution code (`_swebench.TEST_CMD_SOURCES`, `REPO_SOURCES`, `PROBLEM_STATEMENT_SOURCES`;
+`agenttask.TEST_CMD_SOURCES` and friends), and they are compared across runs, so an adapter may not
+change a spelling without treating it as a raw-result change.
+
+`test_cmd` on both SWE-bench suites is the case that forced this: it resolves from an explicit
+dataset column, else `swebench.harness.constants.MAP_REPO_VERSION_TO_SPECS`, else the row's
+`test_directives`, else a constant fallback. Those are four different prompts for one template.
+`repo` and `problem_statement` are the same shape one step quieter — each is read from the first of
+several column spellings, so a mirror that publishes `issue_text`, or drops `repo` (which then
+renders as `prompts.EMPTY_VALUE`), also rewrites the prompt. `prompt_template_id`,
+`prompt_dir_sha256`, `adapter_sha256` and `adapters_dir_sha256` all hash the harness, and none of
+them moves when the *dataset* or the *dependency* supplying a value changes — swebench 5.x removed
+that table — so without this key the prompt silently changes and the run's own provenance says
+nothing happened.
 
 ### 5.2 `Prompt`
 
@@ -1127,6 +1169,10 @@ for a one-time cache miss. State this in the paper.
 - [ ] `runtime.vllm_argv` is non-null for a run against a server started by `./modelctl serve`
 - [ ] every `results.jsonl` line validates against §3 and carries an `error_code` from §4
 - [ ] `patch.ref` / `trajectory.ref` are relative and resolve inside the run dir
+- [ ] every `results.jsonl` line carries a `prompt.variable_sources` entry for each §5.2 template
+      variable (`problem_statement`, `repo`, `test_cmd`), and the per-instance values match the run
+      it is being compared against — two runs that disagree on any of them sent different prompts
+      under an identical template (§3.1, §5.1)
 - [ ] `resultsctl verify` passes on a freshly packaged bundle
 - [ ] `build_dataset.py` exits `3` on a mutated `partitions.json` and on any holdout id
 - [ ] `manifest.py build` exits `2` on a seed file without `instance_ids_sha256` and on a

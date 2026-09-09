@@ -61,7 +61,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from harness.types import GraderError, Prompt, Task, Verdict  # noqa: E402
+from harness.types import (  # noqa: E402
+    PROMPT_VARIABLE_SOURCES_KEY,
+    GraderError,
+    Prompt,
+    Task,
+    Verdict,
+)
 
 # `harness.prompts` is imported lazily, inside the two functions that need it, so a broken
 # prompt directory surfaces as a prompt error at render time rather than as an unimportable
@@ -108,6 +114,23 @@ DEFAULT_SETUP_TIMEOUT_S = 1800
 TIMEOUT_SCOPE = "per_attempt_batch"  # recorded in Verdict.raw["timeout_scope"]
 DETAIL_MAX = 512
 OUTPUT_TAIL_CHARS = 2000
+
+# Provenance for the three §5.2 prompt variables this adapter supplies (CONTRACTS §5.1).
+# `test_cmd` is the one that resolves from two places — the pack record's
+# `environment.test_cmd`, else DEFAULT_TEST_CMD — and it is substituted INTO the fixed
+# template, so a pack that starts or stops carrying that field changes the prompt every
+# model reads while prompt_template_id, prompt_dir_sha256 and every adapter hash stay
+# identical. `source_sha256` and environment_digest do cover those bytes, but neither says
+# WHICH of the two answered for a given task, which is what a cross-run comparison needs.
+# `repo` and `problem_statement` come from the task record or not at all; they are recorded
+# too, so a reader checks the map against the template rather than against this adapter's
+# judgement about which variables were worth reporting (AI-3162).
+SOURCE_TASK_RECORD = "task_record"          # the pack's task record supplied the value
+SOURCE_ADAPTER_DEFAULT = "adapter_default"  # DEFAULT_TEST_CMD, this module's constant
+SOURCE_ABSENT = "absent"                    # nothing supplied it; renders as EMPTY_VALUE
+TEST_CMD_SOURCES = (SOURCE_TASK_RECORD, SOURCE_ADAPTER_DEFAULT)
+REPO_SOURCES = (SOURCE_TASK_RECORD, SOURCE_ABSENT)
+PROBLEM_STATEMENT_SOURCES = (SOURCE_TASK_RECORD,)  # a record without one is rejected
 
 
 class AgentTaskDataError(RuntimeError):
@@ -364,10 +387,15 @@ def _build_task(
         raise AgentTaskDataError(f"task {iid}: hidden_tests.path is missing")
 
     env_in = dict(record.get("environment") or {})
+    # One read, one truthiness test: the recorded source must describe the command
+    # actually stored, not a second guess at how it was chosen.
+    test_cmd_in = env_in.get("test_cmd")
+    test_cmd = test_cmd_in or DEFAULT_TEST_CMD
+    test_cmd_source = SOURCE_TASK_RECORD if test_cmd_in else SOURCE_ADAPTER_DEFAULT
     environment = {
         "image": env_in.get("image", ""),
         "setup_cmds": list(env_in.get("setup_cmds") or []),
-        "test_cmd": env_in.get("test_cmd") or DEFAULT_TEST_CMD,
+        "test_cmd": test_cmd,
         "runner": env_in.get("runner", "pytest"),
         "report_json": env_in.get("report_json"),
         "test_timeout_s": int(env_in.get("test_timeout_s", DEFAULT_TEST_TIMEOUT_S)),
@@ -377,8 +405,10 @@ def _build_task(
         raise AgentTaskDataError(f"task {iid}: unknown runner {environment['runner']!r}")
 
     qualified_id = f"{SUITE_NAME}::{iid}"
-    # metadata is adapter-private and never read by the harness (CONTRACTS.md §5.1). It
-    # deliberately carries no task text — only the pointers grade() needs.
+    repo = record.get("repo", "") or ""
+    # metadata is adapter-private, and the harness BRANCHES on none of it (CONTRACTS.md
+    # §5.1). It deliberately carries no task text — only the pointers grade() needs, plus
+    # the one reserved key the harness copies verbatim onto every attempt record.
     metadata = {
         "consent_class": CONSENT_CLASS,
         "data_dir": str(data_dir),
@@ -387,13 +417,18 @@ def _build_task(
         "hidden_tests": hidden,
         "labels": list(record.get("labels") or []),
         "origin": record.get("origin", "internal/agenttask"),
+        PROMPT_VARIABLE_SOURCES_KEY: {
+            "problem_statement": SOURCE_TASK_RECORD,
+            "repo": SOURCE_TASK_RECORD if repo else SOURCE_ABSENT,
+            "test_cmd": test_cmd_source,
+        },
     }
 
     return Task(
         suite=SUITE_NAME,
         instance_id=iid,
         qualified_id=qualified_id,
-        repo=record.get("repo", "") or "",
+        repo=repo,
         base_commit=snapshot.get("base_commit", "") or "",
         problem_statement=problem,
         fail_to_pass=f2p,

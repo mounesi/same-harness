@@ -53,7 +53,8 @@
 # further suite of --suite all is started; the exit code is 130 / 4.
 #
 # Preflight is three tiers, all of them before the first model call:
-#   1. endpoint    GET $endpoint/models answers, and serves exactly --model
+#   1. endpoint    `curl` resolves (lib/pathguard.sh — a curl off PATH otherwise reads as a
+#                  dead server), GET $endpoint/models answers, and serves exactly --model
 #   2. provenance  every REQUIRED field of §2 resolves (manifest build)
 #   3. grading     the selected adapter's environment_digest() answers and the grader it
 #                  names is actually installed here (docker, the eval module). Without this
@@ -92,6 +93,13 @@ STATE_DIR="${STATE_DIR:-$REPO_DIR/.state}"
 case "$STATE_DIR" in /*) ;; *) STATE_DIR="$(cd "$STATE_DIR" 2>/dev/null && pwd || echo "$PWD/$STATE_DIR")" ;; esac
 VLLM_ARGV_FILE="$STATE_DIR/vllm-argv"
 PY="${HARNESS_PYTHON:-python3}"
+
+# The guard for this repo's most expensive recurring failure: a program that is installed
+# and present but not on PATH for non-interactive execution. Four live-GPU runs have died
+# that way; lib/pathguard.sh has the case notes. Used below to name the missing program
+# instead of letting preflight tier 1 blame the endpoint for it.
+# shellcheck source=../lib/pathguard.sh
+. "$REPO_DIR/lib/pathguard.sh"
 
 VALID_SUITES=(swebench-verified swebench-pro agenttask)
 
@@ -450,6 +458,17 @@ do_run() {
 
   # ---- preflight: the endpoint must be serving THIS model -----------------
   if [[ "$MODE" != "manifest-only" ]]; then
+    # curl is the ONLY way this script talks to the endpoint, so a curl that is installed
+    # but not on PATH does not merely fail — it fails as ENDPOINT UNREACHABLE below, and
+    # the operator goes and restarts a server that was never broken. That misdirection is
+    # the whole reason for lib/pathguard.sh (four live-GPU failures, same root cause); one
+    # `command -v` buys the right diagnosis before the banner can print the wrong one.
+    if ! pathguard_require "preflight tier 1 (the endpoint probe)" curl; then
+      if [[ -n "$RESUME" ]]; then abort_resume 3 "the endpoint probe cannot run on this host"; return 3; fi
+      build_manifest "$suite" "$seed_file" "$run_id" "$run_dir" "$passes" "" || true
+      finish_run failed 3
+      return "$FINISH_CODE"
+    fi
     info "preflight: GET $ENDPOINT/models"
     if ! ids="$(probe_endpoint)"; then
       cat >&2 <<EOF
