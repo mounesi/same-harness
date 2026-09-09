@@ -122,6 +122,26 @@ jobs:
       - name: gamespec floor check (reference implementation)
         run: python3 suites/gamespec/floor_check.py suites/gamespec/specs/racing-v1.reference.html
 
+      # AI-3159 regression guard. The harness agent loop sends tool_choice:"auto" on every
+      # call; vLLM answers HTTP 400 unless the server was started with BOTH
+      # --enable-auto-tool-choice and --tool-call-parser. No models.d entry had them, so
+      # every attempt for every model would have ended SERVER_ERROR at 0 iterations — and
+      # the smoke test could not catch it, because the mock endpoint accepts tool_choice
+      # "auto" without argument. A model added without a parser is unservable, so it fails
+      # here instead of on a rented GPU.
+      - name: Every model declares a tool-call parser
+        shell: bash
+        run: |
+          fail=0
+          for f in models.d/*.env; do
+            args=$(grep -E '^EXTRA_ARGS=' "$f" | head -1)
+            case "$args" in
+              *--enable-auto-tool-choice*--tool-call-parser*) echo "ok $f" ;;
+              *) echo "MISSING tool-calling flags: $f" >&2; fail=1 ;;
+            esac
+          done
+          exit "$fail"
+
       - name: Leakage guard self-test
         run: python training/build_dataset.py --self-test
 
