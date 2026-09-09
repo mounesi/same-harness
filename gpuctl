@@ -184,7 +184,18 @@ cmd_up() {
     # --no-xattrs: bsdtar on macOS records com.apple.provenance as an extended-header
     # keyword, and GNU tar on the instance prints a warning line for EVERY file it does
     # not recognise — ~30 lines that bury anything real in the upload output.
-    tar --no-xattrs -czf /tmp/gpuctl-repo.tgz -C "$HERE" --exclude=.git --exclude=.github --exclude=.state .
+    # .git SHIPS. harness/manifest.py resolves harness.repo_git_sha with `git rev-parse
+    # HEAD`, and that field is REQUIRED provenance (CONTRACTS.md §2) — not merely nice to
+    # have. Without it run.sh does not produce a nonconformant run, it refuses to start:
+    #     error: manifest: REQUIRED provenance could not be resolved: harness.repo_git_sha
+    #     manifest build failed (exit 3)
+    # So excluding .git made the entire by-hand path in RUNBOOK §1.4 incapable of running
+    # the harness at all, on any suite — discovered on the AI-P167 shakedown, after the
+    # instance was up, the stack installed and vLLM serving. benchmark.yml has always
+    # shipped the whole checkout for precisely this reason, with a comment saying so; the
+    # two paths simply disagreed, and only the CI one was ever exercised.
+    # It costs 2.5 MB.
+    tar --no-xattrs -czf /tmp/gpuctl-repo.tgz -C "$HERE" --exclude=.github --exclude=.state .
     scp -q /tmp/gpuctl-repo.tgz "$SSH_USER@$ip:~/"
     sshto "$ip" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo 2>/dev/null || tar -xzf ~/gpuctl-repo.tgz -C ~/harness-repo"
     assert_weights_mounted "$ip" "$weights_dir"
