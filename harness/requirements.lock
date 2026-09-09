@@ -4,24 +4,101 @@
 # dataset loading and grading. Their sha256 is recorded in every run manifest as
 # runtime.requirements_lock_sha256, so a dependency change is visible in the audit trail.
 #
-# Install on the GPU instance with:
-#   pip install --require-hashes -r harness/requirements.lock   (once hashes are filled in)
-#   pip install -r harness/requirements.lock                     (until then)
+# Install on the GPU instance in ONE pip pass:
+#   pip install "vllm==$VLLM_VERSION" hf_transfer -r harness/requirements.lock
+# Double quotes, not single — the version has to expand. That is the command `gpuctl`
+# install_stack runs (inside its hermetic venv); the reason for one pass is below.
+#
+# CAUTION — .github/workflows/benchmark.yml does NOT install this way. It runs
+# `pip install 'vllm==$VLLM_VERSION' hf_transfer` and then, as a SEPARATE pip pass,
+# `pip install -r harness/requirements.lock`, with bare pip and no venv. That is the
+# two-pass shape AI-P167 was about. While huggingface_hub was a `>=1.27.0` floor the
+# second pass was a no-op for it; now that it is an exact `==`, the second pass can
+# change what the first one resolved, with only a pip dependency-conflict warning to
+# show for it. Repairing that workflow is not this file's job and is not done here — but
+# until it is done, a CI run's env/pip-freeze.txt, not this file, is the record of what
+# CI installed.
 #
 # vLLM is NOT listed here: it is pinned separately via the VLLM_VERSION repo variable so the
 # serving stack and the harness stack can be upgraded independently, and its resolved
 # dist-info RECORD digest is what the manifest records.
 #
-# TODO(AI-2955): re-resolve on the first provisioned instance and freeze exact versions +
-# --hash entries. The pins below are the intended majors, not verified resolutions.
+# ---------------------------------------------------------------------------------------
+# PROVENANCE. This block replaces TODO(AI-2955) ("re-resolve on the first provisioned
+# instance and freeze exact versions + --hash entries; the pins below are the intended
+# majors, not verified resolutions"). Read each heading below literally: the sections
+# are separated because the claims in them are NOT equally well established.
+#
+#   IN-REPO EVIDENCE. Commit deb56ad records the AI-P167 shakedown on a provisioned
+#   instance against a live vLLM 0.28.0: the agent loop ran 15-16 tool-calling iterations
+#   and both smoke tasks graded resolved=True. That is the only end-to-end run this
+#   repository cites, and it ran the smoke / agenttask path, not a SWE-bench suite.
+#
+#   NOT IN THIS REPO. No run bundle, no run_id and no env/pip-freeze.txt exists anywhere
+#   in the tree, and so no run's pip_freeze_sha256 either (the one hex string in
+#   docs/CONTRACTS.md is an illustrative sample, not a run's). The three
+#   version numbers below were supplied by the operator of that instance; a future reader
+#   cannot re-derive them from this repository. Treat them as reported, not as attested,
+#   and do not read the manifest field names in this header as pointers to stored data.
+#
+#   RE-CHECKABLE WITHOUT AN INSTANCE, and re-checked against PyPI metadata on 2026-09-08:
+#       vllm 0.28.0     requires huggingface_hub>=1.27.0  (and transformers>=5.5.3)
+#       datasets 3.2.0  requires huggingface-hub>=0.23.0
+#       swebench 3.0.3  requires datasets, unconstrained
+#       huggingface_hub newest release on PyPI: 1.30.0
+#   so 1.30.0 is what a one-pass resolve of `vllm==0.28.0` plus this file selects, and
+#   writing it as `==` cannot make that pass unsatisfiable while VLLM_VERSION is 0.28.0.
+#   Re-run the first line with:
+#       curl -s https://pypi.org/pypi/vllm/0.28.0/json | grep -o 'huggingface_hub[^"]*'
+#   This is a resolvability check, not a provenance check. It says the pin is consistent
+#   with the declared dependencies; it does not say this set is what ran on any instance.
+#
+#   NOT ESTABLISHED — imports. Installing is not importing, and `pip freeze` records only
+#   what is installed. The agenttask adapter (harness/adapters/agenttask.py) imports
+#   neither `datasets` nor `swebench`; the harness's only `datasets` import is
+#   `_import_datasets` in harness/adapters/_swebench.py, on the SWE-bench path, and no
+#   swebench-verified or swebench-pro run has happened yet. So `datasets==3.2.0` and
+#   `swebench==3.0.3` are pins this project has never exercised, in this or any run.
+#   Nothing in this file should be read as saying the pairing is dataset-clean.
+#
+#   NOT hash-pinned, so no --require-hashes. --hash entries need per-wheel digests and
+#   `pip freeze` records versions only, so none is written here rather than invented. The
+#   per-run witness remains runtime.pip_freeze_sha256 next to requirements_lock_sha256.
+#   To close the gap, run `pip hash` over the downloaded wheels on a provisioned instance
+#   and paste the real digests.
+# ---------------------------------------------------------------------------------------
 
-datasets==3.2.0
 # Resolved together with vllm, never installed after it: a second pip pass silently
-# downgraded this to 0.27.1 under a vLLM that requires >=1.27.0 (AI-P167, 2026-09-07).
-# swebench stays on 3.0.x deliberately — 5.x drops MAP_REPO_VERSION_TO_SPECS, which
-# _swebench.py uses to build the test_cmd PROMPT variable, so bumping it silently
-# changes the prompt every model sees. See AI-3162 before touching that pin.
-huggingface_hub>=1.27.0
+# downgraded huggingface_hub to 0.27.1 under a vLLM that requires >=1.27.0 (AI-P167,
+# 2026-09-07). huggingface_hub was a `>=1.27.0` floor until this commit, which meant
+# requirements_lock_sha256 could be byte-identical across two runs that had installed
+# different hub versions — the one audit signal this file exists to give. It is exact
+# now. That exactness is tied to VLLM_VERSION=0.28.0: bumping vLLM means re-resolving
+# these two together, not force-installing around them.
+#
+# Bumping `datasets` is not free either: `datasets_version` is one of the fields hashed
+# into the SWE-bench environment_digest (harness/adapters/_swebench.py), and
+# analysis/aggregate.py lists harness.environment_digest in PER_SUITE_KEYS as BLOCKING.
+datasets==3.2.0
+huggingface_hub==1.30.0
 
 # SWE-bench official evaluation harness (grading). Docker is a system prerequisite.
+#
+# STAYS on 3.0.x, and not because 5.x crashes — because it does not. 5.x has no
+# MAP_REPO_VERSION_TO_SPECS at all (checked by unzipping both wheels from PyPI: 3.0.3
+# defines it under swebench/harness/constants/, 5.0.2 does not contain the name in any
+# .py file). `_resolve_test_cmd` in harness/adapters/_swebench.py imports that symbol
+# inside `except Exception: pass` to build the `test_cmd` PROMPT variable — the one
+# substituted into harness/prompts/user.md line 2. So a bump fails SOFT at the prompt
+# layer: the run completes, the test command every model is shown falls through to the
+# test_directives / `python -m pytest` fallback, and prompt_dir_sha256 and the template
+# id stay byte-identical either side. The prompt-hash provenance does not catch it.
+#
+# The manifest is not silent, though, and this is worth being exact about:
+# environment_digest hashes `grader_version` and `grader_record_sha256` of the `swebench`
+# distribution (_swebench.py; both suites set grader_distribution="swebench"), and
+# harness.environment_digest is a BLOCKING key in analysis/aggregate.py's PER_SUITE_KEYS
+# — so aggregating a 3.0.3 run with a 5.x run is refused without --allow-mixed. What a
+# bump costs you is not the flag; it is the ability to see from prompt_dir_sha256 that
+# the models were asked a different question. See AI-3162 before touching this pin.
 swebench==3.0.3
