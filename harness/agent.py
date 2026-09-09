@@ -70,6 +70,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from harness import prompts as prompt_pkg  # noqa: E402  (needs REPO_ROOT on sys.path)
+from harness.types import PROMPT_VARIABLE_SOURCES_KEY  # noqa: E402  (§5.1 reserved key)
 
 CONFIG_PATH = HARNESS_DIR / "agent_config.json"
 
@@ -1504,6 +1505,27 @@ def attempt_seed(base_seed: int, pass_idx: int) -> int:
     del pass_idx  # deliberately unused: see the docstring
     return base_seed
 
+
+def prompt_variable_sources(task: Any) -> dict:
+    """The §5.1 reserved map, normalised to `{str: str}` and sorted.
+
+    `PROMPT_VARIABLE_SOURCES_KEY` is imported from `harness.types` rather than spelled
+    here: the writer (the adapter) and this reader must agree on the string, and a
+    divergence would produce `{}` on every record — indistinguishable, to a reader, from
+    an adapter that declares no sources.
+
+    Never raises and never propagates adapter shapes: this is provenance, and a malformed
+    metadata block must cost a line of JSON, not an attempt.
+    """
+    try:
+        sources = (getattr(task, "metadata", None) or {}).get(PROMPT_VARIABLE_SOURCES_KEY)
+    except Exception:  # noqa: BLE001 — a Task whose metadata is not a mapping
+        return {}
+    if not isinstance(sources, dict):
+        return {}
+    return {str(k): str(v) for k, v in sorted(sources.items(), key=lambda kv: str(kv[0]))}
+
+
 def _verdict_field(verdict: Any, name: str, default: Any = None) -> Any:
     if isinstance(verdict, dict):
         return verdict.get(name, default)
@@ -1550,6 +1572,12 @@ class AttemptState:
         self.terminal_code: str | None = None
         self.detail = ""
         self.patch = ""
+        # Both stay None when the attempt died before build_prompt returned; the record
+        # then says so rather than implying a prompt that was never rendered. They are
+        # taken from the SAME Prompt object, so the two halves of the record's `prompt`
+        # block describe one render rather than one render and one module constant.
+        self.prompt_sha256: str | None = None
+        self.prompt_template_id: str | None = None
 
 
 def _append_log(path: Path, message: str) -> None:
@@ -1599,6 +1627,8 @@ def run_attempt_loop(ctx: RunContext, task: Any, pass_idx: int) -> AttemptState:
                 f"{prompt_pkg.TEMPLATE_ID!r}",
             )
         log(f"prompt {prompt.template_id} sha256={prompt.prompt_sha256}")
+        st.prompt_sha256 = prompt.prompt_sha256
+        st.prompt_template_id = prompt.template_id
 
         executor = build_workspace(task, st.slug, ctx.scratch_root)
         log(f"workspace ready: {type(executor).__name__} {executor.workdir} base={executor.base_sha[:12]}")
@@ -1814,6 +1844,26 @@ def run_attempt_grade(ctx: RunContext, st: AttemptState) -> dict:
             "seed": st.seed,
             "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
             "temperature": ctx.params["temperature"],
+        },
+        # Same reason as `sampling` above: the harness-constant claim, made checkable from
+        # the raw data. The template is pinned run-wide by prompt_template_id and
+        # prompt_dir_sha256, but the VALUES substituted into it are per instance and can
+        # degrade on their own — `test_cmd` resolves from the dataset row, else the
+        # installed swebench constants, else a generic fallback. `prompt_sha256` shows THAT
+        # the rendered bytes differ from another run's; `variable_sources` shows WHY, so a
+        # reviewer can tell a dataset difference from a dependency repackaging without
+        # re-rendering anything (CONTRACTS.md §3.1, §5.1).
+        #
+        # `template_id` comes from the Prompt that was actually rendered, like
+        # `prompt_sha256` beside it — one provenance block, one source. It falls back to
+        # the module constant only when no prompt was rendered at all, so the §3.1
+        # invariant (`template_id` equals the manifest's) holds on every line. The two
+        # spellings cannot disagree today: render() rejects a foreign id, and
+        # run_attempt_loop re-checks it above.
+        "prompt": {
+            "template_id": st.prompt_template_id or prompt_pkg.TEMPLATE_ID,
+            "prompt_sha256": st.prompt_sha256,
+            "variable_sources": prompt_variable_sources(task),
         },
         "started_at": iso(st.started_at),
         "ended_at": iso(ended_at),
@@ -2395,6 +2445,13 @@ def _fallback_record(ctx: RunContext, task: Any, pass_idx: int, exc: BaseExcepti
             "seed": attempt_seed(base_seed, pass_idx),
             "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
             "temperature": ctx.params["temperature"],
+        },
+        # The worker died, so no prompt was rendered — but the task was built, so the
+        # adapter's variable provenance is known and belongs on the record like any other.
+        "prompt": {
+            "template_id": prompt_pkg.TEMPLATE_ID,
+            "prompt_sha256": None,
+            "variable_sources": prompt_variable_sources(task),
         },
         "started_at": now,
         "ended_at": now,
