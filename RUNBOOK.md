@@ -68,7 +68,13 @@ export LAMBDA_API_KEY=... LAMBDA_FS=...
                                                # you for 6 h, ships the repo, starts vLLM
 ./gpuctl ssh
 
-# on the instance
+# on the instance — everything gpuctl installed is in the hermetic venv (~/$VENV_NAME,
+# default harness-venv; change the two paths below if you overrode it), and nothing is in
+# the image's python3: the harness modules need the locked deps, and the agenttask grader
+# shells out to `python3 -m pytest`, so put the venv first and pin run.sh's own driver.
+# benchmark.yml exports exactly these two on its harness step; without them run.sh fails
+# preflight (exit 3) with the stack sitting installed next to it.
+export PATH="$HOME/harness-venv/bin:$PATH" HARNESS_PYTHON="$HOME/harness-venv/bin/python"
 ./harness/run.sh --model kimi-k3 --suite swebench-verified --passes 3 --out ~/results
 ./resultsctl package ~/results/runs/<run_id>    # run_id is field 2 of the RUN line run.sh prints
 ./resultsctl upload dist/<run_id>.tar.gz && ./resultsctl index dist/<run_id>.tar.gz

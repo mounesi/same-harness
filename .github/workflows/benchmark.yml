@@ -42,11 +42,15 @@ jobs:
       LAMBDA_IMAGE: ${{ vars.LAMBDA_IMAGE }}
       VLLM_VERSION: ${{ vars.VLLM_VERSION }}
       INSTANCE_NAME: sh-ci-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
-      # Everything this job installs on the instance lives in ONE hermetic venv — the same
-      # one gpuctl's install_stack() builds (VENV_NAME, default harness-venv), so the CI
-      # path and the by-hand path in RUNBOOK §1.4 provision identically. Written absolute,
-      # not as ~: these paths are interpolated LOCALLY into ssh command strings, where the
-      # runner's HOME is not the instance's. The ssh user is hardcoded ubuntu here already.
+      # Everything this job installs on the instance lives in ONE hermetic venv, at the same
+      # path gpuctl's install_stack() builds (~/$VENV_NAME, gpuctl default harness-venv, ssh
+      # user ubuntu) — the "Derive instance type" step asserts that default still holds, so
+      # this hardcoded path cannot drift away from gpuctl's silently. The two paths install
+      # the same way; they do not RUN the same way — gpuctl stops at `modelctl serve` and
+      # never invokes the harness, so the harness step's PATH/HARNESS_PYTHON wiring below has
+      # no gpuctl counterpart (RUNBOOK §1.4 tells a human to export the equivalent).
+      # Written absolute, not as ~: these paths are interpolated LOCALLY into ssh command
+      # strings, where the runner's HOME is not the instance's.
       VENV: /home/ubuntu/harness-venv
       # WEIGHTS_DIR is NOT hardcoded here. Lambda mounts persistent filesystems at
       # /lambda/nfs/<name>, not under $HOME, and only the API knows the mount point — the
@@ -68,6 +72,19 @@ jobs:
           source "models.d/${{ inputs.model }}.env"
           [[ -n "${INSTANCE_TYPE:-}" ]] || { echo "models.d/${{ inputs.model }}.env has no INSTANCE_TYPE"; exit 1; }
           [[ "${MULTINODE:-0}" == "1" ]] && { echo "multi-node models are not CI-supported yet"; exit 1; }
+          # Everything from here to the end of this step is a CHEAP GATE: it runs on the
+          # runner, before `lambdactl up`, so a misconfiguration costs nothing. install_stack()
+          # checks VLLM_VERSION at install time because it runs on a box the operator already
+          # leased by hand; here the instance is not leased yet, so check it now — an unset
+          # repo variable must not cost a provision to discover.
+          [[ -n "${VLLM_VERSION:-}" ]] \
+            || { echo "::error::repo variable VLLM_VERSION is unset — the serving stack would be whatever the image carries and the run would not be reproducible"; exit 1; }
+          # The job env hardcodes VENV=/home/ubuntu/harness-venv; gpuctl parameterizes the
+          # same directory as ~/$VENV_NAME. Nothing connects the two strings, so assert the
+          # gpuctl default rather than assuming it: if it moves, this fails on the runner
+          # instead of leaving CI and the by-hand path on two different venvs.
+          grep -Fq 'VENV_NAME="${VENV_NAME:-harness-venv}"' gpuctl \
+            || { echo "::error::gpuctl's VENV_NAME default no longer reads harness-venv — VENV=$VENV in this workflow was chosen to match it. Update both together."; exit 1; }
           # Cheap gate BEFORE any instance is launched: the harness refuses placeholder
           # partitions (§6.2) — discovering that after provisioning an 8xB200 is dead money.
           python3 - <<'PY2'
@@ -132,8 +149,8 @@ jobs:
             || { echo "::error::'$MOUNT' is not a mount on the instance — the filesystem did not attach (region mismatch?). Refusing to download weights onto ephemeral disk."; exit 1; }
           ssh "ubuntu@$IP" "mkdir -p '$WEIGHTS_DIR'"
 
-          [[ -n "${VLLM_VERSION:-}" ]] \
-            || { echo "::error::repo variable VLLM_VERSION is unset — the serving stack would be whatever the image carries and the run would not be reproducible"; exit 1; }
+          # VLLM_VERSION was asserted in the "Derive instance type" step, before this
+          # instance existed — it cannot be empty here.
 
           # A HERMETIC venv: python3 -m venv, deliberately WITHOUT --system-site-packages.
           # This step used to `pip install` into the image's python. The Lambda image ships
@@ -155,8 +172,19 @@ jobs:
           # only a pip warning to show for it. Resolved together, an incompatibility is an
           # error here instead of a failure after the weights.
           # (grading dependencies are pinned in harness/requirements.lock — codex invariant 5)
-          ssh "ubuntu@$IP" "cd ~/harness-repo && $VENV/bin/pip install -q 'vllm==${VLLM_VERSION}' hf_transfer -r harness/requirements.lock" \
-            || { echo "::error::could not install the pinned stack — vllm==${VLLM_VERSION} and harness/requirements.lock may be mutually unsatisfiable. Resolve them together; do not install them in sequence."; exit 1; }
+          #
+          # pytest is named EXPLICITLY because it is not in that lock, and it is the
+          # agenttask grader: the adapter runs its hidden tests through a shell as
+          # `python3 -m pytest` (GRADER_PYTHON, harness/adapters/agenttask.py). Every other
+          # place in the repo installs it as its own step for the same reason (README.md,
+          # RUNBOOK.md §1.1, .github/workflows/ci.yml). Nothing did that on this instance,
+          # and a venv built without --system-site-packages cannot fall back on an
+          # image-provided one — so without this word the tier-3 grading preflight
+          # (grading_requirements() -> run.sh exit 3) refuses to start the run here, after
+          # the provision, the install, the weights and the vLLM load. Named in the SAME pip
+          # invocation so it is resolved WITH vLLM, not after it.
+          ssh "ubuntu@$IP" "cd ~/harness-repo && $VENV/bin/pip install -q 'vllm==${VLLM_VERSION}' hf_transfer pytest -r harness/requirements.lock" \
+            || { echo "::error::could not install the pinned stack — vllm==${VLLM_VERSION}, pytest and harness/requirements.lock may be mutually unsatisfiable. Resolve them together; do not install them in sequence."; exit 1; }
 
           # Fail here, cheaply, rather than after the weights load. Import vLLM's CUDA
           # platform module, not merely torch: with a force-installed cu128 torch,
@@ -216,12 +244,23 @@ jobs:
           # run that dies mid-flight still leaves the ids it already emitted.
           # The venv on PATH is load-bearing, not tidiness: the agenttask adapter grades by
           # running its hidden tests through a SHELL as `python3 -m pytest` (GRADER_PYTHON,
-          # harness/adapters/agenttask.py), so which interpreter grades is decided by PATH.
-          # With the system python3 first, pytest is not importable and the tier-3 grading
-          # preflight refuses to start the run — or, worse, every attempt grades TESTS_FAIL
-          # 0/N and publishes as a model result rather than as a broken host.
+          # harness/adapters/agenttask.py), so PATH decides which interpreter — and which
+          # pytest — grades. pytest is not in harness/requirements.lock, and nothing in this
+          # workflow puts it in the image's python3; the provision step above installs it
+          # into $VENV, and that venv is hermetic, so it cannot borrow one from the image
+          # either. $VENV/bin therefore has to come FIRST, so that `python3 -m pytest`
+          # resolves to the interpreter that has it. If it does not, the tier-3 grading
+          # preflight (grading_requirements() -> harness/run.sh exit 3) refuses to start the
+          # run; opted out of with HARNESS_SKIP_GRADING_PREFLIGHT=1, grade() then raises
+          # GraderError on every attempt instead — rc 127 / "No module named pytest" is
+          # caught explicitly (agenttask.py, "a runner that never ran is not a verdict"), so
+          # the whole run costs its GPU hours and produces no scored verdict at all.
           # HARNESS_PYTHON pins run.sh's own driver to the same interpreter regardless of
           # PATH order; the harness modules need the locked deps, which live only in the venv.
+          # Known consequence: the hidden tests now execute against the venv's packages
+          # instead of the image's /usr/lib/python3/dist-packages. environment_digest()
+          # records grader_python and the pytest version, but not the rest of what is
+          # importable, so that part of the grading environment is not in the audit trail.
           ssh "ubuntu@$IP" "cd ~/harness-repo && \
             PATH=$VENV/bin:\$PATH \
             HARNESS_PYTHON=$VENV/bin/python \
