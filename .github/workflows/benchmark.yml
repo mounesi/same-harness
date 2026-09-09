@@ -260,7 +260,9 @@ jobs:
           # Known consequence: the hidden tests now execute against the venv's packages
           # instead of the image's /usr/lib/python3/dist-packages. environment_digest()
           # records grader_python and the pytest version, but not the rest of what is
-          # importable, so that part of the grading environment is not in the audit trail.
+          # importable — so that part is missing from the DIGEST, not from the audit trail:
+          # run.sh writes env/pip-freeze.txt with this same interpreter (HARNESS_PYTHON) and
+          # the manifest carries its sha256 as runtime.pip_freeze_sha256.
           ssh "ubuntu@$IP" "cd ~/harness-repo && \
             PATH=$VENV/bin:\$PATH \
             HARNESS_PYTHON=$VENV/bin/python \

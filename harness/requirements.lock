@@ -9,15 +9,17 @@
 # Double quotes, not single — the version has to expand. That is the command `gpuctl`
 # install_stack runs (inside its hermetic venv); the reason for one pass is below.
 #
-# CAUTION — .github/workflows/benchmark.yml does NOT install this way. It runs
-# `pip install 'vllm==$VLLM_VERSION' hf_transfer` and then, as a SEPARATE pip pass,
-# `pip install -r harness/requirements.lock`, with bare pip and no venv. That is the
-# two-pass shape AI-P167 was about. While huggingface_hub was a `>=1.27.0` floor the
-# second pass was a no-op for it; now that it is an exact `==`, the second pass can
-# change what the first one resolved, with only a pip dependency-conflict warning to
-# show for it. Repairing that workflow is not this file's job and is not done here — but
-# until it is done, a CI run's env/pip-freeze.txt, not this file, is the record of what
-# CI installed.
+# CI installs the same way, as of this change. .github/workflows/benchmark.yml used to
+# run `pip install vllm hf_transfer` and then, as a SEPARATE pass, `pip install -r
+# harness/requirements.lock`, with bare pip and no venv — the two-pass shape that let the
+# second pass silently downgrade what the first resolved. It now builds the same hermetic
+# venv gpuctl does and installs everything in one resolution pass, so this file describes
+# CI's environment as well as gpuctl's.
+#
+# One thing this file still does not cover either way: pytest. It is the agenttask grader
+# and is installed by name alongside this lock, not from it — see the comment in gpuctl's
+# install_stack(). So env/pip-freeze.txt, not this file, remains the complete record of
+# what a given run installed.
 #
 # vLLM is NOT listed here: it is pinned separately via the VLLM_VERSION repo variable so the
 # serving stack and the harness stack can be upgraded independently, and its resolved

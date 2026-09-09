@@ -18,8 +18,9 @@
 #      400 vLLM gives, so the mock can no longer be MORE PERMISSIVE than the server it
 #      stands in for. Scope: this checks the mock, not any real serve line. The smoke
 #      never launches vLLM and writes its own profile with EXTRA_ARGS="" (below), so a
-#      models.d entry missing the flags still passes this suite — as six of the seven
-#      entries do on this branch. Covering that needs a check over models.d, not a mock.
+#      models.d entry missing the flags would still pass this suite. Covering that needs a
+#      check over models.d, not a mock — ci.yml has one ("Every model declares a tool-call
+#      parser"), and every entry carries the flags today.
 #   2. manifest builds and REQUIRED fields resolve                       (tier 2)
 #   3. grading preflight passes for the suite                            (tier 3)
 #   4. attempts execute and results.jsonl gets one record per attempt
