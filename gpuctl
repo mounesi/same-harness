@@ -97,8 +97,16 @@ install_stack() { # ip — build a HERMETIC venv and put the pinned stack in it
   # install silently downgrade a dependency out from under the first — that is how
   # huggingface_hub landed on 0.27.1 while vLLM required >=1.27.0, with only a pip
   # warning to show for it. Resolved together, an incompatibility is an error instead.
-  info "installing pinned stack: vllm==$VLLM_VERSION + harness/requirements.lock"
-  sshto "$ip" "cd ~/harness-repo && ~/$VENV_NAME/bin/pip install -q 'vllm==$VLLM_VERSION' hf_transfer -r harness/requirements.lock" \
+  # pytest is named explicitly: it is NOT in harness/requirements.lock, and it is the
+  # agenttask grader — that adapter runs its hidden tests through a shell as
+  # `python3 -m pytest` (GRADER_PYTHON, harness/adapters/agenttask.py). The rest of the repo
+  # installs it as its own step (README.md, RUNBOOK.md §1.1, .github/workflows/ci.yml);
+  # nothing does that on the instance, and this venv is hermetic, so it cannot fall back on
+  # an image-provided one. Without it `./harness/run.sh --suite agenttask` on this box fails
+  # tier-3 grading preflight (grading_requirements() -> exit 3) with the stack already
+  # installed. In the same resolution pass, so pip weighs it against vLLM's pins.
+  info "installing pinned stack: vllm==$VLLM_VERSION + harness/requirements.lock + pytest"
+  sshto "$ip" "cd ~/harness-repo && ~/$VENV_NAME/bin/pip install -q 'vllm==$VLLM_VERSION' hf_transfer pytest -r harness/requirements.lock" \
     || die "could not install the pinned stack — the pins in harness/requirements.lock and
        vllm==$VLLM_VERSION may be mutually unsatisfiable. Resolve them together, do not
        install them in sequence."
