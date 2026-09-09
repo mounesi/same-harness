@@ -101,6 +101,25 @@ DEFAULT_TEST_TIMEOUT_S = 1800
 #: Identical for both suites, so it cannot make the harness vary by suite.
 FALLBACK_TEST_CMD = "python -m pytest"
 
+#: The rungs `_resolve_test_cmd` tries, in order.  Which one answered is recorded
+#: per task and copied into every attempt record, because `test_cmd` is a value
+#: SUBSTITUTED INTO the prompt: when the rung changes, the bytes the model reads
+#: change while `prompt_template_id` and `prompt_dir_sha256` stay identical, so
+#: nothing in the existing provenance can tell the two runs apart.
+#:
+#: Not hypothetical.  swebench 5.x dropped `MAP_REPO_VERSION_TO_SPECS`; under the
+#: `except Exception` in `_resolve_test_cmd` that turns a real per-repo command
+#: ("./tests/runtests.py --verbosity 2 …") into the generic FALLBACK_TEST_CMD for
+#: every instance at once, with no diagnostic anywhere.  `harness/requirements.lock`
+#: pins swebench to 3.0.x for exactly this reason; this records what actually
+#: happened rather than trusting the pin (AI-3162).
+TEST_CMD_SOURCES = (
+    "dataset_column",      # the dataset row carried an explicit command
+    "swebench_constants",  # MAP_REPO_VERSION_TO_SPECS[repo][version]["test_cmd"]
+    "test_directives",     # FALLBACK_TEST_CMD + the row's test_directives
+    "fallback",            # FALLBACK_TEST_CMD alone — nothing else answered
+)
+
 #: Upstream `swebench.harness.constants.APPLY_PATCH_FAIL` as it appears in
 #: `run_instance.log` (lower-cased for matching).  Its presence is definitive:
 #: the container was built and the model's patch did not apply.
@@ -609,16 +628,55 @@ def _resolve_image(spec: SuiteSpec, row: Mapping[str, Any], instance_id: str) ->
     return template.format(instance_id=instance_id, norm_id=_normalized_image_id(instance_id))
 
 
-def _resolve_test_cmd(row: Mapping[str, Any], repo: str) -> str:
+#: Deduplication set for `_warn_constants_gone`.  The lookup below runs once per
+#: instance, so an unimportable constants table would otherwise print the same line
+#: 100 times and bury it.
+_CONSTANTS_WARNED: set[str] = set()
+
+
+def _warn_constants_gone(exc: BaseException) -> None:
+    """Say it out loud when the swebench constants table is *gone*, not just silent.
+
+    A `KeyError` is ordinary: swebench-pro's repos were never in the Verified
+    table, so those instances legitimately resolve on a later rung and always
+    have.  An `ImportError`/`AttributeError` is not ordinary — it means the
+    installed distribution no longer exposes `MAP_REPO_VERSION_TO_SPECS` at all
+    (5.x removed it), which downgrades the `test_cmd` prompt variable for every
+    instance in the suite simultaneously.  The durable record is the per-task
+    `prompt_variable_sources`; this line exists so the operator sees it while the
+    run is still starting rather than in a post-hoc diff.
+    """
+    if isinstance(exc, KeyError):
+        return
+    key = f"{type(exc).__name__}: {exc}"
+    if key in _CONSTANTS_WARNED:
+        return
+    _CONSTANTS_WARNED.add(key)
+    print(
+        "==> WARNING: swebench.harness.constants.MAP_REPO_VERSION_TO_SPECS is unavailable "
+        f"({key}). The `test_cmd` prompt variable falls back to a generic command, so the "
+        "prompt every model reads is NOT the one earlier runs used. Check the swebench pin "
+        "in harness/requirements.lock; every attempt record now carries "
+        "prompt.variable_sources.test_cmd to prove which rung answered.",
+        file=sys.stderr,
+    )
+
+
+def _resolve_test_cmd(row: Mapping[str, Any], repo: str) -> tuple[str, str]:
     """Best available per-instance test command, used for the `test_cmd` prompt variable.
 
     Order: explicit dataset column -> the installed swebench constants table ->
-    a constant fallback.  The same order is used for both suites, so this cannot
-    become a source of per-suite prompt drift.
+    the row's test_directives -> a constant fallback.  The same order is used for
+    both suites, so this cannot become a source of per-suite prompt drift.
+
+    Returns `(command, source)` where `source` is a member of TEST_CMD_SOURCES.
+    The command string is byte-identical to what this function returned before the
+    source was tracked, for every input: recording where a prompt variable came
+    from must not change the prompt it produces.
     """
     explicit = _first_present(row, ("test_cmd", "test_command", "run_tests"))
     if explicit:
-        return str(explicit)
+        return str(explicit), "dataset_column"
 
     version = row.get("version")
     if repo and version is not None:
@@ -627,19 +685,23 @@ def _resolve_test_cmd(row: Mapping[str, Any], repo: str) -> str:
 
             candidate = MAP_REPO_VERSION_TO_SPECS[repo][str(version)].get("test_cmd")
             if isinstance(candidate, str) and candidate:
-                return candidate
-        except Exception:
-            pass
+                return candidate, "swebench_constants"
+        except Exception as exc:  # noqa: BLE001 — a prompt variable must not fail a run
+            # Still swallowed, deliberately: a missing table is not a reason to refuse to
+            # run.  What changed is that it is no longer swallowed *silently* — the rung
+            # that did answer is recorded per task, and a table that is gone entirely
+            # (as opposed to merely lacking this repo) is announced once.
+            _warn_constants_gone(exc)
 
     directives = _first_present(row, ("test_directives",))
     if directives:
         try:
             items = _as_str_tuple(directives, "test_directives", str(row.get("instance_id")))
             if items:
-                return f"{FALLBACK_TEST_CMD} {' '.join(items)}"
+                return f"{FALLBACK_TEST_CMD} {' '.join(items)}", "test_directives"
         except AdapterConfigError:
             pass
-    return FALLBACK_TEST_CMD
+    return FALLBACK_TEST_CMD, "fallback"
 
 
 def _build_task(
@@ -667,7 +729,7 @@ def _build_task(
         )
 
     qualified_id = f"{spec.suite_name}::{instance_id}"
-    test_cmd = _resolve_test_cmd(row, repo)
+    test_cmd, test_cmd_source = _resolve_test_cmd(row, repo)
     environment = {
         "image": _resolve_image(spec, row, instance_id),
         # SWE-bench evaluation images ship the environment prebuilt; the official
@@ -692,6 +754,13 @@ def _build_task(
         "test_patch_present": bool(row.get("test_patch")),
         "created_at": row.get("created_at"),
         "hints_dropped": bool(row.get("hints_text")),
+        # The one reserved key the harness reads back (CONTRACTS §5.1): copied verbatim
+        # into every attempt record's `prompt.variable_sources` (§3), and used for
+        # nothing else.  It exists because `test_cmd` is substituted INTO the fixed
+        # template, so its resolution can degrade — a repackaged dependency, a dataset
+        # column that appears or disappears — without moving `prompt_template_id`,
+        # `prompt_dir_sha256` or any adapter hash.  See TEST_CMD_SOURCES.
+        "prompt_variable_sources": {"test_cmd": test_cmd_source},
     }
 
     return Task(

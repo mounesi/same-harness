@@ -1504,6 +1504,35 @@ def attempt_seed(base_seed: int, pass_idx: int) -> int:
     del pass_idx  # deliberately unused: see the docstring
     return base_seed
 
+
+#: The ONE key in `Task.metadata` the harness reads (CONTRACTS.md §5.1). It maps a prompt
+#: variable name to the name of the resolution rung the adapter took to produce its value,
+#: and is copied verbatim into the attempt record; nothing here ever branches on it.
+#:
+#: Why it has to exist: `prompt_template_id` and `prompt_dir_sha256` pin the TEMPLATE, not
+#: the values substituted into it. The SWE-bench adapter builds `test_cmd` from the dataset
+#: row, else the installed swebench constants table, else a generic fallback — so a
+#: dependency that repackages that table (5.x dropped MAP_REPO_VERSION_TO_SPECS) rewrites
+#: the prompt every model reads while every provenance hash in the manifest stays identical.
+#: That is the study's control variable moving with nothing to show for it (AI-3162).
+PROMPT_VARIABLE_SOURCES_KEY = "prompt_variable_sources"
+
+
+def prompt_variable_sources(task: Any) -> dict:
+    """The §5.1 reserved map, normalised to `{str: str}` and sorted.
+
+    Never raises and never propagates adapter shapes: this is provenance, and a malformed
+    metadata block must cost a line of JSON, not an attempt.
+    """
+    try:
+        sources = (getattr(task, "metadata", None) or {}).get(PROMPT_VARIABLE_SOURCES_KEY)
+    except Exception:  # noqa: BLE001 — a Task whose metadata is not a mapping
+        return {}
+    if not isinstance(sources, dict):
+        return {}
+    return {str(k): str(v) for k, v in sorted(sources.items(), key=lambda kv: str(kv[0]))}
+
+
 def _verdict_field(verdict: Any, name: str, default: Any = None) -> Any:
     if isinstance(verdict, dict):
         return verdict.get(name, default)
@@ -1550,6 +1579,9 @@ class AttemptState:
         self.terminal_code: str | None = None
         self.detail = ""
         self.patch = ""
+        # Stays None when the attempt died before build_prompt returned; the record then
+        # says so rather than implying a prompt that was never rendered.
+        self.prompt_sha256: str | None = None
 
 
 def _append_log(path: Path, message: str) -> None:
@@ -1599,6 +1631,7 @@ def run_attempt_loop(ctx: RunContext, task: Any, pass_idx: int) -> AttemptState:
                 f"{prompt_pkg.TEMPLATE_ID!r}",
             )
         log(f"prompt {prompt.template_id} sha256={prompt.prompt_sha256}")
+        st.prompt_sha256 = prompt.prompt_sha256
 
         executor = build_workspace(task, st.slug, ctx.scratch_root)
         log(f"workspace ready: {type(executor).__name__} {executor.workdir} base={executor.base_sha[:12]}")
@@ -1814,6 +1847,19 @@ def run_attempt_grade(ctx: RunContext, st: AttemptState) -> dict:
             "seed": st.seed,
             "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
             "temperature": ctx.params["temperature"],
+        },
+        # Same reason as `sampling` above: the harness-constant claim, made checkable from
+        # the raw data. The template is pinned run-wide by prompt_template_id and
+        # prompt_dir_sha256, but the VALUES substituted into it are per instance and can
+        # degrade on their own — `test_cmd` resolves from the dataset row, else the
+        # installed swebench constants, else a generic fallback. `prompt_sha256` shows THAT
+        # the rendered bytes differ from another run's; `variable_sources` shows WHY, so a
+        # reviewer can tell a dataset difference from a dependency repackaging without
+        # re-rendering anything (CONTRACTS.md §3.1, §5.1).
+        "prompt": {
+            "template_id": prompt_pkg.TEMPLATE_ID,
+            "prompt_sha256": st.prompt_sha256,
+            "variable_sources": prompt_variable_sources(task),
         },
         "started_at": iso(st.started_at),
         "ended_at": iso(ended_at),
@@ -2395,6 +2441,13 @@ def _fallback_record(ctx: RunContext, task: Any, pass_idx: int, exc: BaseExcepti
             "seed": attempt_seed(base_seed, pass_idx),
             "seed_derivation": "held-constant (greedy decoding: seed does not vary by pass)",
             "temperature": ctx.params["temperature"],
+        },
+        # The worker died, so no prompt was rendered — but the task was built, so the
+        # adapter's variable provenance is known and belongs on the record like any other.
+        "prompt": {
+            "template_id": prompt_pkg.TEMPLATE_ID,
+            "prompt_sha256": None,
+            "variable_sources": prompt_variable_sources(task),
         },
         "started_at": now,
         "ended_at": now,

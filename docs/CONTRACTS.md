@@ -671,6 +671,7 @@ other passes, other error codes, malformed or foreign lines — is preserved byt
 | `partition` | enum | `train` \| `dev` \| `final_holdout` \| `unpartitioned`, resolved from `partitions.json` at load time |
 | `pass_idx` | int | 0-based, `0 <= pass_idx < passes` |
 | `sampling` | object | `{base_seed, seed, seed_derivation, temperature}` — what was actually sent for this attempt. `base_seed` MUST equal the manifest's `inference.seed`. Decoding is greedy (`temperature` 0.0), so `seed == base_seed` for every pass: the passes are not independent samples and MUST be reported as mean + min/max range, never a bootstrap CI over passes. |
+| `prompt` | object | `{template_id, prompt_sha256, variable_sources}` — provenance for the prompt this attempt actually sent. `template_id` MUST equal the manifest's `harness.prompt_template_id`. `prompt_sha256` is the §5.2 value (`null` only when the attempt died before the prompt was rendered). `variable_sources` is `{variable name: source name}` copied verbatim from the task's `metadata.prompt_variable_sources` (§5.1), `{}` when the adapter declares none. **Why it is here:** `prompt_template_id` and `prompt_dir_sha256` pin the TEMPLATE; the values substituted into it are per instance and resolve independently. SWE-bench's `test_cmd` comes from the dataset row, else the installed swebench constants table, else a generic fallback — so a dependency that repackages that table (5.x dropped `MAP_REPO_VERSION_TO_SPECS`) changes the prompt every model reads while every hash in the manifest stays identical. `prompt_sha256` shows that the bytes differ; `variable_sources` shows which resolution rung is responsible. |
 | `wall_clock_ms` | int | `ended_at - started_at`, includes grading AND any time the attempt waited for a grading slot (grading runs on its own pool, `HARNESS_GRADE_CONCURRENCY`, so the GPU-bound loop is never blocked by docker/tests). Per-attempt `cost.usd` is therefore contention-inclusive; the headline cost is run-level (§8) and unaffected. |
 | `resolved` | bool | suite-defined success. `resolved == true` **implies** `error_code == "OK"`; the converse does not hold (`OK` + `resolved:false` is impossible — use `TESTS_FAIL`; see §4) |
 | `error_code` | enum | closed enum from §4. Never free text. |
@@ -805,13 +806,27 @@ class Task:
     pass_to_pass: tuple[str, ...] # test node ids that must stay green
     environment: dict             # {"image": "...", "setup_cmds": [...], "test_cmd": "..."}
     partition: str                # "train"|"dev"|"final_holdout"|"unpartitioned"
-    metadata: dict                # suite-specific, JSON-serializable, never read by the harness
+    metadata: dict                # suite-specific, JSON-serializable; the harness never
+                                  # BRANCHES on it. One reserved key is copied out — see below
     source_sha256: str            # sha256 of the canonical JSON of the upstream task record
 ```
 
 Rules: `problem_statement` is passed through unmodified — no suite-specific preambles, no hints, no
 formatting differences between suites. Anything an adapter wants to add goes in `metadata` and is
 ignored by the prompt.
+
+**Reserved metadata key `prompt_variable_sources`.** `{variable name: source name}`, both strings,
+optional. It is the only key the harness reads: `harness/agent.py` copies it into every attempt
+record's `prompt.variable_sources` (§3.1) and does nothing else with it — no harness behaviour may
+depend on `metadata`, and this key does not change that. An adapter MUST set it for any §5.2 prompt
+variable it resolves from more than one place, naming the place that answered. `test_cmd` on both
+SWE-bench suites is the case that forced this: it resolves from an explicit dataset column, else
+`swebench.harness.constants.MAP_REPO_VERSION_TO_SPECS`, else the row's `test_directives`, else a
+constant fallback. Those are four different prompts for one template. `prompt_template_id`,
+`prompt_dir_sha256`, `adapter_sha256` and `adapters_dir_sha256` all hash the harness, and none of
+them moves when the *dependency* supplying the value is repackaged — swebench 5.x removed that
+table — so without this key the prompt silently changes and the run's own provenance says nothing
+happened.
 
 ### 5.2 `Prompt`
 
@@ -1127,6 +1142,9 @@ for a one-time cache miss. State this in the paper.
 - [ ] `runtime.vllm_argv` is non-null for a run against a server started by `./modelctl serve`
 - [ ] every `results.jsonl` line validates against §3 and carries an `error_code` from §4
 - [ ] `patch.ref` / `trajectory.ref` are relative and resolve inside the run dir
+- [ ] every SWE-bench `results.jsonl` line carries `prompt.variable_sources.test_cmd`, and the
+      per-instance distribution of that value matches the run it is being compared against — two
+      runs that disagree here sent different prompts under an identical template (§3.1, §5.1)
 - [ ] `resultsctl verify` passes on a freshly packaged bundle
 - [ ] `build_dataset.py` exits `3` on a mutated `partitions.json` and on any holdout id
 - [ ] `manifest.py build` exits `2` on a seed file without `instance_ids_sha256` and on a
