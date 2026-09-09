@@ -70,6 +70,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from harness import prompts as prompt_pkg  # noqa: E402  (needs REPO_ROOT on sys.path)
+from harness.types import PROMPT_VARIABLE_SOURCES_KEY  # noqa: E402  (§5.1 reserved key)
 
 CONFIG_PATH = HARNESS_DIR / "agent_config.json"
 
@@ -1505,21 +1506,13 @@ def attempt_seed(base_seed: int, pass_idx: int) -> int:
     return base_seed
 
 
-#: The ONE key in `Task.metadata` the harness reads (CONTRACTS.md §5.1). It maps a prompt
-#: variable name to the name of the resolution rung the adapter took to produce its value,
-#: and is copied verbatim into the attempt record; nothing here ever branches on it.
-#:
-#: Why it has to exist: `prompt_template_id` and `prompt_dir_sha256` pin the TEMPLATE, not
-#: the values substituted into it. The SWE-bench adapter builds `test_cmd` from the dataset
-#: row, else the installed swebench constants table, else a generic fallback — so a
-#: dependency that repackages that table (5.x dropped MAP_REPO_VERSION_TO_SPECS) rewrites
-#: the prompt every model reads while every provenance hash in the manifest stays identical.
-#: That is the study's control variable moving with nothing to show for it (AI-3162).
-PROMPT_VARIABLE_SOURCES_KEY = "prompt_variable_sources"
-
-
 def prompt_variable_sources(task: Any) -> dict:
     """The §5.1 reserved map, normalised to `{str: str}` and sorted.
+
+    `PROMPT_VARIABLE_SOURCES_KEY` is imported from `harness.types` rather than spelled
+    here: the writer (the adapter) and this reader must agree on the string, and a
+    divergence would produce `{}` on every record — indistinguishable, to a reader, from
+    an adapter that declares no sources.
 
     Never raises and never propagates adapter shapes: this is provenance, and a malformed
     metadata block must cost a line of JSON, not an attempt.
@@ -1579,9 +1572,12 @@ class AttemptState:
         self.terminal_code: str | None = None
         self.detail = ""
         self.patch = ""
-        # Stays None when the attempt died before build_prompt returned; the record then
-        # says so rather than implying a prompt that was never rendered.
+        # Both stay None when the attempt died before build_prompt returned; the record
+        # then says so rather than implying a prompt that was never rendered. They are
+        # taken from the SAME Prompt object, so the two halves of the record's `prompt`
+        # block describe one render rather than one render and one module constant.
         self.prompt_sha256: str | None = None
+        self.prompt_template_id: str | None = None
 
 
 def _append_log(path: Path, message: str) -> None:
@@ -1632,6 +1628,7 @@ def run_attempt_loop(ctx: RunContext, task: Any, pass_idx: int) -> AttemptState:
             )
         log(f"prompt {prompt.template_id} sha256={prompt.prompt_sha256}")
         st.prompt_sha256 = prompt.prompt_sha256
+        st.prompt_template_id = prompt.template_id
 
         executor = build_workspace(task, st.slug, ctx.scratch_root)
         log(f"workspace ready: {type(executor).__name__} {executor.workdir} base={executor.base_sha[:12]}")
@@ -1856,8 +1853,15 @@ def run_attempt_grade(ctx: RunContext, st: AttemptState) -> dict:
         # the rendered bytes differ from another run's; `variable_sources` shows WHY, so a
         # reviewer can tell a dataset difference from a dependency repackaging without
         # re-rendering anything (CONTRACTS.md §3.1, §5.1).
+        #
+        # `template_id` comes from the Prompt that was actually rendered, like
+        # `prompt_sha256` beside it — one provenance block, one source. It falls back to
+        # the module constant only when no prompt was rendered at all, so the §3.1
+        # invariant (`template_id` equals the manifest's) holds on every line. The two
+        # spellings cannot disagree today: render() rejects a foreign id, and
+        # run_attempt_loop re-checks it above.
         "prompt": {
-            "template_id": prompt_pkg.TEMPLATE_ID,
+            "template_id": st.prompt_template_id or prompt_pkg.TEMPLATE_ID,
             "prompt_sha256": st.prompt_sha256,
             "variable_sources": prompt_variable_sources(task),
         },

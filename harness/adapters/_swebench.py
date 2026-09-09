@@ -55,7 +55,13 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from harness.types import GraderError, Prompt, Task, Verdict  # noqa: E402
+from harness.types import (  # noqa: E402
+    PROMPT_VARIABLE_SOURCES_KEY,
+    GraderError,
+    Prompt,
+    Task,
+    Verdict,
+)
 
 # dataclass(slots=True) needs CPython >= 3.10. Target runtime is 3.11 (Lambda images);
 # degrade on older interpreters so the repo stays importable for local inspection.
@@ -101,24 +107,57 @@ DEFAULT_TEST_TIMEOUT_S = 1800
 #: Identical for both suites, so it cannot make the harness vary by suite.
 FALLBACK_TEST_CMD = "python -m pytest"
 
-#: The rungs `_resolve_test_cmd` tries, in order.  Which one answered is recorded
-#: per task and copied into every attempt record, because `test_cmd` is a value
-#: SUBSTITUTED INTO the prompt: when the rung changes, the bytes the model reads
-#: change while `prompt_template_id` and `prompt_dir_sha256` stay identical, so
-#: nothing in the existing provenance can tell the two runs apart.
-#:
-#: Not hypothetical.  swebench 5.x dropped `MAP_REPO_VERSION_TO_SPECS`; under the
-#: `except Exception` in `_resolve_test_cmd` that turns a real per-repo command
-#: ("./tests/runtests.py --verbosity 2 …") into the generic FALLBACK_TEST_CMD for
-#: every instance at once, with no diagnostic anywhere.  `harness/requirements.lock`
-#: pins swebench to 3.0.x for exactly this reason; this records what actually
-#: happened rather than trusting the pin (AI-3162).
-TEST_CMD_SOURCES = (
-    "dataset_column",      # the dataset row carried an explicit command
-    "swebench_constants",  # MAP_REPO_VERSION_TO_SPECS[repo][version]["test_cmd"]
-    "test_directives",     # FALLBACK_TEST_CMD + the row's test_directives
-    "fallback",            # FALLBACK_TEST_CMD alone — nothing else answered
+# --------------------------------------------------------------------------- #
+# prompt-variable provenance (CONTRACTS.md §5.1, §5.2)
+# --------------------------------------------------------------------------- #
+#
+# The template has exactly three variables — problem_statement, repo, test_cmd (see
+# `build_prompt`) — and this adapter resolves each of them from more than one place.
+# Which place answered is recorded per task and copied into every attempt record,
+# because these are values SUBSTITUTED INTO the prompt: when the answering place
+# changes, the bytes the model reads change while `prompt_template_id` and
+# `prompt_dir_sha256` stay identical, so nothing else in the provenance can tell the
+# two runs apart.
+#
+# Not hypothetical for either kind of place.  A dataset mirror that publishes
+# `issue_text` instead of `problem_statement`, or drops `repo`, changes the prompt
+# without changing a single hash the manifest records.  And swebench 5.x dropped
+# `MAP_REPO_VERSION_TO_SPECS`; under the `except Exception` in `_resolve_test_cmd`
+# that turns a real per-repo command ("./tests/runtests.py --verbosity 2 …") into the
+# generic FALLBACK_TEST_CMD for every instance at once.  `harness/requirements.lock`
+# pins swebench to 3.0.x for exactly this reason; this records what actually happened
+# rather than trusting the pin (AI-3162).
+#
+# The column tuples below are the ones the lookups actually use, so a source string
+# cannot drift from the lookup it describes: change a column name and both move.
+
+#: Dataset columns consulted for each prompt variable, in order.
+TEST_CMD_COLUMNS = ("test_cmd", "test_command", "run_tests")
+REPO_COLUMNS = ("repo", "repository")
+PROBLEM_STATEMENT_COLUMNS = ("problem_statement", "issue_text", "problem")
+
+#: Non-column rungs.
+SOURCE_SWEBENCH_CONSTANTS = "swebench_constants"  # MAP_REPO_VERSION_TO_SPECS[repo][version]
+SOURCE_TEST_DIRECTIVES = "test_directives"        # FALLBACK_TEST_CMD + the row's directives
+SOURCE_FALLBACK = "fallback"                      # FALLBACK_TEST_CMD alone
+SOURCE_ABSENT = "absent"                          # no column answered; renders as EMPTY_VALUE
+
+
+def _column_source(column: str) -> str:
+    """Source name for "the dataset row's `column` answered"."""
+    return f"dataset_column:{column}"
+
+
+#: The closed value sets, derived from the same tuples the lookups use.  Documented
+#: here so a reader of a results.jsonl line knows what the field can say.
+TEST_CMD_SOURCES = tuple(_column_source(c) for c in TEST_CMD_COLUMNS) + (
+    SOURCE_SWEBENCH_CONSTANTS,
+    SOURCE_TEST_DIRECTIVES,
+    SOURCE_FALLBACK,
 )
+REPO_SOURCES = tuple(_column_source(c) for c in REPO_COLUMNS) + (SOURCE_ABSENT,)
+#: No `absent` member: `_build_task` refuses a row with no problem statement.
+PROBLEM_STATEMENT_SOURCES = tuple(_column_source(c) for c in PROBLEM_STATEMENT_COLUMNS)
 
 #: Upstream `swebench.harness.constants.APPLY_PATCH_FAIL` as it appears in
 #: `run_instance.log` (lower-cased for matching).  Its presence is definitive:
@@ -278,11 +317,22 @@ def _as_str_tuple(value: Any, field: str, instance_id: str) -> tuple[str, ...]:
     raise AdapterConfigError(f"{instance_id}: {field} has unsupported type {type(value).__name__}")
 
 
-def _first_present(row: Mapping[str, Any], keys: Sequence[str]) -> Any:
+def _first_present_column(
+    row: Mapping[str, Any], keys: Sequence[str]
+) -> tuple[Any, str | None]:
+    """`_first_present`, plus WHICH key answered — the provenance §5.1 records.
+
+    Returns `(value, key)`, or `(None, None)` when no key answered.
+    """
     for key in keys:
         if key in row and row[key] not in (None, ""):
-            return row[key]
-    return None
+            return row[key], key
+    return None, None
+
+
+def _first_present(row: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    # Delegates so the two cannot disagree about what "present" means.
+    return _first_present_column(row, keys)[0]
 
 
 def _network_allowed() -> bool:
@@ -628,37 +678,78 @@ def _resolve_image(spec: SuiteSpec, row: Mapping[str, Any], instance_id: str) ->
     return template.format(instance_id=instance_id, norm_id=_normalized_image_id(instance_id))
 
 
-#: Deduplication set for `_warn_constants_gone`.  The lookup below runs once per
-#: instance, so an unimportable constants table would otherwise print the same line
-#: 100 times and bury it.
+#: Deduplication set for the warnings below.  The lookup runs once per instance, so an
+#: unimportable constants table would otherwise print the same line 100 times and bury it.
 _CONSTANTS_WARNED: set[str] = set()
 
 
-def _warn_constants_gone(exc: BaseException) -> None:
-    """Say it out loud when the swebench constants table is *gone*, not just silent.
-
-    A `KeyError` is ordinary: swebench-pro's repos were never in the Verified
-    table, so those instances legitimately resolve on a later rung and always
-    have.  An `ImportError`/`AttributeError` is not ordinary — it means the
-    installed distribution no longer exposes `MAP_REPO_VERSION_TO_SPECS` at all
-    (5.x removed it), which downgrades the `test_cmd` prompt variable for every
-    instance in the suite simultaneously.  The durable record is the per-task
-    `prompt_variable_sources`; this line exists so the operator sees it while the
-    run is still starting rather than in a post-hoc diff.
-    """
-    if isinstance(exc, KeyError):
-        return
-    key = f"{type(exc).__name__}: {exc}"
+def _warn_once(key: str, message: str) -> None:
     if key in _CONSTANTS_WARNED:
         return
     _CONSTANTS_WARNED.add(key)
-    print(
+    print(message, file=sys.stderr)
+
+
+def _warn_constants_gone(exc: BaseException) -> None:
+    """Say it out loud when the swebench constants table cannot be imported at all.
+
+    This is the whole-suite failure: the installed distribution no longer exposes
+    `MAP_REPO_VERSION_TO_SPECS` (5.x removed it), so the `test_cmd` prompt variable
+    degrades for every instance simultaneously.  The durable record is the per-task
+    `prompt_variable_sources`; this line exists so the operator sees it while the run
+    is still starting rather than in a post-hoc diff.
+    """
+    _warn_once(
+        f"import {type(exc).__name__}: {exc}",
         "==> WARNING: swebench.harness.constants.MAP_REPO_VERSION_TO_SPECS is unavailable "
-        f"({key}). The `test_cmd` prompt variable falls back to a generic command, so the "
-        "prompt every model reads is NOT the one earlier runs used. Check the swebench pin "
-        "in harness/requirements.lock; every attempt record now carries "
-        "prompt.variable_sources.test_cmd to prove which rung answered.",
-        file=sys.stderr,
+        f"({type(exc).__name__}: {exc}). The `test_cmd` prompt variable falls back to a "
+        "generic command, so the prompt every model reads is NOT the one earlier runs "
+        "used. Check the swebench pin in harness/requirements.lock; every attempt record "
+        "carries prompt.variable_sources.test_cmd to prove which rung answered.",
+    )
+
+
+def _warn_constants_lookup_failed(
+    exc: BaseException, table: Any, repo: str, version: Any
+) -> None:
+    """Warn about a lookup MISS that is not simply "this repo was never in the table".
+
+    The table imported fine but did not answer for this `(repo, version)`.  Staying
+    quiet when the repo is absent is deliberate: swebench-pro's repos were never in the
+    Verified table, so those instances have always resolved on a later rung, and warning
+    would fire on every pro instance.  A repo that IS present with a version key that is
+    not gets a line, because that shape has two possible causes and this function cannot
+    tell them apart — a dataset carrying a version the pinned swebench does not know, or
+    a release re-spelling the version keys ("4.1" -> "4.1.0").  It claims neither; both
+    produce the same harm, a `test_cmd` that drops to a later rung.
+
+    A KeyError is therefore NOT proof that everything is fine, and the durable record —
+    `prompt_variable_sources` on every attempt — is what actually catches a table that
+    stopped answering.  This is a heads-up, not the guarantee.
+    """
+    if not isinstance(exc, KeyError):
+        _warn_once(
+            f"lookup {type(exc).__name__}: {exc}",
+            "==> WARNING: MAP_REPO_VERSION_TO_SPECS lookup raised "
+            f"{type(exc).__name__}: {exc}. The `test_cmd` prompt variable falls back to a "
+            "later rung; see prompt.variable_sources.test_cmd on every attempt record.",
+        )
+        return
+    try:
+        known = sorted(str(v) for v in table[repo])
+    except Exception:  # noqa: BLE001 — the repo is absent, or the table is not a mapping
+        return
+    # Keyed on the repo, not the (repo, version) pair: if a release re-spelled every
+    # version key, every instance misses, and one line per repo is a signal while one
+    # line per instance is a wall.
+    _warn_once(
+        f"version {repo}",
+        f"==> WARNING: MAP_REPO_VERSION_TO_SPECS has {repo!r} but not version "
+        f"{str(version)!r} (it has: {', '.join(known[:8])}"
+        f"{', ...' if len(known) > 8 else ''}). Either the dataset carries a version this "
+        "swebench does not know, or the table's version keys changed spelling; either way "
+        "the `test_cmd` prompt variable for this instance drops to a later rung. See "
+        "prompt.variable_sources.test_cmd on every attempt record.",
     )
 
 
@@ -674,34 +765,39 @@ def _resolve_test_cmd(row: Mapping[str, Any], repo: str) -> tuple[str, str]:
     source was tracked, for every input: recording where a prompt variable came
     from must not change the prompt it produces.
     """
-    explicit = _first_present(row, ("test_cmd", "test_command", "run_tests"))
+    explicit, column = _first_present_column(row, TEST_CMD_COLUMNS)
     if explicit:
-        return str(explicit), "dataset_column"
+        return str(explicit), _column_source(str(column))
 
     version = row.get("version")
     if repo and version is not None:
+        # Import and lookup are split so the two failures can be told apart: a table that
+        # is GONE degrades the whole suite at once, a lookup that misses degrades one
+        # instance.  Both are still swallowed — a prompt variable must not fail a run —
+        # but neither is swallowed silently: the rung that did answer is recorded per
+        # task, and each failure gets one deduplicated line on stderr.
         try:
             from swebench.harness.constants import MAP_REPO_VERSION_TO_SPECS  # type: ignore
-
-            candidate = MAP_REPO_VERSION_TO_SPECS[repo][str(version)].get("test_cmd")
-            if isinstance(candidate, str) and candidate:
-                return candidate, "swebench_constants"
-        except Exception as exc:  # noqa: BLE001 — a prompt variable must not fail a run
-            # Still swallowed, deliberately: a missing table is not a reason to refuse to
-            # run.  What changed is that it is no longer swallowed *silently* — the rung
-            # that did answer is recorded per task, and a table that is gone entirely
-            # (as opposed to merely lacking this repo) is announced once.
+        except Exception as exc:  # noqa: BLE001 — 5.x removed the table outright
             _warn_constants_gone(exc)
+        else:
+            try:
+                candidate = MAP_REPO_VERSION_TO_SPECS[repo][str(version)].get("test_cmd")
+            except Exception as exc:  # noqa: BLE001 — absent repo/version, or a new shape
+                _warn_constants_lookup_failed(exc, MAP_REPO_VERSION_TO_SPECS, repo, version)
+            else:
+                if isinstance(candidate, str) and candidate:
+                    return candidate, SOURCE_SWEBENCH_CONSTANTS
 
     directives = _first_present(row, ("test_directives",))
     if directives:
         try:
             items = _as_str_tuple(directives, "test_directives", str(row.get("instance_id")))
             if items:
-                return f"{FALLBACK_TEST_CMD} {' '.join(items)}", "test_directives"
+                return f"{FALLBACK_TEST_CMD} {' '.join(items)}", SOURCE_TEST_DIRECTIVES
         except AdapterConfigError:
             pass
-    return FALLBACK_TEST_CMD, "fallback"
+    return FALLBACK_TEST_CMD, SOURCE_FALLBACK
 
 
 def _build_task(
@@ -711,9 +807,10 @@ def _build_task(
     partitions: Mapping[str, str],
     revision: str | None,
 ) -> Task:
-    repo = str(_first_present(row, ("repo", "repository")) or "")
+    repo_value, repo_column = _first_present_column(row, REPO_COLUMNS)
+    repo = str(repo_value or "")
     base_commit = str(_first_present(row, ("base_commit", "commit")) or "")
-    problem = _first_present(row, ("problem_statement", "issue_text", "problem"))
+    problem, problem_column = _first_present_column(row, PROBLEM_STATEMENT_COLUMNS)
     if not problem:
         raise AdapterConfigError(f"{instance_id}: dataset row has no problem statement")
 
@@ -756,11 +853,18 @@ def _build_task(
         "hints_dropped": bool(row.get("hints_text")),
         # The one reserved key the harness reads back (CONTRACTS §5.1): copied verbatim
         # into every attempt record's `prompt.variable_sources` (§3), and used for
-        # nothing else.  It exists because `test_cmd` is substituted INTO the fixed
-        # template, so its resolution can degrade — a repackaged dependency, a dataset
-        # column that appears or disappears — without moving `prompt_template_id`,
-        # `prompt_dir_sha256` or any adapter hash.  See TEST_CMD_SOURCES.
-        "prompt_variable_sources": {"test_cmd": test_cmd_source},
+        # nothing else.  It carries ALL THREE template variables, not just test_cmd:
+        # each is substituted INTO the fixed template, and each resolves from more than
+        # one place, so any of them can change what the model reads without moving
+        # `prompt_template_id`, `prompt_dir_sha256` or any adapter hash.  A mirror that
+        # publishes `issue_text` instead of `problem_statement`, or omits `repo` (which
+        # then renders as prompts.EMPTY_VALUE), is the same failure as a repackaged
+        # swebench.  See TEST_CMD_SOURCES / REPO_SOURCES / PROBLEM_STATEMENT_SOURCES.
+        PROMPT_VARIABLE_SOURCES_KEY: {
+            "problem_statement": _column_source(str(problem_column)),
+            "repo": _column_source(str(repo_column)) if repo_column else SOURCE_ABSENT,
+            "test_cmd": test_cmd_source,
+        },
     }
 
     return Task(
