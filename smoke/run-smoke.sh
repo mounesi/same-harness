@@ -11,7 +11,13 @@
 #   ./smoke/run-smoke.sh [--keep]
 #
 # It asserts, in order:
-#   1. mock endpoint answers /v1/models         (run.sh preflight tier 1)
+#   1. mock endpoint answers /v1/models         (run.sh preflight tier 1), and — served
+#      WITHOUT vLLM's tool-calling flags — refuses tool_choice:"auto" with the same HTTP
+#      400 vLLM gives, so the mock can no longer be MORE PERMISSIVE than the server it
+#      stands in for. Scope: this checks the mock, not any real serve line. The smoke
+#      never launches vLLM and writes its own profile with EXTRA_ARGS="" (below), so a
+#      models.d entry missing the flags still passes this suite — as six of the seven
+#      entries do on this branch. Covering that needs a check over models.d, not a mock.
 #   2. manifest builds and REQUIRED fields resolve                       (tier 2)
 #   3. grading preflight passes for the suite                            (tier 3)
 #   4. attempts execute and results.jsonl gets one record per attempt
@@ -29,7 +35,14 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${SMOKE_PORT:-8099}"
+# Second endpoint for the negative test in step 1: the same mock, launched WITHOUT the
+# vLLM tool-calling flags.
+PORT_NO_TOOLS="${SMOKE_PORT_NO_TOOLS:-$((PORT + 1))}"
 MODEL="smoke-model"
+# Per-run-unique id, served on /v1/models by that second mock and by nothing else. It is
+# how the wait loop below tells "our process bound the port" from "something else already
+# had it" — see the comment there.
+MODEL_NO_TOOLS="$MODEL-no-tools-$$"
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 
@@ -37,6 +50,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/smoke-XXXXXX")"
 PACK="$WORK/pack"
 OUT="$WORK/results"
 MOCK_PID=""
+MOCK_NT_PID=""
 
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
@@ -44,6 +58,7 @@ step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 
 cleanup() {
   [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
+  [[ -n "$MOCK_NT_PID" ]] && kill "$MOCK_NT_PID" 2>/dev/null || true
   if [[ "$KEEP" == "1" ]]; then
     printf '\nkept: %s\n' "$WORK"
   else
@@ -59,7 +74,34 @@ python3 smoke/make_pack.py --out "$PACK" >/dev/null || fail "could not build the
 ok "2-task pack at $PACK"
 
 step "1. mock endpoint"
-MOCK_MODEL="$MODEL" python3 smoke/mock_endpoint.py --port "$PORT" --model "$MODEL" 2>"$WORK/mock.log" &
+# Both mock ports must be free BEFORE anything is launched. A python that loses the bind
+# race dies with EADDRINUSE while curl keeps getting answers from whoever won it, and every
+# assertion after that is about a process this script did not start. That is not
+# hypothetical: two smoke runs overlapping on :$PORT produced exactly that here — step 1
+# green, then "endpoint unreachable" at step 2 when the other run cleaned up its mock.
+# Binding the port ourselves is the check that does not race with a slow fork.
+port_free() {
+  python3 - "$1" <<'PY'
+import socket, sys
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # same option the mock's server sets
+try:
+    sock.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+PY
+}
+port_free "$PORT" \
+  || fail "port $PORT is already in use — another smoke run, or a mock left behind by one (SMOKE_PORT= to move)"
+port_free "$PORT_NO_TOOLS" \
+  || fail "port $PORT_NO_TOOLS is already in use — another smoke run, or a mock left behind by one (SMOKE_PORT_NO_TOOLS= to move)"
+# --enable-auto-tool-choice --tool-call-parser are the vLLM flags a models.d EXTRA_ARGS must
+# carry; the mock honours them because the loop sends tool_choice:"auto" on every call and
+# vLLM 400s that without both. Started without them below, on purpose, to prove it.
+MOCK_MODEL="$MODEL" python3 smoke/mock_endpoint.py --port "$PORT" --model "$MODEL" \
+  --enable-auto-tool-choice --tool-call-parser smoke 2>"$WORK/mock.log" &
 MOCK_PID=$!
 for _ in $(seq 1 40); do
   curl -sf "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 && break
@@ -67,6 +109,88 @@ for _ in $(seq 1 40); do
 done
 curl -sf "http://127.0.0.1:$PORT/v1/models" | grep -q "$MODEL" || fail "mock endpoint never came up (see $WORK/mock.log)"
 ok "serving $MODEL on :$PORT"
+
+# Negative test — the hole this net used to have. The mock accepted tool_choice:"auto"
+# unconditionally, so a smoke run went green against a server configuration that could not
+# have served one attempt of any suite for any model; the real 400 was first seen on a
+# leased GPU (AI-P167 shakedown, vLLM 0.28.0 — deb56ad). Assert BOTH directions: a
+# tool-calling server answers the loop's request envelope, a server without the flags
+# refuses it with vLLM's error.
+MOCK_MODEL="$MODEL_NO_TOOLS" python3 smoke/mock_endpoint.py \
+  --port "$PORT_NO_TOOLS" --model "$MODEL_NO_TOOLS" 2>"$WORK/mock-no-tools.log" &
+MOCK_NT_PID=$!
+# Wait for OUR process, not merely for something on that port. If the port is already held
+# (a concurrent smoke run, a stale mock) the launch dies at bind with EADDRINUSE, and a
+# plain "does :$PORT_NO_TOOLS answer" loop breaks on the foreign server's reply instead —
+# then the whole negative test is evaluated against a process nobody here started, which is
+# the same lie this step exists to rule out. Two things make that observable, and both are
+# needed:
+#   * $MODEL_NO_TOOLS is unique to this run, so /v1/models only matches when the server
+#     answering is the one launched two lines up;
+#   * the liveness check runs AFTER the loop, never inside it. Inside, it is useless: the
+#     freshly forked python has not reached bind yet on iteration 1, so it is still alive
+#     when curl already has an answer from the foreign server. Demonstrated by holding
+#     :8100 with another mock — the in-loop version printed both green lines and the run
+#     exited 0 while $WORK/mock-no-tools.log held the EADDRINUSE traceback.
+for _ in $(seq 1 40); do
+  curl -sf "http://127.0.0.1:$PORT_NO_TOOLS/v1/models" 2>/dev/null | grep -q "$MODEL_NO_TOOLS" && break
+  sleep 0.25
+done
+kill -0 "$MOCK_NT_PID" 2>/dev/null \
+  || fail "tool-calling-disabled mock exited before it served — port $PORT_NO_TOOLS busy? (see $WORK/mock-no-tools.log)"
+curl -sf "http://127.0.0.1:$PORT_NO_TOOLS/v1/models" 2>/dev/null | grep -q "$MODEL_NO_TOOLS" \
+  || fail "tool-calling-disabled mock never came up on :$PORT_NO_TOOLS (see $WORK/mock-no-tools.log)"
+python3 - "$PORT" "$PORT_NO_TOOLS" "$MODEL" <<'PY' || exit 1
+import json, sys, urllib.error, urllib.request
+from harness.agent import LLMClient, load_config
+
+on_port, off_port, model = sys.argv[1], sys.argv[2], sys.argv[3]
+def die(m):
+    print("  \033[31mFAIL\033[0m " + m); sys.exit(1)
+
+cfg = load_config()
+# A minimal stand-in tool schema, NOT the one harness/agent.py registers. The gate under
+# test keys on tool_choice alone, and tool_choice comes from _payload below — so what this
+# asserts to match the loop is the request envelope and the sampling knobs, not the tools.
+tools = [{"type": "function",
+          "function": {"name": "read_file", "parameters": {"type": "object", "properties": {}}}}]
+payload = LLMClient("http://127.0.0.1/v1", model, cfg)._payload(
+    [{"role": "user", "content": "smoke"}], tools)
+if payload.get("tool_choice") != "auto":
+    # If the loop ever stops sending "auto" this assertion is vacuous, so say so loudly
+    # rather than pass: the gate below would then be testing nothing.
+    die("agent loop no longer sends tool_choice:'auto' (got %r) — this test needs rewriting"
+        % payload.get("tool_choice"))
+
+def post(port):
+    req = urllib.request.Request("http://127.0.0.1:%s/v1/chat/completions" % port,
+                                 data=json.dumps(payload).encode(), method="POST")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+code, body = post(on_port)
+if code != 200:
+    die("tool-calling mock rejected the loop's payload: HTTP %s %s" % (code, body[:300]))
+print("  \033[32mok\033[0m   tool-calling enabled: the loop's own request envelope is served (200)")
+
+code, body = post(off_port)
+if code != 400:
+    die("mock without --enable-auto-tool-choice/--tool-call-parser answered HTTP %s to "
+        "tool_choice:'auto' — vLLM answers 400, so the mock would again be more "
+        "permissive than the server it stands in for" % code)
+msg = str((json.loads(body).get("error") or {}).get("message", ""))
+if "--enable-auto-tool-choice" not in msg or "--tool-call-parser" not in msg:
+    die("400 body does not name the missing flags, so it would not tell an operator what "
+        "to fix: %r" % msg[:300])
+print("  \033[32mok\033[0m   tool calling off: HTTP 400 %r" % msg)
+PY
+kill "$MOCK_NT_PID" 2>/dev/null || true
+wait "$MOCK_NT_PID" 2>/dev/null || true
+MOCK_NT_PID=""
 
 # The harness resolves the model from models.d/<name>.env; give it a smoke profile that
 # points at the mock rather than at real weights.
