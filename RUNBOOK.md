@@ -55,9 +55,18 @@ install pinned deps → `modelctl serve` → `harness/run.sh` (3 passes) → pac
 the cost ledger → **tear the instance down in an `if: always()` step**. Only one GPU job
 runs at a time (`concurrency: gpu-run`).
 
-Run **`qwen3-coder-next` on `swebench-verified` first.** It is the cheapest model (~$2.49/hr)
-and exists to shake down the real path — weights download, vLLM at TP=1, docker grading —
-before anything expensive.
+Shake the paid path down cheaply before anything expensive — weights download, vLLM boot,
+docker grading, teardown, cost ledger. That is what `models.d/shakedown-qwen30b.env` exists
+for (`TP=1`, `gpu_1x_h100_pcie`, 249¢/hr in `pricing/fallback-prices.json`). It is
+deliberately not a study model and it is **not** in the `model` options above, so today it
+runs by hand (§1.4), not from this dispatch.
+
+`qwen3-coder-next` is **not** that shakedown any more. Its env file sets `TP=2` /
+`gpu_2x_h100_sxm5` — see the registry section of README.md for the arithmetic — and its
+FP8-vs-BF16 question is still open, so the "cheapest model at ~$2.49/hr, vLLM at TP=1" this
+paragraph used to say was wrong on the price, the instance type and the TP.
+
+`minimax-m3` is currently unlaunchable (see `models.d/minimax-m3.env`): do not dispatch it.
 
 ### 1.4 A benchmark run — by hand (on a Lambda instance)
 
@@ -245,10 +254,19 @@ and ~1–2 h of setup (weights download + vLLM load) per dispatch. Per-hour bill
 | qwen3-coder-next | 1× H100 PCIe | 2.49 | 15 | **~$40** |
 | minimax-m3 | 4× H100 SXM | 15.96 | 15 | **~$240** |
 | deepseek-v4-flash | 8× H100 SXM | 23.92 | 15 | **~$360** |
-| glm-5.3 *(blocked on weights)* | 8× B200 | 39.92 | 15 | **~$600** |
+| glm-5.3 *(weights out; Phase 1 vs reserve is a scheduling call)* | 8× B200 | 39.92 | 15 | **~$600** |
 | kimi-k3 | 8× B200 | 39.92 | 15 | **~$600** |
 | **Phase 1 total, 5 models** | | | | **~$1,850** + setup ~$150 = **~$2,000** |
 | qwen3.8-max *(reserve; multi-node, not CI-supported)* | 2× 8× B200 | ~80 | 18 | ~$1,450 |
+
+> **Two rows are stale and the Phase 1 total is therefore soft.** The first is
+> `qwen3-coder-next`: its env file sets `gpu_2x_h100_sxm5`, not `gpu_1x_h100_pcie`, and
+> `gpu_2x_h100_sxm5` has no entry in `pricing/fallback-prices.json`, so there is no
+> defensible $/hr for it here at all. The second is `minimax-m3`: ~854 GB of BF16 weights
+> fit neither 4× nor 8× H100, so the 4× H100 SXM row prices a run that cannot happen. Both
+> are tracked in README.md's *TODO before Day 1*; re-cost them before committing to the
+> Phase 1 total. `glm-5.3` is no longer blocked on weights (they are public as of
+> 2026-09-04) — that row's cost stands, only its parenthetical was wrong.
 
 Against the **$7,500 Lambda credit** (expires ~Aug 2027), the allocation is:
 
