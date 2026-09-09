@@ -46,6 +46,30 @@ case ":$PATH:" in
 esac
 
 VLLM_BIN="${VLLM_BIN:-vllm}"
+
+# ...and the same for a venv. Running $VENV/bin/vllm does NOT put $VENV/bin on PATH — a
+# console script sets sys.executable, nothing else — so anything the server shells out to
+# by NAME is invisible even though it is installed right beside the binary we just ran.
+#
+# vLLM does exactly that: FlashInfer JIT-compiles kernels during engine startup and execs
+# `ninja`. On the AI-P167 shakedown that produced
+#     FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+# with /home/ubuntu/harness-venv/bin/ninja present the whole time, installed by pip as a
+# vLLM dependency. The failure lands AFTER the weights are resolved and the engine starts,
+# which is the most expensive place to discover a PATH problem.
+#
+# This is the fourth time one root cause has bitten this repo — the agenttask grader's
+# `python`, the `hf` CLI, the `vllm` binary, and now `ninja`. The rule: if we invoke an
+# interpreter or console script by absolute path, its bin directory belongs on PATH,
+# because whatever it starts will look things up there.
+if [[ "$VLLM_BIN" == /* && -x "$VLLM_BIN" ]]; then
+  _vllm_bindir="$(cd "$(dirname "$VLLM_BIN")" && pwd)"
+  case ":$PATH:" in
+    *":$_vllm_bindir:"*) ;;
+    *) PATH="$_vllm_bindir:$PATH"; export PATH ;;
+  esac
+  unset _vllm_bindir
+fi
 mkdir -p "$STATE_DIR"
 
 if [[ -z "${WEIGHTS_DIR:-}" ]]; then
