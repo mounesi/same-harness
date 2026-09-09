@@ -77,6 +77,16 @@ export LAMBDA_API_KEY=... LAMBDA_FS=...
 ./gpuctl down
 ```
 
+**"Command not found", and it is installed.** This is the project's most expensive
+recurring failure: the program is present, and invisible only because its directory is not
+on PATH for a non-interactive `ssh host "cmd"` (which never sources `~/.profile`). It has
+killed four live-GPU runs — the grader's `python`, the `hf` CLI, the `vllm` binary, and
+`ninja`, which vLLM's FlashInfer JIT execs during *engine startup*, after the weights are
+resolved. `modelctl serve` now asserts every program a launch will exec **before** it
+downloads anything, and `./modelctl preflight <model>` runs that same check on its own in a
+second. A refusal names where the missing program actually is. Case notes and the two
+functions: `lib/pathguard.sh`.
+
 **The instance turns itself off if you forget.** It lives only while leased or while a harness
 process is running; `./gpuwatch` (CI, every 15 min) terminates it otherwise. Running long?
 `./gpuctl hold 4h`. Want to see the meter? `./gpuctl status`. The low-level tools

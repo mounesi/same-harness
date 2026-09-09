@@ -3,6 +3,7 @@
 # endpoint, for "The Harness Variable" benchmark (AI-P144).
 #
 #   ./modelctl list                    show registered models + which one is live
+#   ./modelctl preflight <model>       can this host launch it? (no download, no GPU time)
 #   ./modelctl download <model>        pull weights from HF into $WEIGHTS_DIR
 #   ./modelctl serve <model>           serve it with vLLM on $PORT (downloads if needed)
 #   ./modelctl switch <model>          stop whatever is running, serve <model>
@@ -15,6 +16,10 @@
 #   WEIGHTS_DIR   where weights live        (default: /persistent/models, else ~/models)
 #   PORT          vLLM port                 (default: 8000)
 #   VLLM_BIN      vllm executable           (default: vllm)
+#   HARNESS_PYTHON  interpreter that downloads the weights   (default: python3)
+#   MODELCTL_SKIP_LAUNCH_PREFLIGHT=1   launch anyway when the program preflight refuses
+#                 (mirrors HARNESS_SKIP_GRADING_PREFLIGHT; the missing program then
+#                  surfaces at engine startup instead, after the weights)
 #
 # Every model is a file in models.d/<name>.env defining:
 #   HF_REPO (required), TP, PP, MAX_MODEL_LEN, EXTRA_ARGS, MULTINODE, VLLM_DOCKER_IMAGE
@@ -34,16 +39,23 @@ BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS_D="$BASE_DIR/models.d"
 STATE_DIR="${STATE_DIR:-$BASE_DIR/.state}"
 PORT="${PORT:-8000}"
+
+# Four live-GPU failures in this project share one root cause: the program was installed and
+# present, and invisible only because its directory was not on PATH for non-interactive
+# execution. lib/pathguard.sh holds the four case notes and the two functions used here —
+# pathguard_adopt (the repair, for the bin dirs we know about) and pathguard_require (the
+# assertion, run before anything expensive). Sourcing it is not optional: a modelctl that
+# cannot find the guard is a modelctl that will rediscover the bug on a rented GPU.
+# shellcheck source=lib/pathguard.sh
+. "$BASE_DIR/lib/pathguard.sh"
+
 # pip installs console scripts into ~/.local/bin, which is NOT on PATH for a
 # non-interactive `ssh host "cmd"` — the exact way CI and gpuctl invoke this script. An
 # interactive login shell sources ~/.profile and picks it up, so this failure appears only
 # in automation, only after the instance is billing, and reads as "vllm: No such file or
 # directory" with no hint that the binary is right there. Observed on the AI-P167 shakedown
 # 2026-09-07: it cost one download cycle. Put the user bin dir on PATH before resolving.
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *) PATH="$HOME/.local/bin:$PATH"; export PATH ;;
-esac
+pathguard_adopt "$HOME/.local/bin"
 
 VLLM_BIN="${VLLM_BIN:-vllm}"
 
@@ -58,18 +70,11 @@ VLLM_BIN="${VLLM_BIN:-vllm}"
 # vLLM dependency. The failure lands AFTER the weights are resolved and the engine starts,
 # which is the most expensive place to discover a PATH problem.
 #
-# This is the fourth time one root cause has bitten this repo — the agenttask grader's
-# `python`, the `hf` CLI, the `vllm` binary, and now `ninja`. The rule: if we invoke an
-# interpreter or console script by absolute path, its bin directory belongs on PATH,
-# because whatever it starts will look things up there.
-if [[ "$VLLM_BIN" == /* && -x "$VLLM_BIN" ]]; then
-  _vllm_bindir="$(cd "$(dirname "$VLLM_BIN")" && pwd)"
-  case ":$PATH:" in
-    *":$_vllm_bindir:"*) ;;
-    *) PATH="$_vllm_bindir:$PATH"; export PATH ;;
-  esac
-  unset _vllm_bindir
-fi
+# The rule the guard generalises: if we invoke an interpreter or console script by absolute
+# path, its bin directory belongs on PATH, because whatever it starts will look things up
+# there. HARNESS_PYTHON is the other absolute path we are handed, so it gets it too.
+pathguard_adopt "$VLLM_BIN"
+pathguard_adopt "${HARNESS_PYTHON:-}"
 mkdir -p "$STATE_DIR"
 
 if [[ -z "${WEIGHTS_DIR:-}" ]]; then
@@ -97,6 +102,33 @@ load_model() {
   MODEL_DIR="$WEIGHTS_DIR/$name"
 }
 
+# Everything a launch of $MODEL_NAME will exec BY NAME, asserted before the weights
+# download rather than discovered after the engine starts. The list is the four failures
+# lib/pathguard.sh records, plus the one they teach us to expect next:
+#   $VLLM_BIN   the server itself     — AI-3157, "nohup: failed to run command 'vllm'"
+#   ninja       vLLM's FlashInfer JIT execs it during ENGINE STARTUP — AI-3159. It arrives
+#               as a pip dependency of vllm, so "nowhere on this host" means the serving
+#               stack is incomplete, not that this model happens not to need it.
+#   curl        wait_healthy's only probe. Without it a perfectly healthy server still
+#               reports "not healthy after 1800s" — 30 minutes of billing to learn nothing.
+#   python      the weights download runs through it, and huggingface_hub lives in THAT
+#               interpreter — not necessarily in whatever `python3` PATH resolves to.
+# Under VLLM_DOCKER_IMAGE the engine's own programs live inside the image; only docker and
+# curl are ours to check.
+require_launch_programs() {
+  # The escape hatch, same shape and same reason as HARNESS_SKIP_GRADING_PREFLIGHT: this
+  # list is a claim about what a launch reaches for, and a claim can be wrong. An operator
+  # who knows better must be able to overrule it — loudly, once, and on purpose.
+  if [[ "${MODELCTL_SKIP_LAUNCH_PREFLIGHT:-}" == "1" ]]; then
+    info "launch preflight skipped (MODELCTL_SKIP_LAUNCH_PREFLIGHT=1) — a missing program will surface at engine startup instead, after the weights"
+    return 0
+  fi
+  local need=(curl "${HARNESS_PYTHON:-python3}")
+  if [[ -n "$VLLM_DOCKER_IMAGE" ]]; then need+=(docker); else need+=("$VLLM_BIN" ninja); fi
+  pathguard_require "serving $MODEL_NAME on this host" "${need[@]}" \
+    || die "this host cannot serve $MODEL_NAME — see above. Nothing was downloaded and no GPU time was spent."
+}
+
 running_pid() {
   [[ -f "$PIDFILE" ]] || return 1
   local pid; pid="$(cat "$PIDFILE")"
@@ -120,6 +152,10 @@ cmd_list() {
 
 cmd_download() {
   load_model "$1"
+  # 60-160 GB is a poor way to discover that the interpreter holding huggingface_hub is not
+  # where we think it is.
+  pathguard_require "downloading $HF_REPO" "${HARNESS_PYTHON:-python3}" \
+    || die "cannot download $MODEL_NAME — see above. Nothing was written to $MODEL_DIR."
   mkdir -p "$MODEL_DIR"
   info "downloading $HF_REPO -> $MODEL_DIR (hf_transfer on)"
   # Downloaded through the PYTHON API, not the `hf` CLI. Two reasons, both observed on a
@@ -148,11 +184,20 @@ wait_healthy() {
   echo; die "server not healthy after $((tries*10))s — see: ./modelctl logs"
 }
 
+cmd_preflight() {
+  load_model "$1"
+  require_launch_programs
+  info "preflight ok — $MODEL_NAME can be launched on this host (weights: $MODEL_DIR)"
+}
+
 cmd_serve() {
   load_model "$1"
   if pid="$(running_pid)"; then
     die "'$(cat "$CURFILE" 2>/dev/null || echo '?')' is already running (pid $pid) — use: ./modelctl switch $MODEL_NAME"
   fi
+  # BEFORE the download, and long before the engine starts: this is the cheapest moment at
+  # which a missing program is still just a message.
+  require_launch_programs
   [[ -d "$MODEL_DIR" && -n "$(ls -A "$MODEL_DIR" 2>/dev/null)" ]] || cmd_download "$MODEL_NAME"
 
   if [[ "$MULTINODE" == "1" ]]; then
@@ -250,6 +295,7 @@ cmd_test() {
 
 case "${1:-}" in
   list)     cmd_list ;;
+  preflight) [[ $# -ge 2 ]] || die "usage: ./modelctl preflight <model>"; cmd_preflight "$2" ;;
   download) [[ $# -ge 2 ]] || die "usage: ./modelctl download <model>"; cmd_download "$2" ;;
   serve)    [[ $# -ge 2 ]] || die "usage: ./modelctl serve <model>";    cmd_serve "$2" ;;
   switch)   [[ $# -ge 2 ]] || die "usage: ./modelctl switch <model>";   cmd_switch "$2" ;;
@@ -257,5 +303,5 @@ case "${1:-}" in
   status)   cmd_status ;;
   logs)     cmd_logs "${2:-}" ;;
   test)     cmd_test ;;
-  *) sed -n '2,12p' "$0"; exit 1 ;;
+  *) sed -n '2,13p' "$0"; exit 1 ;;
 esac

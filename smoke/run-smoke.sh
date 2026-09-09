@@ -11,6 +11,8 @@
 #   ./smoke/run-smoke.sh [--keep]
 #
 # It asserts, in order:
+#   0. the PATH guard holds: lib/pathguard.sh passes its self-test, and `modelctl serve`
+#      refuses a host whose vLLM is missing BEFORE it downloads anything
 #   1. mock endpoint answers /v1/models         (run.sh preflight tier 1)
 #   2. manifest builds and REQUIRED fields resolve                       (tier 2)
 #   3. grading preflight passes for the suite                            (tier 3)
@@ -54,7 +56,11 @@ trap cleanup EXIT
 
 cd "$REPO"
 
-step "0. synthetic suite"
+step "0. pathguard + synthetic suite"
+# The PATH guard fronts every expensive step in this repo, so it is the first thing checked.
+bash lib/pathguard.sh --self-test >/dev/null || fail "lib/pathguard.sh --self-test failed"
+ok "pathguard self-test (adopts a bin dir, refuses a missing program, names where it is)"
+
 python3 smoke/make_pack.py --out "$PACK" >/dev/null || fail "could not build the pack"
 ok "2-task pack at $PACK"
 
@@ -82,6 +88,30 @@ trap 'rm -f "$REPO/models.d/'"$MODEL"'.env"; cleanup' EXIT
 
 mkdir -p "$WORK/weights/$MODEL"
 echo "synthetic" > "$WORK/weights/$MODEL/config.json"
+
+step "1b. modelctl launch preflight"
+# modelctl's launch preflight, through modelctl itself — the wiring, not just the library.
+# Both directions matter, and both are failures this repo has actually paid for:
+#   negative — a host that cannot launch must be refused BEFORE the weights download, with
+#              the missing program named (AI-3157: "nohup: failed to run command 'vllm'"
+#              arrived after provisioning, and read as nothing in particular).
+#   positive — a venv we are pointed INTO by absolute path must satisfy it, because a
+#              console script puts NOTHING on PATH: that is how `ninja`, sitting beside the
+#              vllm binary, went missing during engine startup (AI-3159). A guard that
+#              cannot see the siblings would refuse the one host that has ever served.
+set +e
+PG_OUT="$(VLLM_BIN=/nonexistent/vllm ./modelctl preflight "$MODEL" 2>&1)"; PG_RC=$?
+set -e
+[[ "$PG_RC" -ne 0 ]] || fail "modelctl preflight passed with VLLM_BIN=/nonexistent/vllm"
+grep -q 'REQUIRED PROGRAM NOT FOUND' <<<"$PG_OUT" \
+  || fail "modelctl preflight refused without naming the missing program: $PG_OUT"
+ok "modelctl refuses a host that cannot launch (before any download)"
+
+mkdir -p "$WORK/venv/bin"
+for p in vllm ninja; do printf '#!/bin/sh\nexit 0\n' >"$WORK/venv/bin/$p"; chmod +x "$WORK/venv/bin/$p"; done
+VLLM_BIN="$WORK/venv/bin/vllm" ./modelctl preflight "$MODEL" >/dev/null 2>&1 \
+  || fail "modelctl preflight refused a venv that has vllm and ninja in it (PATH adoption broke)"
+ok "modelctl accepts a venv it was pointed into, siblings included"
 
 step "2-4. run.sh: preflight, manifest, attempts"
 set +e
