@@ -423,7 +423,7 @@ and every `results.jsonl` record's `grade` block carries the same value (§3).
 | `nvidia_driver` | string \| null | `nvidia-smi --query-gpu=driver_version --format=csv,noheader` (first line) |
 | `cuda_runtime` | string \| null | `nvidia-smi` header, or `torch.version.cuda` |
 | `pip_freeze_sha256` | hex | sha256 of `env/pip-freeze.txt`, itself `python3 -m pip freeze --all` sorted |
-| `requirements_lock_sha256` | hex \| null | sha256 of `harness/requirements.lock` (fully pinned, hash-pinned); `null` sets `flags.provenance_incomplete` |
+| `requirements_lock_sha256` | hex \| null | sha256 of `harness/requirements.lock` (fully pinned at the 2026-09-09 resolutions; **not** hash-pinned — see that file's header); `null` sets `flags.provenance_incomplete` |
 | `tensor_parallel_size`, `pipeline_parallel_size`, `max_model_len`, `extra_args`, `multinode` | int/string/bool | sourced from `models.d/<model>.env` with `modelctl`'s defaults (`TP=1 PP=1 MAX_MODEL_LEN=262144 EXTRA_ARGS="" MULTINODE=0`). `extra_args` is a **blocking comparability key** in `aggregate.py`; if it contains `--max-model-len` or `--served-model-name` the build sets `flags.nonconformant` with reason `EXTRA_ARGS overrides a held-constant serving flag` (`modelctl` appends `$EXTRA_ARGS` *before* those flags, so the study values still win on the command line — the run is flagged, not silently corrected) |
 | `vllm_argv` | string \| null | the single line `modelctl` writes to `$STATE_DIR/vllm-argv` when it launches the server, copied into `<run_dir>/env/vllm-args.txt`; `null` if unavailable, which sets `flags.provenance_incomplete` |
 

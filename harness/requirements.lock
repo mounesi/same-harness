@@ -5,23 +5,61 @@
 # runtime.requirements_lock_sha256, so a dependency change is visible in the audit trail.
 #
 # Install on the GPU instance with:
-#   pip install --require-hashes -r harness/requirements.lock   (once hashes are filled in)
-#   pip install -r harness/requirements.lock                     (until then)
+#   pip install 'vllm==$VLLM_VERSION' hf_transfer -r harness/requirements.lock
+# in ONE pip pass — that is what gpuctl install_stack does, and the reason is below.
 #
 # vLLM is NOT listed here: it is pinned separately via the VLLM_VERSION repo variable so the
 # serving stack and the harness stack can be upgraded independently, and its resolved
 # dist-info RECORD digest is what the manifest records.
 #
-# TODO(AI-2955): re-resolve on the first provisioned instance and freeze exact versions +
-# --hash entries. The pins below are the intended majors, not verified resolutions.
+# ---------------------------------------------------------------------------------------
+# PROVENANCE — the versions below are resolutions, not intentions (was TODO(AI-2955)).
+#
+# The first end-to-end run on a provisioned instance completed 2026-09-09: vLLM served, the
+# agent loop ran, the hidden tests graded 2/2 resolved, the bundle verified. Every pin below
+# is the exact version pip resolved inside that run's hermetic venv, read back from its
+# env/pip-freeze.txt, with vllm==0.28.0 on driver 580.126.20 / CUDA 13.0.
+#
+# What that run proves, and what it does not:
+#
+#   VERIFIED — these three installed together in one resolution pass and imported clean in
+#   an environment that then served a full run. The rest of that environment (vLLM's
+#   transitive closure) is recorded here as the known-good reference point for the next
+#   re-resolve. It is deliberately NOT pinned: pinning torch et al. in this file would
+#   over-constrain the next VLLM_VERSION bump, and the serving stack is VLLM_VERSION's job.
+#       torch==2.13.0        transformers==5.16.1   tokenizers==0.23.2    numpy==2.3.5
+#       torchvision==0.28.0  torchaudio==2.11.0     torchcodec==0.16.0    hf-xet==1.6.0
+#       hf_transfer==0.1.9   torch_c_dlpack_ext==0.1.5
+#
+#   NOT VERIFIED — that run executed the agenttask suite from a local pack, which never
+#   imports `datasets`. So datasets==3.2.0 next to huggingface_hub==1.30.0 is proven to
+#   resolve, install and import; it is NOT proven to load a SWE-bench dataset. Only a
+#   swebench-verified / swebench-pro run shows that, and none has happened yet. Do not read
+#   this file as saying the pairing is dataset-clean.
+#
+#   NOT hash-pinned, so no --require-hashes. --hash entries need per-wheel digests, and
+#   `pip freeze` records versions only — nothing in the 2026-09-09 bundle carries a digest,
+#   so none is written here rather than invented. The audit trail is not blind meanwhile:
+#   runtime.pip_freeze_sha256 fixes the exact installed set of each run alongside
+#   requirements_lock_sha256. To close it, run `pip hash` over the downloaded wheels on a
+#   provisioned instance and paste the real digests.
+# ---------------------------------------------------------------------------------------
 
-datasets==3.2.0
 # Resolved together with vllm, never installed after it: a second pip pass silently
-# downgraded this to 0.27.1 under a vLLM that requires >=1.27.0 (AI-P167, 2026-09-07).
-# swebench stays on 3.0.x deliberately — 5.x drops MAP_REPO_VERSION_TO_SPECS, which
-# _swebench.py uses to build the test_cmd PROMPT variable, so bumping it silently
-# changes the prompt every model sees. See AI-3162 before touching that pin.
-huggingface_hub>=1.27.0
+# downgraded huggingface_hub to 0.27.1 under a vLLM that requires >=1.27.0 (AI-P167,
+# 2026-09-07). huggingface_hub was a >=1.27.0 floor until 2026-09-09; it is now the exact
+# version that ran. That exactness is only correct while VLLM_VERSION is 0.28.0 — bumping
+# vLLM means re-resolving these two, not force-installing around them.
+datasets==3.2.0
+huggingface_hub==1.30.0
 
 # SWE-bench official evaluation harness (grading). Docker is a system prerequisite.
+#
+# STAYS on 3.0.x, and not because 5.x crashes — because it does not. 5.x drops
+# MAP_REPO_VERSION_TO_SPECS, which _swebench.py `_resolve_test_cmd` imports to build the
+# `test_cmd` PROMPT variable, and that import sits inside `except Exception: pass`. So a
+# bump fails SOFT: the run completes, the prompt every model sees falls through to the
+# test_directives / `python -m pytest` branch instead, and prompt_dir_sha256 and the
+# template id are byte-identical either side — nothing in the manifest would say the runs
+# are no longer comparable. See AI-3162 before touching this pin.
 swebench==3.0.3
