@@ -42,6 +42,12 @@ jobs:
       LAMBDA_IMAGE: ${{ vars.LAMBDA_IMAGE }}
       VLLM_VERSION: ${{ vars.VLLM_VERSION }}
       INSTANCE_NAME: sh-ci-${{ inputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # Everything this job installs on the instance lives in ONE hermetic venv — the same
+      # one gpuctl's install_stack() builds (VENV_NAME, default harness-venv), so the CI
+      # path and the by-hand path in RUNBOOK §1.4 provision identically. Written absolute,
+      # not as ~: these paths are interpolated LOCALLY into ssh command strings, where the
+      # runner's HOME is not the instance's. The ssh user is hardcoded ubuntu here already.
+      VENV: /home/ubuntu/harness-venv
       # WEIGHTS_DIR is NOT hardcoded here. Lambda mounts persistent filesystems at
       # /lambda/nfs/<name>, not under $HOME, and only the API knows the mount point — the
       # old `/home/ubuntu/<fs>/models` resolved to ephemeral disk, which fails silently:
@@ -126,10 +132,67 @@ jobs:
             || { echo "::error::'$MOUNT' is not a mount on the instance — the filesystem did not attach (region mismatch?). Refusing to download weights onto ephemeral disk."; exit 1; }
           ssh "ubuntu@$IP" "mkdir -p '$WEIGHTS_DIR'"
 
-          ssh "ubuntu@$IP" "pip install -q 'vllm==${VLLM_VERSION}' hf_transfer"
-          # grading dependencies are pinned in harness/requirements.lock (codex invariant 5)
-          ssh "ubuntu@$IP" "cd ~/harness-repo && pip install -q -r harness/requirements.lock"
-          ssh "ubuntu@$IP" "cd ~/harness-repo && WEIGHTS_DIR=$WEIGHTS_DIR ./modelctl serve ${{ inputs.model }}"
+          [[ -n "${VLLM_VERSION:-}" ]] \
+            || { echo "::error::repo variable VLLM_VERSION is unset — the serving stack would be whatever the image carries and the run would not be reproducible"; exit 1; }
+
+          # A HERMETIC venv: python3 -m venv, deliberately WITHOUT --system-site-packages.
+          # This step used to `pip install` into the image's python. The Lambda image ships
+          # an apt-managed scientific stack in /usr/lib/python3/dist-packages compiled
+          # against numpy 1.x, and a --user install upgrades numpy to 2.x underneath it;
+          # the two then shadow each other:
+          #   apt scipy 1.8.0 -> ImportError: cannot import name 'Inf' from 'numpy'
+          #   apt sklearn     -> ValueError: numpy.dtype size changed (ABI mismatch)
+          # Both observed on the AI-P167 shakedown, one after the other, each costing a
+          # serve attempt on a GPU that bills by the hour while it fails (the largest
+          # instance in pricing/fallback-prices.json is $39.92/hr). With dist-packages hidden
+          # the conflict cannot arise. It also makes runtime.requirements_lock_sha256 mean
+          # something: the lock then describes the environment that actually ran.
+          ssh "ubuntu@$IP" "test -x $VENV/bin/python || python3 -m venv $VENV"
+          ssh "ubuntu@$IP" "$VENV/bin/pip install -q --upgrade pip setuptools wheel"
+          # ONE resolution pass. Installing vLLM and then the lock separately lets the
+          # second install silently downgrade a dependency out from under the first — that
+          # is how huggingface_hub landed on 0.27.1 under a vLLM requiring >=1.27.0, with
+          # only a pip warning to show for it. Resolved together, an incompatibility is an
+          # error here instead of a failure after the weights.
+          # (grading dependencies are pinned in harness/requirements.lock — codex invariant 5)
+          ssh "ubuntu@$IP" "cd ~/harness-repo && $VENV/bin/pip install -q 'vllm==${VLLM_VERSION}' hf_transfer -r harness/requirements.lock" \
+            || { echo "::error::could not install the pinned stack — vllm==${VLLM_VERSION} and harness/requirements.lock may be mutually unsatisfiable. Resolve them together; do not install them in sequence."; exit 1; }
+
+          # Fail here, cheaply, rather than after the weights load. Import vLLM's CUDA
+          # platform module, not merely torch: with a force-installed cu128 torch,
+          # torch.cuda.is_available() returns True and a torch-only check passes, and then
+          # vLLM dies at serve time — AFTER the download — on
+          #     ImportError: libcudart.so.13  (vllm._C_stable_libtorch)
+          # because vLLM ships its OWN compiled extension linked against a CUDA runtime
+          # that has nothing to do with torch's. Same guard as gpuctl's install_stack().
+          echo "==> checking the GPU is visible to this stack, and that vLLM itself loads"
+          ssh "ubuntu@$IP" "$VENV/bin/python -" <<'PYGPU' \
+            || { echo "::error::the installed stack cannot serve on this instance (see above). Nothing has been downloaded yet — pin a compatible VLLM_VERSION and re-run."; exit 1; }
+          import sys
+          import torch
+          if not torch.cuda.is_available():
+              sys.exit('torch %s (cuda %s) cannot see the GPU — the host driver is older than this '
+                       'build. Pin a vLLM whose torch targets this driver.' % (torch.__version__, torch.version.cuda))
+          try:
+              import vllm.platforms.cuda  # the compiled extension, linked to its own CUDA runtime
+          except Exception as exc:
+              sys.exit('torch works, but vLLM will not load on this host: %s: %s. vLLM ships its own '
+                       'CUDA extension; a torch that runs here does not imply a vLLM that runs here.'
+                       % (type(exc).__name__, exc))
+          print('  gpu ok:', torch.cuda.get_device_name(0), '| torch', torch.__version__,
+                'cuda', torch.version.cuda, '| vllm loads')
+          PYGPU
+
+          # modelctl must use the venv for BOTH jobs: HARNESS_PYTHON drives the weights
+          # download (huggingface_hub lives in the venv, not in the system python) and
+          # VLLM_BIN drives the server. Leaving either pointed at the system interpreter
+          # reintroduces the apt/pip split the venv exists to remove. Passing VLLM_BIN as an
+          # absolute path is also what puts the venv's bin on PATH inside modelctl, which
+          # vLLM needs: it execs `ninja` BY NAME while FlashInfer JIT-compiles kernels
+          # during engine startup.
+          ssh "ubuntu@$IP" "cd ~/harness-repo && WEIGHTS_DIR=$WEIGHTS_DIR \
+            HARNESS_PYTHON=$VENV/bin/python VLLM_BIN=$VENV/bin/vllm \
+            ./modelctl serve ${{ inputs.model }}"
           # Everything up to here is SETUP: instance provision + weight download + vLLM load.
           # CONTRACTS.md §8 reports that time separately and never folds it into
           # cost_per_resolved, so the ledger step needs the boundary timestamp.
@@ -151,7 +214,17 @@ jobs:
           # line per run (§1.4). Capture it — the harness run_id is the ONLY join key between
           # the cost ledger and analysis/aggregate.py (§3.1). tee writes as lines arrive, so a
           # run that dies mid-flight still leaves the ids it already emitted.
+          # The venv on PATH is load-bearing, not tidiness: the agenttask adapter grades by
+          # running its hidden tests through a SHELL as `python3 -m pytest` (GRADER_PYTHON,
+          # harness/adapters/agenttask.py), so which interpreter grades is decided by PATH.
+          # With the system python3 first, pytest is not importable and the tier-3 grading
+          # preflight refuses to start the run — or, worse, every attempt grades TESTS_FAIL
+          # 0/N and publishes as a model result rather than as a broken host.
+          # HARNESS_PYTHON pins run.sh's own driver to the same interpreter regardless of
+          # PATH order; the harness modules need the locked deps, which live only in the venv.
           ssh "ubuntu@$IP" "cd ~/harness-repo && \
+            PATH=$VENV/bin:\$PATH \
+            HARNESS_PYTHON=$VENV/bin/python \
             WEIGHTS_DIR=$WEIGHTS_DIR \
             LAMBDA_INSTANCE_ID='${LAMBDA_INSTANCE_ID}' \
             LAMBDA_INSTANCE_TYPE='${LAMBDA_INSTANCE_TYPE}' \
