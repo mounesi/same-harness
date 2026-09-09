@@ -97,21 +97,56 @@ step "1b. modelctl launch preflight"
 #              arrived after provisioning, and read as nothing in particular).
 #   positive — a venv we are pointed INTO by absolute path must satisfy it, because a
 #              console script puts NOTHING on PATH: that is how `ninja`, sitting beside the
-#              vllm binary, went missing during engine startup (AI-3159). A guard that
-#              cannot see the siblings would refuse the one host that has ever served.
+#              vllm binary, went missing during engine startup (AI-P167 shakedown,
+#              2026-09-07 — no ticket; see commit d249261). A guard that cannot see the
+#              siblings would refuse the one host that has ever served.
 set +e
 PG_OUT="$(VLLM_BIN=/nonexistent/vllm ./modelctl preflight "$MODEL" 2>&1)"; PG_RC=$?
 set -e
 [[ "$PG_RC" -ne 0 ]] || fail "modelctl preflight passed with VLLM_BIN=/nonexistent/vllm"
 grep -q 'REQUIRED PROGRAM NOT FOUND' <<<"$PG_OUT" \
   || fail "modelctl preflight refused without naming the missing program: $PG_OUT"
-ok "modelctl refuses a host that cannot launch (before any download)"
+# ...and the program it names must be the one we broke. Asserting only the banner text lets
+# this pass for the wrong reason on any runner missing some OTHER program in the list.
+grep -q '/nonexistent/vllm' <<<"$PG_OUT" \
+  || fail "modelctl preflight refused, but did not name /nonexistent/vllm: $PG_OUT"
+ok "modelctl refuses a host that cannot launch, naming the program (before any download)"
 
 mkdir -p "$WORK/venv/bin"
-for p in vllm ninja; do printf '#!/bin/sh\nexit 0\n' >"$WORK/venv/bin/$p"; chmod +x "$WORK/venv/bin/$p"; done
-VLLM_BIN="$WORK/venv/bin/vllm" ./modelctl preflight "$MODEL" >/dev/null 2>&1 \
-  || fail "modelctl preflight refused a venv that has vllm and ninja in it (PATH adoption broke)"
-ok "modelctl accepts a venv it was pointed into, siblings included"
+# Normalised: pathguard_adopt reports the dir through `cd && pwd`, so a $WORK carrying a
+# doubled slash would not match the paths it prints.
+VENVBIN="$(cd "$WORK/venv/bin" && pwd)"
+for p in vllm ninja; do printf '#!/bin/sh\nexit 0\n' >"$VENVBIN/$p"; chmod +x "$VENVBIN/$p"; done
+set +e
+PG_OUT="$(VLLM_BIN="$VENVBIN/vllm" ./modelctl preflight "$MODEL" 2>&1)"; PG_RC=$?
+set -e
+[[ "$PG_RC" -eq 0 ]] \
+  || fail "modelctl preflight refused a venv that has vllm and ninja in it (PATH adoption broke): $PG_OUT"
+# Exit 0 alone would also pass on a runner that happens to have a real vllm/ninja on PATH,
+# proving nothing about adoption. The ok-line names the resolved path of each program, and
+# pathguard_adopt PREPENDS the venv bin dir, so a resolution through the venv is the proof
+# that adoption happened. `command -v ninja` is empty on this repo's dev machine, so without
+# this assertion the positive case would be untested there too.
+grep -q "$VENVBIN/vllm" <<<"$PG_OUT" \
+  || fail "preflight passed but did not resolve vllm through the adopted venv: $PG_OUT"
+grep -q "$VENVBIN/ninja" <<<"$PG_OUT" \
+  || fail "preflight passed but did not resolve ninja through the adopted venv: $PG_OUT"
+ok "modelctl accepts a venv it was pointed into, resolving siblings through it"
+
+# ninja is ADVISORY, not required: nothing in this repo pins it (it is absent from
+# harness/requirements.lock, which says vLLM is pinned separately via VLLM_VERSION), so a
+# refusal would be a false refusal whose only escape is turning the whole preflight off.
+# It must warn and continue — and it must still say the word `ninja`.
+rm -f "$VENVBIN/ninja"
+set +e
+PG_OUT="$(VLLM_BIN="$VENVBIN/vllm" ./modelctl preflight "$MODEL" 2>&1)"; PG_RC=$?
+set -e
+[[ "$PG_RC" -eq 0 ]] || fail "modelctl preflight refused over a missing ninja (it is advisory): $PG_OUT"
+grep -q 'ninja' <<<"$PG_OUT" || fail "a missing ninja produced no mention of ninja: $PG_OUT"
+if grep -q 'REQUIRED PROGRAM NOT FOUND' <<<"$PG_OUT"; then
+  fail "a missing ninja printed the hard-refusal banner: $PG_OUT"
+fi
+ok "a missing ninja warns and continues; the required programs still refuse"
 
 step "2-4. run.sh: preflight, manifest, attempts"
 set +e

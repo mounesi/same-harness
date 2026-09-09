@@ -8,7 +8,7 @@ One CLI, one OpenAI-compatible endpoint, six open models. The harness always tal
 ```bash
 pip install vllm hf_transfer
 ./modelctl list                     # see registry + what's on disk
-./modelctl preflight qwen3-coder-next  # seconds: can this host launch it at all?
+./modelctl preflight qwen3-coder-next  # seconds: do the programs a launch execs resolve here?
 ./modelctl serve qwen3-coder-next   # downloads if needed, serves, waits for health
 ./modelctl test                     # one real completion through the endpoint
 ./modelctl switch kimi-k3           # stop current, serve next

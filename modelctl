@@ -3,7 +3,9 @@
 # endpoint, for "The Harness Variable" benchmark (AI-P144).
 #
 #   ./modelctl list                    show registered models + which one is live
-#   ./modelctl preflight <model>       can this host launch it? (no download, no GPU time)
+#   ./modelctl preflight <model>       do the programs a launch execs resolve here? (no
+#                                      download, no GPU time; GPU/driver/vLLM-import are
+#                                      gpuctl's install_stack, not this)
 #   ./modelctl download <model>        pull weights from HF into $WEIGHTS_DIR
 #   ./modelctl serve <model>           serve it with vLLM on $PORT (downloads if needed)
 #   ./modelctl switch <model>          stop whatever is running, serve <model>
@@ -19,7 +21,9 @@
 #   HARNESS_PYTHON  interpreter that downloads the weights   (default: python3)
 #   MODELCTL_SKIP_LAUNCH_PREFLIGHT=1   launch anyway when the program preflight refuses
 #                 (mirrors HARNESS_SKIP_GRADING_PREFLIGHT; the missing program then
-#                  surfaces at engine startup instead, after the weights)
+#                  surfaces at engine startup instead, after the weights. `ninja` already
+#                  only warns, so this is rarely the right lever — see require_launch_programs.
+#                  Documented in RUNBOOK.md 2.3)
 #
 # Every model is a file in models.d/<name>.env defining:
 #   HF_REPO (required), TP, PP, MAX_MODEL_LEN, EXTRA_ARGS, MULTINODE, VLLM_DOCKER_IMAGE
@@ -42,10 +46,12 @@ PORT="${PORT:-8000}"
 
 # Four live-GPU failures in this project share one root cause: the program was installed and
 # present, and invisible only because its directory was not on PATH for non-interactive
-# execution. lib/pathguard.sh holds the four case notes and the two functions used here —
-# pathguard_adopt (the repair, for the bin dirs we know about) and pathguard_require (the
-# assertion, run before anything expensive). Sourcing it is not optional: a modelctl that
-# cannot find the guard is a modelctl that will rediscover the bug on a rented GPU.
+# execution. lib/pathguard.sh holds the four case notes and the three functions used here —
+# pathguard_adopt (the repair, for the bin dirs we know about), pathguard_require (the
+# assertion, run before anything expensive) and pathguard_advise (the same diagnosis without
+# the refusal, for a program we expect but cannot prove is needed). Sourcing it is not
+# optional: a modelctl that cannot find the guard is a modelctl that will rediscover the bug
+# on a rented GPU.
 # shellcheck source=lib/pathguard.sh
 . "$BASE_DIR/lib/pathguard.sh"
 
@@ -103,30 +109,51 @@ load_model() {
 }
 
 # Everything a launch of $MODEL_NAME will exec BY NAME, asserted before the weights
-# download rather than discovered after the engine starts. The list is the four failures
-# lib/pathguard.sh records, plus the one they teach us to expect next:
-#   $VLLM_BIN   the server itself     — AI-3157, "nohup: failed to run command 'vllm'"
-#   ninja       vLLM's FlashInfer JIT execs it during ENGINE STARTUP — AI-3159. It arrives
-#               as a pip dependency of vllm, so "nowhere on this host" means the serving
-#               stack is incomplete, not that this model happens not to need it.
+# download rather than discovered after the engine starts. TWO tiers, because the evidence
+# behind the list is not uniform.
+#
+# REFUSED when missing — each of these is something THIS script itself runs:
+#   $VLLM_BIN   the server, started right here by nohup — AI-3157, "nohup: failed to run
+#               command 'vllm'"
 #   curl        wait_healthy's only probe. Without it a perfectly healthy server still
 #               reports "not healthy after 1800s" — 30 minutes of billing to learn nothing.
-#   python      the weights download runs through it, and huggingface_hub lives in THAT
+#   python      cmd_download runs through it, and huggingface_hub lives in THAT
 #               interpreter — not necessarily in whatever `python3` PATH resolves to.
-# Under VLLM_DOCKER_IMAGE the engine's own programs live inside the image; only docker and
-# curl are ours to check.
+#   docker      under VLLM_DOCKER_IMAGE, the launch is a docker run. The engine's own
+#               programs then live inside the image and are not ours to check.
+#
+# WARNED about when missing — `ninja`:
+#   vLLM's FlashInfer JIT execs it during ENGINE STARTUP, and that is the most expensive
+#   place this repo has ever found a PATH problem (AI-P167 shakedown, 2026-09-07; commit
+#   d249261). But we cannot prove from anything in this repo that a launch always needs it:
+#   ninja is not in harness/requirements.lock, and that file says outright that vLLM is
+#   pinned separately, via VLLM_VERSION — so whether pip drags ninja in is a property of
+#   the vLLM version and platform, observed once, not a pin we control. Refusing on an
+#   unproven claim would be a FALSE refusal whose only cure is switching the whole preflight
+#   off, losing the three assertions above that are not in doubt. So: say it loudly, at the
+#   cheap moment, and continue.
 require_launch_programs() {
+  # cmd_switch checks before it stops the running server, then cmd_serve checks again;
+  # download does its own interpreter check. One pass per model per process is enough, and
+  # keeps the ok-line from printing two and three times.
+  if [[ "${_MODELCTL_PREFLIGHT_DONE:-}" == "$MODEL_NAME" ]]; then return 0; fi
   # The escape hatch, same shape and same reason as HARNESS_SKIP_GRADING_PREFLIGHT: this
   # list is a claim about what a launch reaches for, and a claim can be wrong. An operator
-  # who knows better must be able to overrule it — loudly, once, and on purpose.
+  # who knows better must be able to overrule it — loudly, once, and on purpose. Documented
+  # in RUNBOOK.md §2.3 alongside HARNESS_SKIP_GRADING_PREFLIGHT.
   if [[ "${MODELCTL_SKIP_LAUNCH_PREFLIGHT:-}" == "1" ]]; then
     info "launch preflight skipped (MODELCTL_SKIP_LAUNCH_PREFLIGHT=1) — a missing program will surface at engine startup instead, after the weights"
+    _MODELCTL_PREFLIGHT_DONE="$MODEL_NAME"
     return 0
   fi
   local need=(curl "${HARNESS_PYTHON:-python3}")
-  if [[ -n "$VLLM_DOCKER_IMAGE" ]]; then need+=(docker); else need+=("$VLLM_BIN" ninja); fi
+  if [[ -n "$VLLM_DOCKER_IMAGE" ]]; then need+=(docker); else need+=("$VLLM_BIN"); fi
   pathguard_require "serving $MODEL_NAME on this host" "${need[@]}" \
     || die "this host cannot serve $MODEL_NAME — see above. Nothing was downloaded and no GPU time was spent."
+  if [[ -z "$VLLM_DOCKER_IMAGE" ]]; then
+    pathguard_advise "vLLM's FlashInfer JIT, which execs it during engine startup" ninja
+  fi
+  _MODELCTL_PREFLIGHT_DONE="$MODEL_NAME"
 }
 
 running_pid() {
@@ -153,9 +180,13 @@ cmd_list() {
 cmd_download() {
   load_model "$1"
   # 60-160 GB is a poor way to discover that the interpreter holding huggingface_hub is not
-  # where we think it is.
-  pathguard_require "downloading $HF_REPO" "${HARNESS_PYTHON:-python3}" \
-    || die "cannot download $MODEL_NAME — see above. Nothing was written to $MODEL_DIR."
+  # where we think it is. Skipped when the launch preflight already asserted the same
+  # interpreter in this process (cmd_serve calls download): the check is free, the second
+  # ok-line is just noise that makes the first one easier to miss.
+  if [[ "${_MODELCTL_PREFLIGHT_DONE:-}" != "$MODEL_NAME" ]]; then
+    pathguard_require "downloading $HF_REPO" "${HARNESS_PYTHON:-python3}" \
+      || die "cannot download $MODEL_NAME — see above. Nothing was written to $MODEL_DIR."
+  fi
   mkdir -p "$MODEL_DIR"
   info "downloading $HF_REPO -> $MODEL_DIR (hf_transfer on)"
   # Downloaded through the PYTHON API, not the `hf` CLI. Two reasons, both observed on a
@@ -187,7 +218,15 @@ wait_healthy() {
 cmd_preflight() {
   load_model "$1"
   require_launch_programs
-  info "preflight ok — $MODEL_NAME can be launched on this host (weights: $MODEL_DIR)"
+  # Deliberately narrow. This command proves ONE thing: the programs a launch of
+  # $MODEL_NAME execs by name resolve here. It says nothing about the GPU, the driver/torch
+  # CUDA match, VRAM, or whether vLLM imports — those are gpuctl's install_stack, run by
+  # `./gpuctl up --serve`, and on the AI-P167 shakedown they cost three serve attempts of
+  # their own. An OK line that implied "this host can serve" would be the same species of
+  # misdirection this check exists to remove.
+  info "preflight ok — every program a launch of $MODEL_NAME execs resolves on this host"
+  info "            (weights: $MODEL_DIR; GPU, driver/CUDA match and vLLM's own import are"
+  info "             NOT checked here — that is gpuctl's install_stack, on ./gpuctl up --serve)"
 }
 
 cmd_serve() {
@@ -265,7 +304,10 @@ cmd_stop() {
   rm -f "$PIDFILE" "$CURFILE" "$ARGVFILE"
 }
 
-cmd_switch() { cmd_stop; cmd_serve "$1"; }
+# Preflight BEFORE the stop, not after it. A refusal is then non-destructive: the model that
+# was running is still running. Ordered the other way, a host that cannot launch the new
+# model loses the old one too, and the operator is left with nothing serving.
+cmd_switch() { load_model "$1"; require_launch_programs; cmd_stop; cmd_serve "$1"; }
 
 cmd_status() {
   if pid="$(running_pid)"; then
@@ -303,5 +345,5 @@ case "${1:-}" in
   status)   cmd_status ;;
   logs)     cmd_logs "${2:-}" ;;
   test)     cmd_test ;;
-  *) sed -n '2,13p' "$0"; exit 1 ;;
+  *) sed -n '2,15p' "$0"; exit 1 ;;
 esac

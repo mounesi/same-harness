@@ -15,13 +15,16 @@
 #            provisioning.
 #   AI-3157  the `vllm` binary itself: "nohup: failed to run command 'vllm'", with
 #            /home/ubuntu/.local/bin/vllm present the whole time.
-#   AI-3159  `ninja`: vLLM's FlashInfer JIT-compiles kernels during ENGINE STARTUP and
-#            execs `ninja`. It was in the venv, installed by pip as a vLLM dependency. It
-#            failed AFTER the weights were resolved — the most expensive possible moment.
+#   (no ticket)  `ninja`: vLLM's FlashInfer JIT-compiles kernels during ENGINE STARTUP and
+#            execs `ninja`. Found on the AI-P167 shakedown, 2026-09-07; it was fixed
+#            directly in modelctl (commit d249261) and never got a ticket of its own, so
+#            that commit and modelctl's own comment are the whole record. It sat in the
+#            venv — pip had installed it alongside vllm twenty minutes earlier — and it
+#            failed AFTER the weights were resolved, the most expensive possible moment.
 #
 # Each was fixed as a one-off point fix, and a fifth is likely, because the pattern is not
 # in any one program: it is that we hand a program an absolute path and then assume
-# everything IT reaches for by name is visible too. So, two functions:
+# everything IT reaches for by name is visible too. So, three functions:
 #
 #   pathguard_adopt <bin-dir|program-path>
 #       A console script sets sys.executable and NOTHING else: running $VENV/bin/vllm does
@@ -37,6 +40,11 @@
 #       from "not installed anywhere we looked" — that distinction is the entire diagnosis,
 #       and it is exactly what `command not found` withholds.
 #
+#   pathguard_advise <what needs them> <program>...
+#       The same diagnosis, printed as a WARNING and always returning 0. For a program we
+#       believe a step reaches for but cannot prove it does: worth a heads-up at the cheap
+#       moment, not worth refusing on. See modelctl's `ninja`.
+#
 # The division of labour matters. adopt REPAIRS the dirs we already know about; that is the
 # behaviour that makes modelctl work today and it stays. require is the ASSERTION that the
 # result is actually sufficient — it is what fires for the fifth program, the one in a
@@ -44,9 +52,11 @@
 # repairs PATH: silent repair would hide exactly the drift we want to see.
 #
 # The python-side twin of require is `manifest.py grading-preflight`, which checks the
-# binaries and modules grade() will reach for before the first model call. Between them,
-# every program the harness execs by name is asserted before the expensive step that needs
-# it: serving (here, via modelctl) and grading (there).
+# binaries and modules grade() will reach for before the first model call. Between them the
+# two expensive steps of a BENCHMARK RUN are covered — serving (here, via modelctl) and
+# grading (there). Not everything in the repo is: training/train_lora.sh does not source
+# this file and execs bare `python3` and `$TORCHRUN_BIN` on the same rented GPU, which is
+# the AI-3155 shape exactly. That gap is real and named here rather than papered over.
 #
 # Self-test:  bash lib/pathguard.sh --self-test        (run by smoke/run-smoke.sh, so CI
 #                                                       covers it on every push)
@@ -86,11 +96,27 @@ pathguard_adopt() {
 
 # Candidate dirs to search when a program is missing, one per line. Diagnosis only —
 # nothing here is added to PATH.
+#
+# The set must cover where the programs we assert on ACTUALLY live, not just the dirs a
+# stripped PATH is missing at the top. The system dirs are the ones that matter most for
+# the realistic stripped-PATH cases (a container entrypoint, `env -i`, a cron or systemd
+# unit): those lose /usr/bin, not ~/.local/bin. The Lambda instance's default PATH, recorded
+# in commit d249261, is
+#     /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin
+# and on this repo's macOS dev machine `command -v` puts curl and nohup in /usr/bin, sh in
+# /bin, python3 and docker in /usr/local/bin. So: adopted and caller dirs first (most
+# specific — if we were pointed at a venv, that venv is the best answer), then the user bin
+# dir, then the system dirs from those two PATHs that can hold a program we exec — the games
+# dirs are the only ones left out. Omitting the system dirs made `pathguard_where curl`
+# return empty with curl sitting in /usr/bin, i.e. the guard told the operator to install a
+# program that was installed — the same misdirection it exists to end.
 _pathguard_search_dirs() {
   local d dirs
-  dirs="$PATHGUARD_ADOPTED:$PATHGUARD_SEARCH_DIRS:$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:/snap/bin"
+  dirs="$PATHGUARD_ADOPTED:$PATHGUARD_SEARCH_DIRS:$HOME/.local/bin"
+  dirs="$dirs:/usr/local/bin:/usr/local/sbin:/opt/homebrew/bin:/snap/bin"
+  dirs="$dirs:/usr/bin:/bin:/usr/sbin:/sbin"
   # Any venv directly under $HOME: gpuctl builds ~/harness-venv, and that is precisely
-  # where `ninja` sat for the whole of AI-3159.
+  # where `ninja` sat on the AI-P167 shakedown.
   for d in "$HOME"/*/bin; do
     [[ -d "$d" ]] && dirs="$dirs:$d"
   done
@@ -113,11 +139,12 @@ pathguard_where() {
   return 0
 }
 
-# pathguard_require <what needs them> <program>...
-# 0 if every program resolves; otherwise prints the diagnosis on stderr and returns 1.
-# An argument containing a slash is an explicit path, not a PATH lookup, and is tested as
-# a file — that is how $VLLM_BIN and $HARNESS_PYTHON arrive here.
-pathguard_require() {
+# _pathguard_check <hard|soft> <what needs them> <program>...
+# The shared body of require and advise: identical resolution and identical diagnosis, so
+# the two tiers can never drift apart in what they report. Only the banner and the return
+# code differ.
+_pathguard_check() {
+  local tier="${1:-hard}"; shift || true
   local what="${1:-programs}"; shift || true
   local prog resolved found missing=() ok_line=""
   for prog in "$@"; do
@@ -136,8 +163,13 @@ pathguard_require() {
   fi
 
   {
-    printf '\n  !!  REQUIRED PROGRAM NOT FOUND — REFUSING TO CONTINUE  !!\n'
-    printf '      needed by : %s\n' "$what"
+    if [[ "$tier" == hard ]]; then
+      printf '\n  !!  REQUIRED PROGRAM NOT FOUND — REFUSING TO CONTINUE  !!\n'
+      printf '      needed by : %s\n' "$what"
+    else
+      printf '\n  ..  EXPECTED PROGRAM NOT FOUND — CONTINUING ANYWAY  ..\n'
+      printf '      expected by : %s\n' "$what"
+    fi
     for prog in "${missing[@]}"; do
       # ${x##*/} and ${x%/*}, not basename/dirname: a report about a broken PATH must not
       # itself depend on finding programs on PATH.
@@ -154,10 +186,28 @@ pathguard_require() {
       fi
     done
     printf '      PATH      : %s\n' "$PATH"
-    printf '  Nothing expensive has happened yet — this is the cheap place to find out.\n\n'
+    if [[ "$tier" == hard ]]; then
+      printf '  Nothing expensive has happened yet — this is the cheap place to find out.\n\n'
+    else
+      printf '  Not fatal: we cannot prove this step needs it. If the step later dies on this\n'
+      printf '  program, this line is where it was already visible, for free.\n\n'
+    fi
   } >&2
-  return 1
+  if [[ "$tier" == hard ]]; then return 1; fi
+  return 0
 }
+
+# pathguard_require <what needs them> <program>...
+# 0 if every program resolves; otherwise prints the diagnosis on stderr and returns 1.
+# An argument containing a slash is an explicit path, not a PATH lookup, and is tested as
+# a file — that is how $VLLM_BIN and $HARNESS_PYTHON arrive here.
+pathguard_require() { _pathguard_check hard "$@"; }
+
+# pathguard_advise <what needs them> <program>...
+# Always 0. Same diagnosis, printed as a warning. Use it where the CLAIM that the step
+# needs the program is itself unproven: a refusal there is a false refusal, and the cure
+# (skip the whole preflight) is worse than the disease.
+pathguard_advise() { _pathguard_check soft "$@"; }
 
 # --------------------------------------------------------------------- self-test
 # Sourced, this file defines functions and does nothing else. Run directly with
@@ -200,6 +250,28 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" && "${1:-}" == "--self-test" ]]; then
   # 5. an explicit path is tested as a file, not looked up on PATH.
   pathguard_require "self-test" "$_t/bin/pathguard-fake" >/dev/null 2>&1 || _fail "explicit path rejected"
   pathguard_require "self-test" "$_t/bin/nope" >/dev/null 2>&1 && _fail "nonexistent explicit path accepted"
+
+  # 6. the search set reaches the SYSTEM dirs. A stripped PATH (container entrypoint,
+  #    `env -i`, cron) loses /usr/bin, not ~/.local/bin, and the guard used to answer
+  #    "not in any bin dir we know of" for a program sitting in /usr/bin.
+  _sys=""
+  for _d in /usr/bin /bin /usr/sbin /sbin /usr/local/bin; do
+    if [[ -x "$_d/env" ]]; then _sys="$_d"; break; fi
+  done
+  if [[ -n "$_sys" ]]; then
+    _out="$(PATH=/pathguard-nonexistent; PATHGUARD_ADOPTED=""; PATHGUARD_SEARCH_DIRS=""
+            pathguard_require "self-test" env 2>&1)" && _fail "require passed with an empty PATH"
+    case "$_out" in
+      *"INSTALLED at $_sys/env"*) ;;
+      *) _fail "a program in $_sys was not found by the search set: $_out" ;;
+    esac
+  fi
+
+  # 7. advise gives the same diagnosis and does NOT refuse.
+  _out="$(pathguard_advise "self-test" pathguard-nowhere-at-all 2>&1)" \
+    || _fail "pathguard_advise returned non-zero for a missing program"
+  case "$_out" in *"CONTINUING ANYWAY"*) ;; *) _fail "advise did not warn: $_out" ;; esac
+  case "$_out" in *"REFUSING"*) _fail "advise printed a refusal banner: $_out" ;; esac
 
   printf 'pathguard self-test ok\n'
 fi
