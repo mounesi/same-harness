@@ -21,12 +21,21 @@ vLLM args). Add a model = add a file. Current lineup:
 
 | name | GPUs | notes |
 |---|---|---|
-| qwen3-coder-next | 1× H100 | cheap anchor |
-| minimax-m3 | 4–8× H100 | verify specs on HF card before reserving |
+| qwen3-coder-next | 2× H100 (FP8) — 4× for BF16 | NOT a 1× H100 model, and not the cheap anchor the plan assumed; FP8-vs-BF16 is still an open study-design call (AI-3158) |
+| minimax-m3 | 4× H100 | 428B/23B MoE; the ~230B figure was FP8 weight *size*, not params — resolved 2026-08-31, TP=4 |
 | deepseek-v4-flash | 8× H100 | use the retrained agentic checkpoint |
-| glm-5.3 | 8× B200 | BLOCKED on Zhipu weights release — no 5.2 fallback; if not out by run day, defer to reserve |
-| kimi-k3 | 8× B200 (single node) | native MXFP4; accept HF license first |
-| qwen3.8-max | 2× 8× B200 (multi-node) | native FP8; needs Ray cluster; accept HF license first |
+| glm-5.3 | 8× B200 | unblocked: `zai-org/GLM-5.3` is public and ungated on HF (verified 2026-09-09). Phase 1 or Phase 3 reserve is now a scheduling call, not a blocker |
+| kimi-k3 | 8× B200 (single node) | native MXFP4 |
+| qwen3.8-max | 2× 8× B200 (multi-node) | native FP8; needs Ray cluster |
+
+Sizing lives with the model, not here: each `models.d/<name>.env` carries the arithmetic
+(weights ÷ card, KV cache at `--max-model-len 262144`) behind its `TP` and `INSTANCE_TYPE`.
+Where this table and an env file disagree, **the env file is right** — it is what launches
+the instance. This table was wrong about qwen3-coder-next for exactly that reason: it read
+"80B/A3B" as a small model, but A3B is 3B *active* parameters per token and all 79.7B must
+be resident — ~159 GB at BF16 against an 80 GB card, and the FP8 sibling is ~80 GB, i.e. the
+whole card before a single KV-cache block. 2× H100 SXM5 is $8.38/hr, not the $2.49 the cost
+plan was built on.
 
 ## Conventions (held constant across models — this is the study)
 
@@ -38,10 +47,20 @@ vLLM args). Add a model = add a file. Current lineup:
 
 ## TODO before Day 1
 
-- [ ] verify every `HF_REPO` id (marked TODO in models.d/)
-- [ ] accept Kimi K3 + Qwen3.8-Max licenses on HF
-- [ ] resolve MiniMax M3 spec conflict (~230B vs 428B) → set TP=4 or 8
-- [ ] dry-run the Ray two-node launch for qwen3.8-max
+Checked against the HF API on 2026-09-09; every claim below is either verified or says
+plainly that it is not.
+
+- [ ] confirm `deepseek-ai/DeepSeek-V4-Flash` is the **retrained agentic** checkpoint. All
+      six `HF_REPO` ids now resolve (HTTP 200, none gated), so id verification is done —
+      but *which* checkpoint sits behind that id is not something the API answers.
+- [ ] verify Moonshot's vLLM docker image name for kimi-k3 (`VLLM_DOCKER_IMAGE`, still
+      commented out in its env file)
+- [ ] settle FP8 vs BF16 for qwen3-coder-next (AI-3158), then set its `TP` /
+      `INSTANCE_TYPE` together with that decision
+- [ ] dry-run the Ray two-node launch for qwen3.8-max (still not CI-supported)
+- [ ] Kimi K3 + Qwen3.8-Max licenses: HF reports both repos `gated: false` (2026-09-09), so
+      there is probably no click-through left to accept — confirm from the account that will
+      actually pull the weights before run day. Their `license:other` terms bind either way.
 
 ## GPU on / off — gpuctl
 
