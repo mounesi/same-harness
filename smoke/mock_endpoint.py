@@ -14,7 +14,23 @@ Scripted behaviour, chosen by $MOCK_MODE:
     noop    the model answers in prose and never edits anything               -> NO_PATCH
     flaky   fails with 503 twice, then behaves like `solve`     -> exercises the retry path
 
-Usage:  python3 smoke/mock_endpoint.py --port 8099 --model smoke-model
+Tool calling is OFF unless you launch it on, exactly as in vLLM. The agent loop sends
+`tool_choice: "auto"` on every call (harness/agent.py:_payload), and vLLM answers HTTP 400
+to that unless the server was started with BOTH --enable-auto-tool-choice and
+--tool-call-parser:
+
+    {"error": {"message": "\\"auto\\" tool choice requires --enable-auto-tool-choice and
+     --tool-call-parser to be set", "type": "BadRequestError", "code": 400}}
+
+A models.d entry missing those flags therefore cannot serve a single attempt, for any model
+and any suite: 0 iterations, 0 tokens, `SERVER_ERROR` on every task. That is exactly what
+happened on the AI-P167 shakedown against live vLLM 0.28.0 (fixed in deb56ad), and this
+smoke test was green throughout — because the mock accepted "auto" unconditionally. A mock
+more permissive than the server it stands in for is the one way a mock can lie that matters,
+so the flags are mirrored here, spelled the same way, and refused the same way.
+
+Usage:  python3 smoke/mock_endpoint.py --port 8099 --model smoke-model \\
+            --enable-auto-tool-choice --tool-call-parser smoke
 Stdlib only, single-threaded-safe, exits cleanly on SIGTERM.
 """
 
@@ -31,6 +47,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL = os.environ.get("MOCK_MODEL", "smoke-model")
 MODE = os.environ.get("MOCK_MODE", "solve")
+
+# Both must be set for tool_choice:"auto" to be accepted — vLLM requires the pair, not
+# either one, so the mock gates on the pair too (see the module docstring).
+ENABLE_AUTO_TOOL_CHOICE = False
+TOOL_CALL_PARSER = None
+
+# vLLM's own wording, byte for byte: harness/agent.py surfaces the server's `error.message`
+# in the attempt record, so an operator who hits this against the mock searches for the same
+# string they would find in a vLLM log.
+AUTO_TOOL_CHOICE_ERROR = (
+    '"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'
+)
 
 _state_lock = threading.Lock()
 _state = {"calls": 0, "fail_budget": 2}
@@ -109,6 +137,24 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         req = json.loads(self.rfile.read(length) or b"{}")
 
+        # Request validation happens before anything is generated, and before the `flaky`
+        # budget is touched: vLLM rejects an unservable request deterministically on the
+        # very first call, and so must this — otherwise a disabled server would look like
+        # a transient upstream failure and get retried.
+        if req.get("tool_choice") == "auto" and not (ENABLE_AUTO_TOOL_CHOICE and TOOL_CALL_PARSER):
+            self._send(
+                400,
+                {
+                    "error": {
+                        "message": AUTO_TOOL_CHOICE_ERROR,
+                        "type": "BadRequestError",
+                        "param": None,
+                        "code": 400,
+                    }
+                },
+            )
+            return
+
         with _state_lock:
             _state["calls"] += 1
             if MODE == "flaky" and _state["fail_budget"] > 0:
@@ -139,10 +185,26 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8099)
     ap.add_argument("--model", default=MODEL)
+    # Same spelling as the vLLM flags a models.d EXTRA_ARGS has to carry, so the smoke
+    # launch line and a real serve line say the same thing.
+    ap.add_argument("--enable-auto-tool-choice", action="store_true")
+    ap.add_argument("--tool-call-parser", default=None)
     args = ap.parse_args()
     globals()["MODEL"] = args.model
+    globals()["ENABLE_AUTO_TOOL_CHOICE"] = args.enable_auto_tool_choice
+    globals()["TOOL_CALL_PARSER"] = args.tool_call_parser
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    sys.stderr.write("mock: serving %s on :%d (mode=%s)\n" % (args.model, args.port, MODE))
+    sys.stderr.write(
+        "mock: serving %s on :%d (mode=%s, tool_calling=%s)\n"
+        % (
+            args.model,
+            args.port,
+            MODE,
+            ("on:" + args.tool_call_parser)
+            if (args.enable_auto_tool_choice and args.tool_call_parser)
+            else "off",
+        )
+    )
     sys.stderr.flush()
     try:
         srv.serve_forever()
