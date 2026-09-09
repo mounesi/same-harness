@@ -92,6 +92,22 @@ export PATH="$HOME/harness-venv/bin:$PATH" HARNESS_PYTHON="$HOME/harness-venv/bi
 ./gpuctl down
 ```
 
+**"Command not found", and it is installed.** This is the project's most expensive
+recurring failure: the program is present, and invisible only because its directory is not
+on PATH for a non-interactive `ssh host "cmd"` (which never sources `~/.profile`). It has
+killed four live-GPU runs — the grader's `python` (AI-3155), the `hf` CLI and the `vllm`
+binary (both AI-3157), and `ninja`, which vLLM's FlashInfer JIT execs during *engine
+startup*, after the weights are resolved (AI-P167 shakedown, 2026-09-07 — fixed directly in
+`modelctl`, no ticket). `modelctl serve` now asserts every program a launch will exec
+**before** it downloads anything, and `./modelctl preflight <model>` runs that same check on
+its own in a second. A refusal names where the missing program actually is.
+
+Two things it deliberately does *not* do. `ninja` is **advisory**: nothing in this repo pins
+it, so a missing `ninja` warns and continues rather than refusing (`MODELCTL_SKIP_LAUNCH_PREFLIGHT=1`
+turns the whole check off if you need it). And the preflight proves only that programs
+*resolve* — GPU, driver/CUDA match and vLLM's own import are checked separately, by
+`./gpuctl up --serve`. Case notes and the functions: `lib/pathguard.sh`.
+
 **The instance turns itself off if you forget.** It lives only while leased or while a harness
 process is running; `./gpuwatch` (CI, every 15 min) terminates it otherwise. Running long?
 `./gpuctl hold 4h`. Want to see the meter? `./gpuctl status`. The low-level tools
@@ -158,7 +174,7 @@ sample figures if you want to settle chart design before spending anything.
 | variable | `LAMBDA_FS` | name of the persistent filesystem holding `models/` |
 | variable | `VLLM_VERSION` | exact pinned vLLM version, e.g. `0.11.0` |
 
-### 2.3 Harness — environment variables read by `run.sh` / `agent.py` / `manifest.py`
+### 2.3 Harness — environment variables read by `run.sh` / `agent.py` / `manifest.py` (and `modelctl`)
 
 | variable | default | when to set |
 |---|---|---|
@@ -173,6 +189,8 @@ sample figures if you want to settle chart design before spending anything.
 | `HARNESS_ALLOW_NETWORK=1` | off | allow the HfApi weight-revision lookup |
 | `HARNESS_SKIP_WEIGHT_DIGEST=1` | off | skip hashing the weights tree — marks `nonconformant` |
 | `HARNESS_SKIP_GRADING_PREFLIGHT=1` | off | start even though this host cannot grade — you will get `INFRA_GRADER` on every attempt |
+| `MODELCTL_SKIP_LAUNCH_PREFLIGHT=1` | off | `modelctl serve/switch/preflight`: launch even though a program a launch execs is missing — it then surfaces at engine startup, after the weights. A missing `ninja` already only warns, so you should rarely need this |
+| `VLLM_BIN` / `HARNESS_PYTHON` | `vllm` / `python3` | absolute paths into a venv are fine: `modelctl` puts their bin dir on PATH, because a console script does not (`lib/pathguard.sh`) |
 
 ### 2.4 The held constants — `harness/agent_config.json` (do not change per model)
 
