@@ -1,12 +1,14 @@
 {
   "schema": "price-snapshot/v1",
-  "captured_at": "2026-08-30T00:00:00Z",
+  "captured_at": "2026-09-09T00:00:00Z",
   "source": "static-fallback (committed; last rung of the CONTRACTS.md 2.2 price ladder)",
-  "note": "Used only when neither $HARNESS_PRICE_SNAPSHOT nor ./lambdactl types can answer. A run priced from this file is marked flags.nonconformant. Refresh from ./lambdactl types and re-commit whenever Lambda list prices change.",
+  "note": "Used only when neither $HARNESS_PRICE_SNAPSHOT nor ./lambdactl types can answer. A run priced from this file is marked flags.provenance_incomplete, not flags.nonconformant: the price is approximate, the verdicts are unaffected, and aggregate.py still counts the run (CONTRACTS.md 2.2 rung 3). Refresh from ./lambdactl types and re-commit whenever Lambda list prices change.",
+  "refresh_note": "2026-09-09 refresh of the 2026-08-30 table. Per-entry change, computed from the two tables: gpu_1x_h100_pcie 249 -> 329 (+32.1%), gpu_8x_h100_sxm5 2392 -> 3192 (+33.4%), gpu_8x_b200_sxm6 3992 -> 5352 (+34.1%), gpu_4x_h100_sxm5 1596 -> 1636 (+2.5%). The drift is not uniform: three entries moved ~32-34% and the fourth barely moved, so how far a run priced off this rung understated its bill depends on which instance type it used. gpu_2x_h100_sxm5 (838) is new — qwen3-coder-next dispatches to it and it had no entry here, which left its cost unresolved entirely. Cross-checks that exist inside this repo: 838 matches models.d/qwen3-coder-next.env ('$8.38/hr live'), and 329 matches .github/workflows/ci.yml ('$3.29/hr', written 2026-09-07 for an unrelated reason). 1636, 3192 and 5352 have no independent record in this repo; re-read gpu_4x_h100_sxm5 first when a live rung is reachable, since its +2.5% is the odd one out. Only the five instance types models.d/*.env and smoke/run-smoke.sh actually dispatch to are listed — a row for hardware this benchmark never launches would be committed provenance that nobody has a way to check. regions_with_capacity stays [] on every entry: Lambda capacity turns over within the hour, so a committed region list is stale before the next run reads it, and capacity is supplied by the live rungs (CONTRACTS.md 2.2).",
   "prices": {
-    "gpu_1x_h100_pcie": {"price_cents_per_hour": 249, "regions_with_capacity": []},
-    "gpu_4x_h100_sxm5": {"price_cents_per_hour": 1596, "regions_with_capacity": []},
-    "gpu_8x_h100_sxm5": {"price_cents_per_hour": 2392, "regions_with_capacity": []},
-    "gpu_8x_b200_sxm6": {"price_cents_per_hour": 3992, "regions_with_capacity": []}
+    "gpu_1x_h100_pcie": {"price_cents_per_hour": 329, "regions_with_capacity": []},
+    "gpu_2x_h100_sxm5": {"price_cents_per_hour": 838, "regions_with_capacity": []},
+    "gpu_4x_h100_sxm5": {"price_cents_per_hour": 1636, "regions_with_capacity": []},
+    "gpu_8x_h100_sxm5": {"price_cents_per_hour": 3192, "regions_with_capacity": []},
+    "gpu_8x_b200_sxm6": {"price_cents_per_hour": 5352, "regions_with_capacity": []}
   }
 }
