@@ -55,10 +55,18 @@ install pinned deps → `modelctl serve` → `harness/run.sh` (3 passes) → pac
 the cost ledger → **tear the instance down in an `if: always()` step**. Only one GPU job
 runs at a time (`concurrency: gpu-run`).
 
-Run **`qwen3-coder-next` on `swebench-verified` first.** It is the cheapest model
-($8.38/hr on `gpu_2x_h100_sxm5`, per `models.d/qwen3-coder-next.env`)
-and exists to shake down the real path — weights download, vLLM at TP=1, docker grading —
-before anything expensive.
+Shake the paid path down cheaply before anything expensive — weights download, vLLM boot,
+docker grading, teardown, cost ledger. That is what `models.d/shakedown-qwen30b.env` exists
+for (`TP=1`, `gpu_1x_h100_pcie`, 329¢/hr in `pricing/fallback-prices.json`). It is
+deliberately not a study model and it is **not** in the `model` options above, so today it
+runs by hand (§1.4), not from this dispatch.
+
+`qwen3-coder-next` is **not** that shakedown any more. Its env file sets `TP=2` /
+`gpu_2x_h100_sxm5` — see the registry section of README.md for the arithmetic — and its
+FP8-vs-BF16 question is still open, so the "cheapest model at ~$2.49/hr, vLLM at TP=1" this
+paragraph used to say was wrong on the price, the instance type and the TP.
+
+`minimax-m3` is currently unlaunchable (see `models.d/minimax-m3.env`): do not dispatch it.
 
 ### 1.4 A benchmark run — by hand (on a Lambda instance)
 
@@ -250,9 +258,9 @@ and ~1–2 h of setup (weights download + vLLM load) per dispatch. Per-hour bill
 | model | instance | $/hr | est. hours | est. run cost |
 |---|---|---|---|---|
 | qwen3-coder-next | 2× H100 SXM | 8.38 | 15 | **~$126** |
-| minimax-m3 | 4× H100 SXM | 16.36 | 15 | **~$245** |
+| minimax-m3 *(UNLAUNCHABLE — see models.d/minimax-m3.env)* | 8× H100 SXM | 31.92 | 15 | **~$479** |
 | deepseek-v4-flash | 8× H100 SXM | 31.92 | 15 | **~$479** |
-| glm-5.3 *(blocked on weights)* | 8× B200 | 53.52 | 15 | **~$803** |
+| glm-5.3 *(weights are out; Phase 1 vs reserve is a scheduling call)* | 8× B200 | 53.52 | 15 | **~$803** |
 | kimi-k3 | 8× B200 | 53.52 | 15 | **~$803** |
 | **Phase 1 total, 5 models** | | | | **~$2,456** + setup ~$150 = **~$2,600** |
 | qwen3.8-max *(reserve; multi-node, not CI-supported)* | 2× 8× B200 | 107.04 | 18 | ~$1,927 |
