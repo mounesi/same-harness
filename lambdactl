@@ -20,6 +20,8 @@
 #   LAMBDA_IMAGE     "family:version" or an image id. THE GPU DRIVER SHIPS WITH THE IMAGE:
 #                    unset means Lambda picks, and its default is not the newest build.
 #   INSTANCE_NAME    name tag for launched instance (default: harness-run)
+#   LAMBDA_BOOT_TIMEOUT_S  seconds to wait for "active" (default 1800; a PINNED image can
+#                    provision materially slower than Lambda's default one)
 set -euo pipefail
 
 API="https://cloud.lambdalabs.com/api/v1"
@@ -139,16 +141,39 @@ for i in json.load(sys.stdin)['data']:
   echo "==> instance $id (name: $name) — waiting for active" >&2
   echo "launched_id=$id" >&2
 
-  local ip="" status=""
-  for _ in $(seq 1 90); do
+  # Two things this loop must get right, both learned by paying for them (AI-P167,
+  # 2026-09-09, ~$1 of billed boot):
+  #
+  #   1. TERMINAL STATES END THE WAIT. An instance that goes "unhealthy" never becomes
+  #      active, but the old loop had no notion of a status it should give up on, so it
+  #      polled the full 15 minutes and then reported the STALE status it happened to see
+  #      last ("booting") — misdescribing a Lambda-side provisioning failure as a slow
+  #      boot, while the box billed the whole time.
+  #
+  #   2. THE CEILING MUST FIT THE SLOWEST IMAGE, not the default one. 15 minutes was tuned
+  #      when LAMBDA_IMAGE did not exist and Lambda always picked its own (fast) image; a
+  #      pinned image can be materially slower to provision. A timeout here strands an
+  #      UNLEASED instance, because gpuctl claims the lease only after this returns — so
+  #      being wrong in this direction costs a whole boot cycle.
+  local ip="" status="" waited=0
+  local ceiling_s="${LAMBDA_BOOT_TIMEOUT_S:-1800}"
+  while (( waited < ceiling_s )); do
     read -r status ip < <(req GET "/instances/$id" | python3 -c "
 import json,sys; i=json.load(sys.stdin)['data']
 print(i['status'], i.get('ip') or '-')")
     [[ "$status" == "active" && "$ip" != "-" ]] && break
-    printf '.' >&2; sleep 10
+    case "$status" in
+      unhealthy|terminated|terminating|error)
+        echo >&2
+        echo "error: instance $id entered terminal status '$status' after ${waited}s — it will" >&2
+        echo "       not become active. Terminate it (./lambdactl down $id) and retry; if a" >&2
+        echo "       pinned LAMBDA_IMAGE reproduces this, suspect the image before the region." >&2
+        exit 1 ;;
+    esac
+    printf '.' >&2; sleep 10; waited=$(( waited + 10 ))
   done
   echo >&2
-  [[ "$status" == "active" ]] || { echo "error: instance $id not active after 15m (status: $status)" >&2; exit 1; }
+  [[ "$status" == "active" ]] || { echo "error: instance $id not active after ${ceiling_s}s (status: $status)" >&2; exit 1; }
 
   echo "==> waiting for SSH" >&2
   for _ in $(seq 1 30); do
