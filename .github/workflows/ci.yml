@@ -142,6 +142,14 @@ jobs:
           done
           exit "$fail"
 
+      # The reaper is the only thing standing between a forgotten instance and the credit.
+      # Its age guards were dead for the life of the file — it read `launched_at` from the
+      # Lambda API, which returns no timestamp at all, so every `[[ "$age" != "?" ]]` guard
+      # silently evaluated false. Assert the replacement parses, since nothing else can:
+      # exercising the real path needs a live instance.
+      - name: Reaper age-source self-test
+        run: ./gpuwatch --self-test
+
       - name: Leakage guard self-test
         run: python training/build_dataset.py --self-test
 

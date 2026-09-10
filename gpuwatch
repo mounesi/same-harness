@@ -34,8 +34,52 @@ MAX_AGE_H="${MAX_AGE_H:-24}"
 MAX_ACCRUED_USD="${MAX_ACCRUED_USD:-500}"
 GPU_IDLE_UTIL_MAX="${GPU_IDLE_UTIL_MAX:-5}"
 SSH_USER="${SSH_USER:-ubuntu}"
-DRY=0; JSON=0
-for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; --json) JSON=1 ;; *) echo "usage: gpuwatch [--dry-run] [--json]" >&2; exit 2 ;; esac; done
+DRY=0; JSON=0; SELFTEST=0
+for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; --json) JSON=1 ;; --self-test) SELFTEST=1 ;; *) echo "usage: gpuwatch [--dry-run] [--json] [--self-test]" >&2; exit 2 ;; esac; done
+
+# --- self-test: the two things that silently disabled every age guard -------------------
+#
+# This exists because of a defect that cost real money and was invisible for the life of
+# the file: the inventory read `launched_at` from the Lambda API, and the API returns no
+# temporal field at all. `age` was therefore ALWAYS "?", and every guard written as
+# `[[ "$age" != "?" && ... ]]` silently evaluated to false. Four of them: the unreachable
+# reap, the no-tool reap, the MAX_AGE_H hard cap, and the accrued-cost total feeding the
+# spend cap. Nothing warned; a dry run just printed "?m" and "keep".
+#
+# So both halves of the replacement are asserted here: that the remote command computes
+# minutes correctly, and that the report is still matched after UPTIME_MIN was prepended
+# to it (the NO_LEASE_TOOL check used to be a prefix match and broke when it stopped
+# being first — caught only because this test existed).
+if (( SELFTEST )); then
+  fails=0
+  ck() { if [[ "$2" == "$3" ]]; then echo "  ok   $1"; else echo "  FAIL $1: got '$2' want '$3'"; fails=1; fi; }
+
+  # The remote command, run against a synthetic /proc/uptime rather than a real host.
+  tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+  printf '3661.42 7200.00\n' >"$tmp/uptime"
+  # Braces around the redirect: `read ... < missing 2>/dev/null` still lets the SHELL
+  # report the failed redirection on its own stderr. In probe() that is harmless (the whole
+  # ssh call is 2>/dev/null), but a self-test that prints an error while passing is exactly
+  # the kind of noise that trains people to ignore output.
+  remote() { { read -r u _ < "$tmp/uptime"; } 2>/dev/null && echo "UPTIME_MIN=$(( ${u%%.*} / 60 ))" || echo "UPTIME_MIN="; }
+  ck "3661.42s of uptime reads as 61 minutes" "$(remote)" "UPTIME_MIN=61"
+  printf '59.9 100.0\n' >"$tmp/uptime"
+  ck "sub-minute uptime floors to 0, not empty" "$(remote)" "UPTIME_MIN=0"
+  rm -f "$tmp/uptime"
+  ck "missing /proc/uptime yields an empty value" "$(remote)" "UPTIME_MIN="
+
+  # Report matching, with UPTIME_MIN now ahead of everything.
+  rpt="$(printf 'UPTIME_MIN=61\nNO_LEASE_TOOL')"
+  ck "NO_LEASE_TOOL still matches when not first" \
+     "$(grep -q '^NO_LEASE_TOOL' <<<"$rpt" && echo yes || echo no)" "yes"
+  ck "uptime parses out of a multi-line report" "$(sed -n 's/^UPTIME_MIN=//p' <<<"$rpt")" "61"
+  rpt="$(printf 'UPTIME_MIN=90\nLEASE=none\nHARNESS_PROCS=0\nGPU_UTIL=0\nVERDICT=idle')"
+  ck "lease fields still parse alongside uptime" "$(sed -n 's/^VERDICT=//p' <<<"$rpt")" "idle"
+  ck "a bare UNREACHABLE is still recognised" \
+     "$([[ "UNREACHABLE" == UNREACHABLE* ]] && echo yes || echo no)" "yes"
+
+  echo; if (( fails )); then echo "SELF-TEST FAILED"; exit 1; else echo "SELF-TEST PASSED"; exit 0; fi
+fi
 
 [[ -n "${LAMBDA_API_KEY:-}" ]] || { echo "error: LAMBDA_API_KEY not set" >&2; exit 1; }
 req() { curl -sf -X "$1" "$API$2" -H "Authorization: Bearer $LAMBDA_API_KEY" -H 'Content-Type: application/json' ${3:+-d "$3"}; }
@@ -66,9 +110,19 @@ for i in data:
 # price fallback from the instance-types endpoint when /instances omits it
 price_of() { req GET /instance-types | python3 -c 'import json,sys; t=json.load(sys.stdin)["data"].get(sys.argv[1]); print("%.2f" % (t["instance_type"]["price_cents_per_hour"]/100) if t else "?")' "$1" 2>/dev/null || echo "?"; }
 
-probe() { # ip -> gpu-lease status lines, or "UNREACHABLE"
+probe() { # ip -> UPTIME_MIN + gpu-lease status lines, or "UNREACHABLE"
+  # UPTIME_MIN comes first and is emitted UNCONDITIONALLY, before the lease lookup, because
+  # it is the only age source that exists. The Lambda API returns no timestamp of any kind
+  # on an instance — the record carries actions, file_system_names, firewall_rulesets,
+  # hostname, id, image, instance_type, ip, is_reserved, jupyter_token, jupyter_url, name,
+  # private_ip, region, ssh_key_names, status, tags, workspace_id, and nothing temporal
+  # (verified against the live API 2026-09-10). So the box has to tell us itself.
+  #
+  # /proc/uptime rather than uptime(1): two fields, seconds since boot, no prose to parse
+  # and no locale. Instance age and kernel uptime differ by the seconds before the kernel
+  # started, which is immaterial against grace windows measured in tens of minutes.
   ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
-      "$SSH_USER@$1" 'test -x ~/harness-repo/gpu-lease && ~/harness-repo/gpu-lease status || (test -x ~/gpu-lease && ~/gpu-lease status) || echo NO_LEASE_TOOL' 2>/dev/null \
+      "$SSH_USER@$1" 'read -r u _ < /proc/uptime 2>/dev/null && echo "UPTIME_MIN=$(( ${u%%.*} / 60 ))" || echo "UPTIME_MIN="; test -x ~/harness-repo/gpu-lease && ~/harness-repo/gpu-lease status || (test -x ~/gpu-lease && ~/gpu-lease status) || echo NO_LEASE_TOOL' 2>/dev/null \
     || echo UNREACHABLE
 }
 
@@ -87,17 +141,43 @@ while read -r id name itype status ip age price; do
     total_accrued="$(awk -v t="$total_accrued" -v x="$accrued" 'BEGIN{printf "%.2f", t+x}')"
   fi
 
-  lease="?"; procs="?"; util="?"; verdict="?"; action="keep"; why=""
+  lease="?"; procs="?"; util="?"; verdict="?"; action="keep"; why=""; age_src="api"
   if [[ "$status" != "active" ]]; then
     action="keep"; why="status=$status"
   else
     report="$(probe "$ip")"
+    # The box's own uptime is the age source (see probe()). Only trust it when the API did
+    # not supply one, so that if Lambda ever starts returning a launch timestamp it wins.
+    up="$(sed -n 's/^UPTIME_MIN=//p' <<<"$report")"
+    if [[ "$age" == "?" && -n "$up" && "$up" =~ ^[0-9]+$ ]]; then age="$up"; age_src="uptime"; fi
+    # Recompute accrued now that age may be known — the pre-probe pass above could not.
+    if [[ "$accrued" == "?" && "$age" != "?" && "$price" != "?" ]]; then
+      accrued="$(awk -v a="$age" -v p="$price" 'BEGIN{printf "%.2f", a/60*p}')"
+      total_accrued="$(awk -v t="$total_accrued" -v x="$accrued" 'BEGIN{printf "%.2f", t+x}')"
+    fi
+    # grep -q, not a prefix match: probe() emits UPTIME_MIN first, so NO_LEASE_TOOL and the
+    # lease lines are no longer at the head of the report.
     if [[ "$report" == UNREACHABLE* ]]; then
       verdict="unreachable"
-      if [[ "$age" != "?" && "$age" -ge "$UNREACHABLE_GRACE_MIN" ]]; then action="TERMINATE"; why="unreachable for >${UNREACHABLE_GRACE_MIN}m"; else why="unreachable, within grace"; fi
-    elif [[ "$report" == NO_LEASE_TOOL* ]]; then
+      # Age is unknowable here BY CONSTRUCTION — the only source is the box we cannot reach.
+      # Keeping silently is what let an unleased instance bill unnoticed, so an
+      # unevaluatable guard is announced rather than skipped.
+      if [[ "$age" != "?" && "$age" -ge "$UNREACHABLE_GRACE_MIN" ]]; then
+        action="TERMINATE"; why="unreachable for >${UNREACHABLE_GRACE_MIN}m"
+      elif [[ "$age" == "?" ]]; then
+        why="unreachable AND age unknown — the ${UNREACHABLE_GRACE_MIN}m guard cannot be evaluated"
+        echo "::warning::$name: $why — check it by hand: ./lambdactl down $id" >&2
+      else
+        why="unreachable, within grace"
+      fi
+    elif grep -q '^NO_LEASE_TOOL' <<<"$report"; then
       verdict="no-tool"; why="gpu-lease not installed — provisioned outside this repo?"
-      if [[ "$age" != "?" && "$age" -ge "$((IDLE_GRACE_MIN * 3))" ]]; then action="TERMINATE"; fi
+      if [[ "$age" != "?" && "$age" -ge "$((IDLE_GRACE_MIN * 3))" ]]; then
+        action="TERMINATE"; why="no gpu-lease and idle for >$((IDLE_GRACE_MIN * 3))m"
+      elif [[ "$age" == "?" ]]; then
+        why="$why — age unknown, so the $((IDLE_GRACE_MIN * 3))m guard cannot be evaluated"
+        echo "::warning::$name: $why" >&2
+      fi
     else
       lease="$(sed -n 's/^LEASE=//p' <<<"$report")"
       procs="$(sed -n 's/^HARNESS_PROCS=//p' <<<"$report")"
