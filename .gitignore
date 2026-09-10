@@ -30,3 +30,9 @@ venv/
 # Local state
 .state/
 .DS_Store
+
+# smoke/run-smoke.sh writes a throwaway model profile here while it runs. It is a test
+# fixture, not a study model: EXTRA_ARGS is empty, so committing it fails ci.yml's
+# "Every model declares a tool-call parser" guard — and it leaves the tree dirty, which
+# marks any run made from this checkout flags.nonconformant.
+models.d/smoke-model.env
