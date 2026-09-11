@@ -116,12 +116,16 @@ sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" && ./re
   || echo "WARNING: resultsctl package failed; the raw run dir is still pulled below" >&2
 
 # ---- 4. pull the artifact we actually came for ---------------------------------------
-# A sealed bundle deliberately EXCLUDES patches/ (CONTRACTS §7.4). The game lives in the
-# patch, so copy the run's patches and results by hand, before teardown.
+# A sealed bundle deliberately EXCLUDES patches/ and trajectories/ (CONTRACTS §7.4). The
+# game lives in the patch and the model's reasoning in the trajectory, so copy both by
+# hand, before teardown — the first live run pulled only patches, and the one question
+# worth asking afterwards ("what did it do for 26 iterations?") had left with the box.
+# gamespec is CONSENT_CLASS public, so trajectories may sit in results/ (git-ignored).
 LOCAL="$HERE/results/gamespec/$RUN_ID"
 mkdir -p "$LOCAL"
 scp -q -r -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-  "$SSH_USER@$IP:$RUN_DIR/patches" "$SSH_USER@$IP:$RUN_DIR/results.jsonl" "$SSH_USER@$IP:$RUN_DIR/run-manifest.json" "$LOCAL/" \
+  "$SSH_USER@$IP:$RUN_DIR/patches" "$SSH_USER@$IP:$RUN_DIR/trajectories" "$SSH_USER@$IP:$RUN_DIR/logs" \
+  "$SSH_USER@$IP:$RUN_DIR/results.jsonl" "$SSH_USER@$IP:$RUN_DIR/run-manifest.json" "$LOCAL/" \
   || die "could not copy the run back — the box is still up until teardown; ./gpuctl ssh and copy $RUN_DIR by hand"
 info "pulled patches + results to $LOCAL"
 
@@ -135,16 +139,19 @@ for r in recs:
         r.get("instance_id"), r.get("pass_idx"), r.get("resolved"), r.get("error_code"),
         (r.get("grade") or {}).get("fail_to_pass")))
 PY
+# The diff is against the adapter's base tree (SPEC.md, floor_check.py, README, .gitignore),
+# not an empty directory, so rebuild through the adapter — it lays the base down and applies
+# the diff exactly the way grade() does. Needs a Python >= 3.11 locally, like the harness.
+REBUILD_PY="${HARNESS_PYTHON:-python3}"
 for diff in "$LOCAL"/patches/*/pass-*.diff; do
   [[ -f "$diff" ]] || continue
   iid="$(basename "$(dirname "$diff")")"; pass="$(basename "$diff" .diff)"
-  out="$LOCAL/built/$iid/$pass"; rm -rf "$out"; mkdir -p "$out"
-  ( cd "$out" && git init -q . && git apply -p1 "$diff" 2>/dev/null ) || { info "$iid $pass: diff did not apply cleanly"; continue; }
-  if [[ -f "$out/game.html" ]]; then
-    info "$iid $pass: game.html rebuilt -> $out/game.html"
-    python3 "$HERE/suites/gamespec/floor_check.py" "$out/game.html" || true
+  out="$LOCAL/built/$iid/$pass"; rm -rf "$out"
+  if game="$(cd "$HERE" && "$REBUILD_PY" -m harness.adapters.gamespec rebuild "$iid" "$diff" "$out" 2>"$LOCAL/rebuild-$iid-$pass.err")"; then
+    info "$iid $pass: rebuilt -> $game"
+    "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" || true
   else
-    info "$iid $pass: the patch contains no game.html"
+    info "$iid $pass: could not rebuild the deliverable: $(tail -1 "$LOCAL/rebuild-$iid-$pass.err")"
   fi
 done
 
