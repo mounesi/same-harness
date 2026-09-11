@@ -58,7 +58,7 @@ from harness.types import (  # noqa: E402
 )
 
 SUITE_NAME = "gamespec"
-ADAPTER_VERSION = "1.1.0"
+ADAPTER_VERSION = "1.2.0"
 CONSENT_CLASS = "public"
 
 GRADER = "gamespec-floor"
@@ -82,6 +82,15 @@ DELIVERABLE = "game.html"
 # (AI-3155): preflight probes the interpreter the SHELL resolves, not sys.executable.
 GRADER_PYTHON = "python3"
 DEFAULT_TEST_CMD = GRADER_PYTHON + " floor_check.py " + DELIVERABLE
+# floor_check.py applies one spec's floor; its default is racing-v1, so the first spec's
+# command stays byte-identical to what its recorded run used, and every later spec names
+# itself. test_cmd varies per TASK here, never per model — the harness-constant invariant
+# is about the template, and the template is unchanged.
+FIRST_SPEC = "racing-v1"
+
+
+def test_cmd_for(instance_id: str) -> str:
+    return DEFAULT_TEST_CMD if instance_id == FIRST_SPEC else DEFAULT_TEST_CMD + " --spec " + instance_id
 FLOOR_TIMEOUT_S = 180
 DETAIL_MAX = 512
 
@@ -264,7 +273,7 @@ def _build_task(iid: str, part: Mapping[str, str]) -> Task:
         environment={
             "image": "",
             "setup_cmds": [],
-            "test_cmd": DEFAULT_TEST_CMD,
+            "test_cmd": test_cmd_for(iid),
             "deliverable": DELIVERABLE,
         },
         partition=part.get(qid, "unpartitioned"),
@@ -360,7 +369,7 @@ def _grade_in(tmp: Path, task: Task, patch: str) -> Verdict:
             {"deliverable_present": False}, f2p={"passed": 0, "total": 1},
         )
 
-    report = _run_floor(deliverable)
+    report = _run_floor(deliverable, task.instance_id)
     checks = report.get("checks") or []
     failed = [c for c in checks if not c.get("ok")]
     passed = bool(report.get("passed")) and not failed
@@ -380,9 +389,10 @@ def _grade_in(tmp: Path, task: Task, patch: str) -> Verdict:
     )
 
 
-def _run_floor(deliverable: Path) -> dict:
+def _run_floor(deliverable: Path, instance_id: str) -> dict:
     """The repo's floor_check.py, never the workspace copy. Exit 2 = grader broken."""
-    cmd = "%s %s %s --json" % (GRADER_PYTHON, _shq(str(FLOOR_CHECK)), _shq(str(deliverable)))
+    spec = "" if instance_id == FIRST_SPEC else " --spec " + _shq(instance_id)
+    cmd = "%s %s %s --json%s" % (GRADER_PYTHON, _shq(str(FLOOR_CHECK)), _shq(str(deliverable)), spec)
     try:
         proc = subprocess.run(
             cmd, shell=True, cwd=str(deliverable.parent),

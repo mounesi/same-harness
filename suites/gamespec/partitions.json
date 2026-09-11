@@ -1,12 +1,13 @@
 {
-  "frozen_at": "2026-09-11T00:00:00Z",
+  "frozen_at": "2026-09-11T13:30:00Z",
   "frozen_by": "by hand \u2014 gamespec has its own file because suites/partitions.json is frozen over the three SWE-bench-shaped suites only (CONTRACTS 6.2) and the gamespec specs are not fine-tuning data",
   "method": "fixed: every spec is dev \u2014 greenfield specs never enter Phase-2 training and are not held out from it",
   "partitions": {
     "dev": {
-      "count": 1,
+      "count": 2,
       "ids": [
-        "gamespec::racing-v1"
+        "gamespec::racing-v1",
+        "gamespec::racing-v2"
       ]
     },
     "final_holdout": {

@@ -149,7 +149,8 @@ for diff in "$LOCAL"/patches/*/pass-*.diff; do
   out="$LOCAL/built/$iid/$pass"; rm -rf "$out"
   if game="$(cd "$HERE" && "$REBUILD_PY" -m harness.adapters.gamespec rebuild "$iid" "$diff" "$out" 2>"$LOCAL/rebuild-$iid-$pass.err")"; then
     info "$iid $pass: rebuilt -> $game"
-    "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" || true
+    spec_flag=(); [[ "$iid" == "racing-v1" ]] || spec_flag=(--spec "$iid")
+    "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" "${spec_flag[@]}" || true
   else
     info "$iid $pass: could not rebuild the deliverable: $(tail -1 "$LOCAL/rebuild-$iid-$pass.err")"
   fi

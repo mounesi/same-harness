@@ -100,7 +100,9 @@ reaches for any of them is caught while the untouched renderer is not.
 |---|---|
 | `specs/racing-v1.md` | the brief handed to the model — precise on simulation, silent on look and feel |
 | `specs/racing-v1.reference.html` | reference implementation. Deliberately plain |
-| `floor_check.py` | `python3 suites/gamespec/floor_check.py <game.html> [--json]` |
+| `specs/racing-v2.md` | the harder brief: 3-lap race with lap times, on/off-road surfaces, seeded AI opponents, boost, and a **3D** perspective view with a checkable `View.project` |
+| `specs/racing-v2.reference.html` | its reference: software pinhole projection onto a 2D canvas, flat polygons, painter's order. Deliberately plain |
+| `floor_check.py` | `python3 suites/gamespec/floor_check.py <game.html> [--json] [--spec racing-v2]` — one floor per spec, default `racing-v1` |
 
 ### The reference implementation is a spec-debugging tool, not a target
 
@@ -125,7 +127,7 @@ passes for the wrong reason is worse than no check: it reports coverage it does 
    the model's `game.html` reaches `grade()` as a new-file diff, and `grade()` always runs
    the **repo's** `floor_check.py`, never the workspace copy the model could have edited.
    `resolved` = the floor passed in full; `fail_to_pass` is the single node `floor`.
-2. **More specs.** One spec is one task; the harness reports rates. Three or four specs at
+2. ~~**More specs.**~~ — two now (`racing-v1`, `racing-v2`); a non-racing one (flight-over-city, a logistics sim) is still the next step. **More specs.** One spec is one task; the harness reports rates. Three or four specs at
    varying difficulty (racing, flight-over-city, a logistics sim to make the enterprise
    framing explicit) is the minimum for a meaningful comparison.
 3. **The judging harness** — serve two builds side by side, randomise order, record votes
