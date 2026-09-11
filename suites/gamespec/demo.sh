@@ -78,10 +78,27 @@ trap teardown EXIT
 
 sshto() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$IP" "$@"; }
 
+# ---- 1b. node — the one grading dependency the Lambda image does NOT carry -----------
+# suites/gamespec/floor_check.py drives SimCore headlessly in node, and grading preflight
+# (tier 3) refuses to start a run on a host without it — which is exactly what the second
+# demo hit, after vLLM was already serving (~17 min of H100). A pinned LTS tarball goes into
+# the venv's own bin/, the directory the harness step already puts first on PATH, so no
+# sudo, no apt, and the version is the same on every box.
+NODE_VERSION="${NODE_VERSION:-22.12.0}"
+NODE_SHA256="${NODE_SHA256:-22982235e1b71fa8850f82edd09cdae7e3f32df1764a9ec298c72d25ef2c164f}"
+info "ensuring node $NODE_VERSION is in ~/$VENV_NAME/bin"
+sshto "set -e
+if ~/$VENV_NAME/bin/node --version 2>/dev/null | grep -qx 'v$NODE_VERSION'; then echo 'node already present'; exit 0; fi
+cd /tmp && curl -fsSLO 'https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.xz'
+echo '$NODE_SHA256  node-v$NODE_VERSION-linux-x64.tar.xz' | sha256sum -c - >/dev/null
+tar -xJf node-v$NODE_VERSION-linux-x64.tar.xz -C ~/$VENV_NAME --strip-components=1 --exclude='*/share' --exclude='*/include' --exclude='CHANGELOG.md' --exclude='README.md' --exclude='LICENSE'
+rm -f node-v$NODE_VERSION-linux-x64.tar.xz
+~/$VENV_NAME/bin/node --version" || die "could not install node into the venv on the instance"
+
 # ---- 2. run the suite -----------------------------------------------------------------
 # Same PATH/HARNESS_PYTHON pair RUNBOOK §1.4 and benchmark.yml export: the venv is hermetic
-# and nothing is in the image's python3. node ships with the Lambda image; the grading
-# preflight (tier 3) refuses to start if it does not, before any GPU time is spent on the agent.
+# and nothing is in the image's python3. node is installed into
+# the same venv bin/ above; grading preflight (tier 3) refuses to start if it is missing.
 # The first run also hashes the weights for model.weight_digest (31 GB for the default
 # model, a few minutes); the digest is cached next to the weights, so later runs skip it.
 info "running gamespec ($PASSES pass(es)) against the served model"
