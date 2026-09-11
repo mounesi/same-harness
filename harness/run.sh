@@ -101,7 +101,10 @@ PY="${HARNESS_PYTHON:-python3}"
 # shellcheck source=../lib/pathguard.sh
 . "$REPO_DIR/lib/pathguard.sh"
 
-VALID_SUITES=(swebench-verified swebench-pro agenttask)
+# ALL_SUITES is what `--suite all` runs: the three brownfield suites the headline table is
+# built from (CONTRACTS.md §1.2). gamespec is a valid single suite but never part of `all`.
+ALL_SUITES=(swebench-verified swebench-pro agenttask)
+VALID_SUITES=("${ALL_SUITES[@]}" gamespec)
 
 # Run a harness python entry point as a module from the repo root — see the header note
 # on harness/types.py shadowing the stdlib. All paths handed to these MUST be absolute.
@@ -178,7 +181,7 @@ fi
 # An unknown suite is a config value, not a flag typo -> exit 2 (CONTRACTS.md §1.3)
 SUITE_LIST=()
 if [[ "$SUITE" == "all" ]]; then
-  SUITE_LIST=("${VALID_SUITES[@]}")
+  SUITE_LIST=("${ALL_SUITES[@]}")
   [[ -z "$SEED_FILE" ]] || usage_err "--seed-file applies to a single suite, not --suite all"
 else
   for s in "${VALID_SUITES[@]}"; do
@@ -193,7 +196,12 @@ MODEL_ENV_FILE="$REPO_DIR/models.d/$MODEL.env"
 if [[ "$MODE" == "exec" ]]; then
   [[ -f "$AGENT_PY" ]] || die_cfg "missing $AGENT_PY"
 fi
-[[ -n "$PARTITIONS" ]] || PARTITIONS="$REPO_DIR/suites/partitions.json"
+if [[ -z "$PARTITIONS" ]]; then
+  # gamespec carries its own partitions file: suites/partitions.json is frozen over the
+  # three SWE-bench-shaped suites only, and the specs are not Phase-2 training data.
+  if [[ "$SUITE" == "gamespec" ]]; then PARTITIONS="$REPO_DIR/suites/gamespec/partitions.json"
+  else PARTITIONS="$REPO_DIR/suites/partitions.json"; fi
+fi
 [[ -f "$PARTITIONS" ]] || die_cfg "partitions file not found: $PARTITIONS"
 abspath() { ( cd "$(dirname "$1")" 2>/dev/null && printf '%s/%s\n' "$(pwd)" "$(basename "$1")" ); }
 PARTITIONS="$(abspath "$PARTITIONS")"
@@ -210,6 +218,7 @@ default_seed_file() {
     swebench-verified) echo "$REPO_DIR/suites/verified-100.json" ;;
     swebench-pro)      echo "$REPO_DIR/suites/pro-50.json" ;;
     agenttask)         echo "$REPO_DIR/suites/agenttask/seed.json" ;;
+    gamespec)          echo "$REPO_DIR/suites/gamespec/seed.json" ;;
   esac
 }
 

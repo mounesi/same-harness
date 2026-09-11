@@ -794,7 +794,7 @@ everything needed to identify tasks; task *content* is fetched by the environmen
 from __future__ import annotations
 from pathlib import Path
 
-SUITE_NAME: str          # "swebench-verified" | "swebench-pro" | "agenttask"
+SUITE_NAME: str          # "swebench-verified" | "swebench-pro" | "agenttask" | "gamespec"
 ADAPTER_VERSION: str     # semver; bump on ANY grading or task-shaping change
 CONSENT_CLASS: str       # "public" | "restricted"   ("restricted" for agenttask)
 
@@ -914,6 +914,7 @@ class Verdict:
 | `swebench-verified` | `harness/adapters/swebench_verified.py` | `suites/verified-100.json` | public |
 | `swebench-pro` | `harness/adapters/swebench_pro.py` | `suites/pro-50.json` | public |
 | `agenttask` | `harness/adapters/agenttask.py` | `suites/agenttask/seed.json` | **restricted** |
+| `gamespec` | `harness/adapters/gamespec.py` | `suites/gamespec/seed.json` | public |
 
 ---
 

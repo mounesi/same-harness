@@ -54,6 +54,7 @@ PACK="$WORK/pack"
 OUT="$WORK/results"
 MOCK_PID=""
 MOCK_NT_PID=""
+MOCK_GS_PID=""
 
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
@@ -62,6 +63,7 @@ step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 cleanup() {
   [[ -n "$MOCK_PID" ]] && kill "$MOCK_PID" 2>/dev/null || true
   [[ -n "$MOCK_NT_PID" ]] && kill "$MOCK_NT_PID" 2>/dev/null || true
+  [[ -n "$MOCK_GS_PID" ]] && kill "$MOCK_GS_PID" 2>/dev/null || true
   if [[ "$KEEP" == "1" ]]; then
     printf '\nkept: %s\n' "$WORK"
   else
@@ -472,5 +474,68 @@ GT=$?
 set -e
 [[ $GT -eq 0 ]] || { tail -12 "$WORK/guard.out"; fail "leakage-guard self-test failed"; }
 ok "leakage-guard self-test: $(grep -o 'Ran [0-9]* tests' "$WORK/guard.out" | head -1) passed"
+
+step "10. gamespec (greenfield suite): spec -> game.html -> floor check"
+# A third mock, in `gamespec` mode: it reads SPEC.md, writes the suite's reference
+# implementation as game.html, runs the floor check, and stops. This proves the adapter's
+# materialize() -> patch capture -> grade() path with the real floor_check.py under node.
+# node is a grading dependency of this suite (manifest.py GRADING_DEPS), so a host without
+# it must be refused by preflight tier 3 — exit 3, nothing executed — and this leg is
+# skipped rather than failed, exactly like a real run would refuse to start.
+PORT_GS="${SMOKE_PORT_GAMESPEC:-$((PORT + 2))}"
+if ! command -v node >/dev/null 2>&1; then
+  set +e
+  ./harness/run.sh --model "$MODEL" --suite gamespec --passes 1 \
+    --endpoint "http://127.0.0.1:$PORT/v1" --out "$OUT-gs" --dry-run >/dev/null 2>"$WORK/gs-preflight.err"
+  GRC=$?
+  set -e
+  grep -q "node" "$WORK/gs-preflight.err" || fail "without node, gamespec preflight did not name node: $(tail -3 "$WORK/gs-preflight.err")"
+  ok "no node on this host: preflight names it (rc=$GRC) — gamespec leg skipped"
+else
+  port_free "$PORT_GS" \
+    || fail "port $PORT_GS is already in use — another smoke run, or a mock left behind by one (SMOKE_PORT_GAMESPEC= to move)"
+  MOCK_MODE=gamespec MOCK_MODEL="$MODEL" python3 smoke/mock_endpoint.py --port "$PORT_GS" --model "$MODEL" \
+    --enable-auto-tool-choice --tool-call-parser smoke 2>"$WORK/mock-gs.log" &
+  MOCK_GS_PID=$!
+  for _ in $(seq 1 40); do
+    curl -sf "http://127.0.0.1:$PORT_GS/v1/models" >/dev/null 2>&1 && break
+    sleep 0.25
+  done
+  curl -sf "http://127.0.0.1:$PORT_GS/v1/models" | grep -q "$MODEL" || fail "gamespec mock never came up (see $WORK/mock-gs.log)"
+  set +e
+  WEIGHTS_DIR="$WORK/weights" HARNESS_SKIP_WEIGHT_DIGEST=1 \
+  ./harness/run.sh \
+    --model "$MODEL" --suite gamespec --passes 1 \
+    --endpoint "http://127.0.0.1:$PORT_GS/v1" \
+    --out "$OUT-gs" --concurrency 1 --task-timeout 120 >"$WORK/gs-run.out" 2>"$WORK/gs-run.err"
+  GRC=$?
+  set -e
+  kill "$MOCK_GS_PID" 2>/dev/null || true
+  [[ $GRC -eq 0 ]] || { tail -25 "$WORK/gs-run.err"; fail "run.sh --suite gamespec exited $GRC (see $WORK/gs-run.err)"; }
+  GS_RUN_DIR="$(grep '^RUN ' "$WORK/gs-run.out" | head -1 | awk '{print $4}')"
+  [[ -n "$GS_RUN_DIR" && -f "$GS_RUN_DIR/results.jsonl" ]] || fail "gamespec run produced no results.jsonl"
+  python3 - "$GS_RUN_DIR" <<'PYGS'
+import json, sys, pathlib
+run_dir = pathlib.Path(sys.argv[1])
+recs = [json.loads(l) for l in (run_dir / "results.jsonl").read_text().splitlines() if l.strip()]
+def die(m):
+    print("  \033[31mFAIL\033[0m " + m); sys.exit(1)
+if len(recs) != 1:
+    die("expected exactly 1 gamespec record, got %d" % len(recs))
+r = recs[0]
+if r.get("instance_id") != "racing-v1":
+    die("record is for %r, not racing-v1" % r.get("instance_id"))
+g = r.get("grade") or {}
+if g.get("grader") != "gamespec-floor":
+    die("grader is %r, expected gamespec-floor" % g.get("grader"))
+if r.get("resolved") is not True:
+    die("reference game.html did not clear the floor: %s / %s" % (r.get("error_code"), g.get("detail")))
+patch = run_dir / "patches" / "racing-v1" / "pass-0.diff"
+if not patch.is_file() or "game.html" not in patch.read_text():
+    die("the captured patch does not contain game.html")
+print("  \033[32mok\033[0m   racing-v1 graded resolved=true by gamespec-floor (fail_to_pass %s)" % g.get("fail_to_pass"))
+print("  \033[32mok\033[0m   patches/racing-v1/pass-0.diff carries game.html")
+PYGS
+fi
 
 printf '\n\033[32m=== SMOKE PASSED ===\033[0m the pipeline is wired end to end.\n'

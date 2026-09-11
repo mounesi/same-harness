@@ -48,6 +48,8 @@ Dispatch `benchmark-run` from the Actions tab (or `gh workflow run benchmark.yml
   (the instance type derives from `models.d/<model>.env`, never chosen by hand)
 - `suite` — `swebench-verified | swebench-pro | agenttask` (**one suite per dispatch**;
   `all` runs three suites sequentially and will not fit the 12 h job ceiling on a large model)
+  `gamespec` (the build-a-game suite, `suites/gamespec/`) is not a CI dispatch option yet;
+  run it by hand (§1.4) or with `./suites/gamespec/demo.sh`, which also does the up/down.
 
 What the workflow does, in order: launch instance (`lambdactl up`) → ship the repo →
 install pinned deps → `modelctl serve` → `harness/run.sh` (3 passes) → package each run

@@ -37,18 +37,23 @@ MODULE_NAMES: dict[str, str] = {
     "swebench-verified": "swebench_verified",
     "swebench-pro": "swebench_pro",
     "agenttask": "agenttask",
+    # greenfield build-a-game suite; NOT part of `--suite all` (SUITES above), which is
+    # the three brownfield suites the study's headline table is built from.
+    "gamespec": "gamespec",
 }
 
 DEFAULT_SEED_FILES: dict[str, str] = {
     "swebench-verified": "suites/verified-100.json",
     "swebench-pro": "suites/pro-50.json",
     "agenttask": "suites/agenttask/seed.json",
+    "gamespec": "suites/gamespec/seed.json",
 }
 
 CONSENT_CLASSES: dict[str, str] = {
     "swebench-verified": "public",
     "swebench-pro": "public",
     "agenttask": "restricted",
+    "gamespec": "public",
 }
 
 ADAPTERS: dict[str, ModuleType] = {}

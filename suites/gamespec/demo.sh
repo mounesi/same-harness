@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# demo.sh — one command: bring a GPU up, have a model build the racing-v1 game, bring it down.
+#
+#   ./suites/gamespec/demo.sh [model] [--hold 2h] [--passes 1] [--keep-up]
+#
+#   model     a models.d/<name>.env basename. Default: shakedown-qwen30b — the cheapest
+#             Qwen coder that is KNOWN to serve on 1x H100 ($3.29/h). qwen3-coder-next as
+#             configured (BF16, 2x H100) cannot load; see its env file before choosing it.
+#   --hold    lease length handed to gpuctl (default 2h). The box is torn down at the end
+#             of this script regardless; the lease only covers a crash of this script.
+#   --keep-up leave the instance running afterwards (you then own `./gpuctl down`).
+#
+# What it does, in order:
+#   1. ./gpuctl up <model> --serve --hold <ttl>       launch, lease, ship repo, start vLLM
+#   2. ssh: ./harness/run.sh --model <model> --suite gamespec --passes N --out ~/results
+#   3. ssh: ./resultsctl package <run_dir>            sealed bundle (manifest, results, checksums)
+#   4. scp the run's patches/ + results.jsonl back to results/gamespec/<run_id>/
+#   5. rebuild game.html locally from the pass-0 diff and run the floor check on it
+#   6. ./gpuctl down --yes                            retrieves the sealed bundle, then terminates
+#
+# Env (same as gpuctl): LAMBDA_API_KEY (required), LAMBDA_FS, VLLM_VERSION, LAMBDA_IMAGE,
+# LAMBDA_SSH_KEY. The three repo variables CI uses are filled in as defaults below when
+# unset, so a laptop that only exports the API key can run this.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SSH_USER="${SSH_USER:-ubuntu}"
+VENV_NAME="${VENV_NAME:-harness-venv}"
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "==> $*" >&2; }
+
+MODEL="shakedown-qwen30b"; HOLD="2h"; PASSES=1; KEEP_UP=0
+while [[ $# -gt 0 ]]; do case "$1" in
+  --hold)    HOLD="$2"; shift 2 ;;
+  --passes)  PASSES="$2"; shift 2 ;;
+  --keep-up) KEEP_UP=1; shift ;;
+  -h|--help) sed -n '2,25p' "$0" >&2; exit 0 ;;
+  -*) die "unknown flag $1" ;;
+  *) MODEL="$1"; shift ;;
+esac; done
+
+[[ -n "${LAMBDA_API_KEY:-}" ]] || die "LAMBDA_API_KEY not set (https://cloud.lambdalabs.com/api-keys)"
+[[ -f "$HERE/models.d/$MODEL.env" ]] || die "no models.d/$MODEL.env"
+# Defaults mirror the repo variables benchmark.yml runs with (gh variable list).
+export LAMBDA_FS="${LAMBDA_FS:-harness-weights-usw3}"
+export VLLM_VERSION="${VLLM_VERSION:-0.28.0}"
+export LAMBDA_IMAGE="${LAMBDA_IMAGE:-gpu-base-24-04:24.4.4-2141}"
+export LAMBDA_SSH_KEY="${LAMBDA_SSH_KEY:-harness-macbook}"
+command -v node >/dev/null || die "node is needed locally to floor-check the result (brew install node)"
+
+cd "$HERE"
+
+# ---- 1. up -----------------------------------------------------------------------------
+info "bringing up $MODEL (lease $HOLD)"
+UP="$("$HERE/gpuctl" up "$MODEL" --serve --hold "$HOLD" | tail -n1)"
+IP="$(awk '{print $2}' <<<"$UP")"
+[[ -n "$IP" ]] || die "gpuctl up printed no IP: $UP"
+info "instance is up at $IP and serving $MODEL"
+
+teardown() {
+  if (( KEEP_UP )); then
+    info "--keep-up: leaving the instance running. It is leased for $HOLD; ./gpuctl down when done."
+    return
+  fi
+  info "tearing down (gpuctl down retrieves any sealed bundle first)"
+  "$HERE/gpuctl" down --yes || echo "WARNING: gpuctl down failed — run ./gpuctl status and ./gpuctl down by hand" >&2
+}
+trap teardown EXIT
+
+sshto() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$IP" "$@"; }
+
+# ---- 2. run the suite -----------------------------------------------------------------
+# Same PATH/HARNESS_PYTHON pair RUNBOOK §1.4 and benchmark.yml export: the venv is hermetic
+# and nothing is in the image's python3. node ships with the Lambda image; the grading
+# preflight (tier 3) refuses to start if it does not, before any GPU time is spent on the agent.
+info "running gamespec ($PASSES pass(es)) against the served model"
+RUN_LINE="$(sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" HARNESS_PYTHON=\"\$HOME/$VENV_NAME/bin/python\" \
+  && ./harness/run.sh --model '$MODEL' --suite gamespec --passes '$PASSES' --out ~/results" | grep '^RUN ' | tail -n1)" \
+  || die "run.sh failed on the instance (the box is still up until teardown; ./gpuctl ssh to inspect ~/results)"
+RUN_ID="$(awk '{print $2}' <<<"$RUN_LINE")"
+RUN_DIR="$(awk '{print $4}' <<<"$RUN_LINE")"
+STATUS="$(awk '{print $5}' <<<"$RUN_LINE")"
+[[ -n "$RUN_ID" ]] || die "no RUN line from run.sh"
+info "run $RUN_ID finished: $STATUS"
+
+# ---- 3. package (the sealed bundle gpuctl down will retrieve) -------------------------
+sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" && ./resultsctl package '$RUN_DIR' --dist ~/results/dist" \
+  || echo "WARNING: resultsctl package failed; the raw run dir is still pulled below" >&2
+
+# ---- 4. pull the artifact we actually came for ---------------------------------------
+# A sealed bundle deliberately EXCLUDES patches/ (CONTRACTS §7.4). The game lives in the
+# patch, so copy the run's patches and results by hand, before teardown.
+LOCAL="$HERE/results/gamespec/$RUN_ID"
+mkdir -p "$LOCAL"
+scp -q -r -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  "$SSH_USER@$IP:$RUN_DIR/patches" "$SSH_USER@$IP:$RUN_DIR/results.jsonl" "$SSH_USER@$IP:$RUN_DIR/run-manifest.json" "$LOCAL/" \
+  || die "could not copy the run back — the box is still up until teardown; ./gpuctl ssh and copy $RUN_DIR by hand"
+info "pulled patches + results to $LOCAL"
+
+# ---- 5. rebuild game.html from the diff and floor-check it locally --------------------
+python3 - "$LOCAL" <<'PY'
+import json, sys, pathlib
+local = pathlib.Path(sys.argv[1])
+recs = [json.loads(l) for l in (local / "results.jsonl").read_text().splitlines() if l.strip()]
+for r in recs:
+    print("   %-12s pass %s  resolved=%s  %s  floor %s" % (
+        r.get("instance_id"), r.get("pass_idx"), r.get("resolved"), r.get("error_code"),
+        (r.get("grade") or {}).get("fail_to_pass")))
+PY
+for diff in "$LOCAL"/patches/*/pass-*.diff; do
+  [[ -f "$diff" ]] || continue
+  iid="$(basename "$(dirname "$diff")")"; pass="$(basename "$diff" .diff)"
+  out="$LOCAL/built/$iid/$pass"; rm -rf "$out"; mkdir -p "$out"
+  ( cd "$out" && git init -q . && git apply -p1 "$diff" 2>/dev/null ) || { info "$iid $pass: diff did not apply cleanly"; continue; }
+  if [[ -f "$out/game.html" ]]; then
+    info "$iid $pass: game.html rebuilt -> $out/game.html"
+    python3 "$HERE/suites/gamespec/floor_check.py" "$out/game.html" || true
+  else
+    info "$iid $pass: the patch contains no game.html"
+  fi
+done
+
+info "done. Open results/gamespec/$RUN_ID/built/racing-v1/pass-0/game.html in a browser to play it."
