@@ -88,17 +88,25 @@ export PATH="$HOME/harness-venv/bin:$PATH" HARNESS_PYTHON="$HOME/harness-venv/bi
 ./resultsctl package ~/results/runs/<run_id>    # run_id is field 2 of the RUN line run.sh prints
 ./resultsctl upload dist/<run_id>.tar.gz && ./resultsctl index dist/<run_id>.tar.gz
 
-# your machine — PULL THE BUNDLE BACK FIRST. Until you do, it exists only on the instance.
-mkdir -p results/pulled && scp 'ubuntu@<ip>:results/dist/*' results/pulled/   # .tar.gz + .sha256 + .manifest.json
+# your machine — down RETRIEVES the bundle before terminating; you do not pull by hand
 ./gpuctl down
 ```
 
-`gpuctl down` now refuses to terminate an instance that still has a packaged bundle sitting
-in `~/results/dist`, and prints the paths and the `scp` line above. It asks the instance
-over ssh; a box it cannot reach, or one that answers with nothing, is torn down exactly as
-before — an unreachable instance is often precisely why you are running `down`. `--yes` does
-not override the refusal (it answers "terminate these instances?", not "destroy these
-results?"); `--force` does, for when you have already pulled or uploaded them.
+Until someone copies it off, a sealed bundle exists only on the instance, and terminating
+takes the tarball, its manifest and its checksums with it. So `gpuctl down` asks the box
+whether `~/results/dist` still holds one and, if it does, **scp's it to
+`results/pulled/<instance-name>/` and then proceeds**. It only refuses if that copy fails.
+
+It retrieves rather than instructing, because instructing cannot work: `scp` copies and
+nothing in this repo deletes the remote copy, so "pull them and run `down` again" would hit
+the identical refusal the second time and the only way past would be `--force` — which would
+quickly become part of the incantation and defeat the guard.
+
+A box it cannot reach, or one that answers without the probe's marker, is torn down exactly
+as before: an unreachable instance is often precisely why you are running `down`. `--yes`
+does not override the guard (it answers "terminate these instances?", not "destroy these
+results?"); `--force` skips the probe and the retrieval entirely, for when the bundle is
+already saved or you mean to discard it.
 
 **"Command not found", and it is installed.** This is the project's most expensive
 recurring failure: the program is present, and invisible only because its directory is not
@@ -118,7 +126,7 @@ turns the whole check off if you need it). And the preflight proves only that pr
 
 **The instance turns itself off if you forget — but hours later, not minutes.** It lives only
 while leased or while a harness process is running; `./gpuwatch` terminates it otherwise, on
-CI's reaper cron — configured for every 15 min, measured at every ~1.5–4.5 h (§5). Done with
+CI's reaper cron — configured for every 15 min, measured at every ~1.6–4.9 h (§5). Done with
 the box? `./gpuctl down`, don't wait for the reaper. Running long? `./gpuctl hold 4h`. Want to
 see the meter? `./gpuctl status`. The low-level tools (`lambdactl`, `modelctl`) are still there
 underneath.
@@ -318,7 +326,7 @@ pocket**, billed per token and classified `per_token` by the aggregator automati
 
 | leak | guard |
 |---|---|
-| an instance left running | three layers: CI teardown is `if: always()` and **fails the step** if termination is unconfirmed; every instance is **leased** to its job (CI: 12 h, manual: 2 h default) and `./gpuwatch` terminates anything unleased with no harness process — but only on the reaper's real cadence, **every ~1.5–4.5 h, not the 15 min its cron asks for** (see below); hard caps of 24 h age and $500 accrued spend on top. The reaper is safe to leave on before the secrets exist — it skips cleanly |
+| an instance left running | three layers: CI teardown is `if: always()` and **fails the step** if termination is unconfirmed; every instance is **leased** to its job (CI: 12 h, manual: 2 h default) and `./gpuwatch` terminates anything unleased with no harness process — but only on the reaper's real cadence, **every ~1.6–4.9 h, not the 15 min its cron asks for** (see below); hard caps of 24 h age and $500 accrued spend on top. The reaper is safe to leave on before the secrets exist — it skips cleanly |
 | discovering at the first `grade()` that the host cannot grade | grading preflight refuses before the first model call, naming the missing dependency |
 | hashing hundreds of GB of weights on every dispatch | the digest cache lives with the weights on the persistent FS; hashing is parallel |
 | rebuilding SWE-bench docker environments per grade | `--cache_level env` |
@@ -332,8 +340,8 @@ via `gh run list --workflow=reaper.yml --limit 15 --json createdAt,event,conclus
 `event=schedule`, all `conclusion=success`, spanning 2026-09-09T04:34Z → 2026-09-11T01:18Z —
 the gaps between consecutive passes, in minutes, oldest → newest were:
 
-    275  271  216  157  129  128  265  274  264  218  148  134  96  110
-    min 96   median 186.5   mean 192   max 275        (configured: 15)
+    291  110  96  134  148  218  264  274  265  128  129  157  216  271
+    min 96   median 186   mean 193   max 291        (configured: 15)
 
 A box whose lease has lapsed sits inside one of those gaps before the first pass sees it, so
 the exposure after the lease expires is up to one full gap, not 15 minutes. At the list prices
@@ -342,15 +350,22 @@ in `pricing/fallback-prices.json` (1× H100 PCIe $3.29/h, 8× B200 $53.52/h):
 | gap | 1× H100 PCIe | 8× B200 |
 |---|---|---|
 | 15 min (what the cron claims) | $0.82 | $13.38 |
-| 186.5 min (measured median) | ~$10 | ~$166 |
-| 275 min (measured worst) | ~$15 | ~$245 |
+| 186 min (measured median) | ~$10 | ~$166 |
+| 291 min (measured worst) | ~$16 | ~$260 |
 
 The $500 accrued cap does not shorten this: `gpuwatch` totals accrued spend *during* a pass,
-so between passes nothing evaluates it. The practical consequences: **the lease ceiling, not
-the reaper, is what bounds a forgotten box's bill**; `./gpuctl down` explicitly when you are
-done rather than waiting for the reaper; and on B200-class hardware one unleased box eats
-~a third of the untouched $500 buffer in the budget table above during a single median-length
-gap (~half of it at the worst gap observed) — with the reaper behaving exactly as designed.
+so between passes nothing evaluates it. It does override a `busy` verdict once it trips —
+it rebuilds the kill list from every active instance — but only on a pass that runs.
+
+The practical consequences. **A forgotten box's bill is the lease ceiling PLUS the reaper
+gap, and which term dominates depends on the lease**: CI claims 12 h and never renews, so
+there the lease dominates and a crashed workflow can hold a box `busy` for the remainder of
+it (~$642 on 8× B200 — see the comment at the `gpu-lease claim` line in benchmark.yml); a
+manual box defaults to 2 h, which is shorter than the median 3.1 h gap, so there the reaper
+lag is the larger term. Run `./gpuctl down` explicitly rather than waiting for either. On
+B200-class hardware one unleased box eats ~$166 during a single median-length gap and ~$260
+at the worst observed — against the $500 buffer in the budget table above, which §5 already
+notes no longer covers the Phase 1 overrun. All of this is the reaper behaving as designed.
 Do not shorten the cron to compensate: GitHub will not honour it (see the header of
 `.github/workflows/reaper.yml`).
 

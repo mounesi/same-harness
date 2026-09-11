@@ -115,10 +115,10 @@ jobs:
 
       # ---- the last gate before money ------------------------------------------------------
       # reaper.yml asks cron for every 15 minutes. It does not get it: over the last 15
-      # SCHEDULED reaper runs the gaps between starts were 1h36m to 4h35m, median 3h36m
-      # (measured 2026-09-10 with
+      # SCHEDULED reaper runs the gaps between starts were 1h36m to 4h51m, median 3h06m
+      # (measured 2026-09-11 UTC with
       #   gh run list --workflow=reaper.yml --limit 15 --json createdAt,event
-      # — the sibling branch fix/reaper-cadence-truth measures the same thing). I have not
+      # — the same measurement is recorded in the reaper.yml header). I have not
       # established WHY GitHub skips those fires; I am not claiming a cause, only the
       # observed cadence. Either way a leak can bill for hours before the safety net runs.
       #
@@ -234,11 +234,24 @@ jobs:
           scp -o StrictHostKeyChecking=accept-new /tmp/repo.tgz "ubuntu@$IP:~/"
           ssh "ubuntu@$IP" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo"
           # Lease the box to this job for the job's own ceiling: from here on the watchdog
-          # (reaper.yml -> ./gpuwatch) knows it is busy. If this workflow dies before its
-          # teardown, the lease expires with the job and the watchdog finishes the cleanup —
-          # on its real cadence, which is hours apart, not the 15 min its cron asks for
-          # (measured; see the reaper.yml header). The teardown step below is what makes
-          # normal termination prompt; the watchdog is only the backstop.
+          # (reaper.yml -> ./gpuwatch) knows it is busy.
+          #
+          # THE LEASE DOES NOT EXPIRE WITH THE JOB, and this is the largest single cost
+          # exposure in the workflow. It is a flat 12 h claim written to a file ON THE
+          # INSTANCE (~/.harness/lease.json); CI never renews it, and the only `gpu-lease
+          # renew` call site in the repo is gpuctl's manual `hold`. gpu-lease reports
+          # VERDICT=busy while that file is unexpired (gpu-lease:93) and gpuwatch keeps
+          # anything busy. So if this workflow dies after this line but before its
+          # `if: always()` teardown — cancelled, runner lost, network partition — the box
+          # stays "busy" for the REMAINDER OF THE 12 H, and only then does the reaper's own
+          # multi-hour gap begin on top. On 8x B200 at $53.52/h that is ~$642.
+          #
+          # Two backstops sit behind it, neither fast: gpuwatch's MAX_AGE_H=24 terminates
+          # regardless of verdict, but at 24 h — after the lease; and the $500 accrued cap
+          # does override busy (it rebuilds the kill list from every active instance) but is
+          # only evaluated during a pass, which is the thing that runs hours apart.
+          # The teardown step below is what makes normal termination prompt. Shortening this
+          # claim would only help if CI renewed it, which it does not.
           ssh "ubuntu@$IP" "cd ~/harness-repo && ./gpu-lease claim 12h 'ci:${{ inputs.model }}/${{ inputs.suite }}' github-actions"
 
       - name: Provision + serve model

@@ -14,7 +14,7 @@
 #
 # Safety model: an instance stays alive only while it is LEASED (a job claimed it, with an
 # expiry) or a harness process is running on it. `./gpuwatch` — run by CI on a cron set to
-# every 15 min, which GitHub in practice fires every ~1.5-4.5 h (measured; the run list is
+# every 15 min, which GitHub in practice fires every ~1.6-4.9 h (measured; the run list is
 # in the header of .github/workflows/reaper.yml) — terminates anything else carrying this
 # project's name prefix. `up` leases for --hold (default 2h); when your session runs long,
 # `hold` again. Forget, and it turns itself off — but hours after the lease lapses, not
@@ -241,10 +241,13 @@ unretrieved_bundles() { # ip -> one sealed bundle path per line; returns 1 = "co
   # exactly WHY someone is running `down`, so every way of failing to get an answer — no
   # ssh, connection refused, wrong key, timeout, a box already dying — returns 1 and the
   # caller carries on as before. Only a probe that demonstrably ran, proven by the marker
-  # echoed after the ls, may hold anything up. The bound on how long it can take is ssh's
-  # own options rather than timeout(1), which is not on PATH on the macOS box this was
-  # written on (checked on 15.7); -n keeps ssh off the caller's stdin, a here-string of
-  # the target list.
+  # echoed after the ls, may hold anything up. ConnectTimeout bounds the handshake and
+  # ServerAliveInterval/CountMax bound a connection that goes silent — neither bounds a
+  # session that connects and then blocks inside the remote `ls`, because sshd answers
+  # keepalives at the protocol layer whatever the command is doing. A box wedged that far
+  # is exactly the box someone is trying to kill, so --force skips the probe entirely.
+  # timeout(1) would bound it but is absent from the macOS box this was written on
+  # (checked on 15.7). -n keeps ssh off the caller's stdin, a here-string of the targets.
   local ip="$1" out mark="__gpuctl_probe_ok__"
   out="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
              -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
@@ -277,7 +280,7 @@ cmd_down() {
   # is a different question from "destroy these results?", and the loss that put this guard
   # here happened to an operator who had been asked only the first one.
   if (( ! force )); then
-    local holding=0 tname tip bundles
+    local holding=0 pull_failed=0 dest tname tip bundles
     while read -r _ tname tip; do
       [[ -n "${tip:-}" && "$tip" != "-" ]] || continue
       bundles="$(unretrieved_bundles "$tip" || true)"
@@ -290,17 +293,33 @@ cmd_down() {
       echo >&2
       echo "   $tname ($tip)" >&2
       sed 's/^/       /' <<<"$bundles" >&2
-      echo "     pull:  mkdir -p results/pulled && scp '$SSH_USER@$tip:results/dist/*' results/pulled/" >&2
+      # RETRIEVE, rather than telling the operator to. `scp` copies; nothing in this repo
+      # deletes ~/results/dist (resultsctl has package/upload/index/verify/fetch/ls and no
+      # remove). So a guard that refuses and says "pull them and run this again" produces a
+      # byte-identical refusal the second time, and the only way past it is --force — which
+      # teaches the operator to make --force part of the incantation, the exact habit this
+      # guard exists to prevent. Pulling is cheap: a sealed bundle excludes trajectories and
+      # patches (CONTRACTS §7.4) and runs to tens of KB.
+      dest="results/pulled/$tname"
+      mkdir -p "$dest"
+      if scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 \
+             "$SSH_USER@$tip:results/dist/*" "$dest/" 2>/dev/null; then
+        echo "     retrieved -> $dest/" >&2
+      else
+        pull_failed=1
+        echo "     COULD NOT RETRIEVE -> $dest/" >&2
+      fi
     done <<<"$targets"
-    if (( holding )); then
+    if (( holding && pull_failed )); then
       cat >&2 <<'EOF'
 
-Terminating destroys each bundle with its .manifest.json and .sha256. Pull them (the scp
-above takes all three) and run this again — or, if they are already copied or uploaded, or
-you mean to throw them away, say so with --force.
+Terminating destroys each bundle with its manifest and checksums, and at least one could
+not be copied off. Retry, copy it by hand, or — if it is already saved, or you mean to
+throw it away — say so with --force.
 EOF
-      die "refusing to terminate: un-retrieved results on the instance (--force overrides)"
+      die "refusing to terminate: results still on the instance and the pull failed (--force overrides)"
     fi
+    if (( holding )); then info "results retrieved to results/pulled/ — continuing"; fi
   fi
 
   if (( ! yes )); then read -r -p "proceed? [y/N] " ans; [[ "$ans" =~ ^[Yy]$ ]] || die "aborted"; fi
@@ -320,7 +339,7 @@ cmd_hold() {
 cmd_release() {
   need_key; read -r _ name ip < <(pick "${1:-}")
   sshto "$ip" "~/harness-repo/gpu-lease release 2>/dev/null || ~/gpu-lease release"
-  info "$name released — the watchdog reaps it on its next pass, typically 1.5-4.5 h away"
+  info "$name released — the watchdog reaps it on its next pass, typically 1.6-4.9 h away"
   info "it is still billing until then; './gpuctl down $name' stops the meter now"
 }
 cmd_ssh() { need_key; read -r _ name ip < <(pick "${1:-}"); info "$name"; exec ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$ip"; }

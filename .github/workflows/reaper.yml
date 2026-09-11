@@ -3,9 +3,10 @@
 # hard caps: older than 24 h, or total accrued spend over $500. See ./gpuwatch.
 #
 # CADENCE — THE CONFIGURED INTERVAL IS NOT THE REAL ONE. The cron below asks for every
-# 15 minutes. GitHub delivers a small fraction of those firings: scheduled workflows are
-# best-effort, and high-frequency crons are dropped silently. That is GitHub-side, not a
-# bug in this repo — what follows is the measured effect; the cause was not instrumented.
+# 15 minutes. GitHub delivers a small fraction of those firings. What is measured here is
+# the EFFECT — the observed gap between consecutive scheduled starts. The cause was not
+# instrumented, so no mechanism is asserted; the pattern is consistent with GitHub delaying
+# or dropping high-frequency schedules, but this repo has not established that.
 #
 # Measured 2026-09-10 with
 #     gh run list --workflow=reaper.yml --limit 15 --json createdAt,event,conclusion
@@ -13,14 +14,15 @@
 # not failures), spanning 2026-09-09T04:34Z → 2026-09-11T01:18Z. Gaps between consecutive
 # runs, in minutes, oldest → newest:
 #
-#     275  271  216  157  129  128  265  274  264  218  148  134  96  110
-#     min 96   median 186.5   mean 192   max 275        (configured: 15)
+#     291  110  96  134  148  218  264  274  265  128  129  157  216  271
+#     min 96   median 186   mean 193   max 291        (configured: 15)
 #
-# So this is a ~1.5–4.5 hour backstop, not a 15-minute one. An instance whose lease has
+# So this is a ~1.6–4.9 hour backstop, not a 15-minute one. An instance whose lease has
 # lapsed waits somewhere inside one of those gaps before the first pass sees it, and the
 # $500 accrued cap cannot shorten that — gpuwatch only totals accrued spend DURING a pass.
-# Budget against the measured lag (RUNBOOK.md §5) and treat the lease, not the reaper, as
-# the primary guard.
+# Budget against BOTH: the lease ceiling AND the reaper gap that follows it (RUNBOOK §5).
+# For a CI box the 12 h lease dominates; for a manual box the 2 h default lease is SHORTER
+# than the median 3.1 h gap, so there the reaper lag is the larger term. Neither is small.
 #
 # Do NOT "fix" this by editing the cron: a shorter interval does not make GitHub honour it,
 # and a longer one would be a real reduction in protection.

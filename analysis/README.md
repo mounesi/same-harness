@@ -91,7 +91,7 @@ booleans, each with its own list of reasons (CONTRACTS.md §2.2):
 | Flag | Means | What `aggregate.py` does |
 |---|---|---|
 | `flags.nonconformant` | a genuine **harness deviation** that breaks comparability: non-default iteration budget, dirty repo, unresolved weight revision, prompt/template drift | **excluded** from every headline number; listed with its reasons under "Runs excluded". `--include-nonconformant` overrides and the run is then flagged in the warnings |
-| `flags.provenance_incomplete` | cost/provenance attribution is **imprecise**, the science is intact: missing `lambda_instance_id` or `region`, fallback pricing, unresolved requirements-lock hash | **included**. Its group's cost columns are prefixed `≈` in `summary.md`, `cost_approximate` / `cost_approximate_reasons` are set in `by_model_suite.csv` and `summary.json`, and the unresolved fields are listed per run in the "Provenance-incomplete runs" table and on stderr. If such a run has no price and no wall clock at all, its group's cost columns are `—` (`cost_known = false`) with a `cost_unknown` warning — it is never a reason to exit 2 |
+| `flags.provenance_incomplete` | cost/provenance attribution is **imprecise**, the science is intact: missing `lambda_instance_id` or `region`, fallback pricing, unresolved requirements-lock hash, or runs in the group priced from **different price snapshots** (their cost columns are not comparable to each other) | **included**. Its group's cost columns are prefixed `≈` in `summary.md`, `cost_approximate` / `cost_approximate_reasons` are set in `by_model_suite.csv` and `summary.json`, and the unresolved fields are listed per run in the "Provenance-incomplete runs" table and on stderr. If such a run has no price and no wall clock at all, its group's cost columns are `—` (`cost_known = false`) with a `cost_unknown` warning — it is never a reason to exit 2 |
 
 Resolve rate, pass@k, token counts and the failure taxonomy are **never** affected by
 `provenance_incomplete` — only the dollar columns are, which is why excluding those runs would
@@ -135,44 +135,12 @@ between suites, so a global comparison would be meaningless):
 | `harness.adapter_version` | bumped on any grading change (§5) |
 | `harness.environment_digest` | identifies the grading environment |
 
-Compared **within each instance type** — the price epoch:
-
-| Soft | Why |
-|---|---|
-| `price.price_cents_per_hour` | the list price of that hardware, per node-hour |
-
 Soft drift — reported as a warning, promoted to fatal by `--strict` — is
 `harness.result_schema`, `inference.concurrency` (§1.2 says explicitly it does not affect
-verdicts), `inference.passes`, `harness.adapter_sha256`, `suite.instance_ids_sha256`
-within a suite, and `price.price_cents_per_hour` within an instance type. A field that some
-manifests record and others do not is **also** soft, never blocking: an unrecorded knob is an unverified knob, not a proven difference. Both cases are
+verdicts), `inference.passes`, `harness.adapter_sha256`, and `suite.instance_ids_sha256`
+within a suite. A field that some manifests record and others do not is **also** soft, never
+blocking: an unrecorded knob is an unverified knob, not a proven difference. Both cases are
 named in the "Comparability drift" section.
-
-### Price epochs
-
-`price` is a point-in-time record: `captured_at` is "when the snapshot was taken" (§2.2), and
-list prices move. The 2026-09-09 refresh of `pricing/fallback-prices.json` moved
-`gpu_1x_h100_pcie` from 249¢ to 329¢, so the same run bundle costed against the two snapshots
-differs by ~32% for identical hardware and identical work. Aggregating across that boundary
-makes `cost / resolved` — a headline column — differ between two models for a reason that has
-nothing to do with the models.
-
-So `aggregate.py` compares the per-node list price **within one instance type** (not across
-all runs: two different machines legitimately cost different amounts, and not
-`effective_cents_per_hour`, which also carries `node_count`). When one instance type carries
-more than one price among the included runs, the report gains a **"Mixed price epochs"**
-section naming each price, its `captured_at`, its ladder rung and the runs on it; the
-affected groups' cost columns are annotated `≈`; and `summary.json` gains `price_epochs`.
-Runs whose `captured_at` differs but whose price does **not** are silent — the dollars are
-comparable — and every run's epoch is shown in the "Runs included" table regardless.
-
-This is **soft, not blocking**, and deliberately so. Price decides no verdict: a record's
-`resolved` and `error_code` come from grading and the budget ceilings, and the one
-price-derived field in `results.jsonl` is the per-attempt `cost.usd`. A mixed epoch therefore
-moves dollars and nothing else — it cannot move `resolve_rate`, `pass@k` or the failure
-taxonomy. Refusing the aggregation would also be self-defeating: the only override is
-`--allow-mixed`, which waives *every* blocking difference at once, so a price guard strong
-enough to require it would make operators waive the serving-stack guard as a side effect.
 
 `--allow-mixed` overrides the refusal and then annotates it everywhere: a banner at the top
 of `summary.md`, `comparability.mixed = true` plus the specific differences in
@@ -341,7 +309,7 @@ Written to `--out-dir` (default `analysis/tables`):
 
 | File | Contents |
 |---|---|
-| `summary.md` | paste-ready markdown: harness constants, headline, provenance-incomplete runs, mixed price epochs, resolution detail, latency/tokens, failure taxonomy, contamination, per-model rollup, run inventory, exclusions, warnings |
+| `summary.md` | paste-ready markdown: harness constants, headline, provenance-incomplete runs, resolution detail, latency/tokens, failure taxonomy, contamination, per-model rollup, run inventory, exclusions, warnings |
 | `summary.json` | schema `aggregate-report/v1` — every number above plus provenance, options, and diagnostics |
 | `by_model_suite.csv` | one row per (model, suite) |
 | `failures.csv` | long form: one row per (model, suite, error_code) over all 18 codes |
