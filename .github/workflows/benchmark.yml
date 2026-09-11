@@ -23,6 +23,11 @@ on:
         # NOTE: "all" runs three suites sequentially and will not fit the 720m job
         # ceiling for a large model — dispatch one suite per run instead.
         options: [swebench-verified, swebench-pro, agenttask, all]
+      reap_orphans:
+        description: "if the pre-launch check finds a leaked sh-* instance, terminate it and continue instead of stopping"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: gpu-run            # one GPU run at a time — no accidental double spend
@@ -107,6 +112,108 @@ jobs:
           [[ -n "$CPH" && "$CPH" != "0" ]] || CPH=""
           echo "price_cents_per_hour=$CPH" >> "$GITHUB_OUTPUT"
           echo "==> $INSTANCE_TYPE at ${CPH:-unknown} cents/hour (list price; ledger prefers the run manifest)" >&2
+
+      # ---- the last gate before money ------------------------------------------------------
+      # reaper.yml asks cron for every 15 minutes. It does not get it: over the last 15
+      # SCHEDULED reaper runs the gaps between starts were 1h36m to 4h35m, median 3h36m
+      # (measured 2026-09-10 with
+      #   gh run list --workflow=reaper.yml --limit 15 --json createdAt,event
+      # — the sibling branch fix/reaper-cadence-truth measures the same thing). I have not
+      # established WHY GitHub skips those fires; I am not claiming a cause, only the
+      # observed cadence. Either way a leak can bill for hours before the safety net runs.
+      #
+      # This moment is a trigger the project CAN rely on: it is the step immediately before
+      # `lambdactl up` spends money, it happens on every paid run, and a human is standing
+      # here — the workflow is dispatch-only.
+      #
+      # Cheap by construction, as the gate must be: gpuwatch lists instances once and only
+      # ssh-probes ones that exist and are `active`, with ConnectTimeout=10. No instances
+      # means no ssh at all, and an empty inventory is exit 0 with "live": 0 — an empty
+      # account must never fail a dispatch.
+      #
+      # WHY DRY-RUN FIRST RATHER THAN REAP: gpuwatch never touches a name outside the "sh-"
+      # prefix, so the blast radius is this project's own instances. But inside that prefix
+      # it cannot distinguish a leak from a box a human deliberately left idle — the signal
+      # that would say so is a lease or `gpuctl hold`, and forgetting it is exactly how boxes
+      # end up looking idle. Terminating silently at dispatch time would also erase the
+      # evidence that the previous run's teardown failed, which is the thing the operator
+      # most needs to see. Reporting is free: gpuwatch appends its own table to
+      # $GITHUB_STEP_SUMMARY on every pass, dry or not.
+      #
+      # WHY AN ORPHAN BLOCKS RATHER THAN BEING CLEANED AND REPORTED: a leaked instance means
+      # an invariant this project depends on has already failed, and the response to that is
+      # not to add a second billing box on top of it. Blocking costs a re-dispatch; guessing
+      # wrong costs GPU-hours. The operator is present, and unblocking is one toggle:
+      # re-dispatch with reap_orphans=true and this step terminates the leak itself. That
+      # keeps the destructive path explicitly human-authorized instead of automatic.
+      - name: Check for leaked instances before launching (reaper, dry run)
+        id: orphans
+        shell: bash
+        env:
+          REAP: ${{ inputs.reap_orphans }}
+        run: |
+          JSON="$(mktemp)"
+          # The single --json line is all gpuwatch writes to stdout; the table goes to stderr
+          # and to the step summary. Exit 1 means the spend cap tripped or the API call failed.
+          set +e
+          ./gpuwatch --dry-run --json > "$JSON"
+          rc=$?
+          set -e
+
+          COUNTS="$(python3 - "$JSON" <<'PY' || true
+          import json, sys
+          for line in open(sys.argv[1]):
+              line = line.strip()
+              if line.startswith("{"):
+                  d = json.loads(line)
+                  print(int(d.get("live", 0)), int(d.get("terminated", 0)), int(d.get("cap_tripped", 0)))
+                  break
+          PY
+          )"
+
+          if [[ -z "$COUNTS" ]]; then
+            # Inconclusive, not clean. gpuwatch could not produce an inventory (most likely a
+            # failed /instances call). Refusing here is a judgement call: the
+            # launch would probably fail on the same API anyway, and the cost of being wrong
+            # is one re-dispatch, whereas launching blind to what is already running is the
+            # thing this step exists to prevent.
+            echo "::error::gpuwatch could not report what is running (exit $rc, no --json line). Refusing to launch while blind to existing sh-* instances. Re-dispatch, or check the Lambda API." >&2
+            exit 1
+          fi
+          read -r LIVE ORPHANS CAP <<<"$COUNTS"
+          echo "==> live sh-* instances: $LIVE; would be reaped as leaked: $ORPHANS; spend cap tripped: $CAP (gpuwatch exit $rc)"
+
+          if (( CAP )); then
+            echo "::error::gpuwatch's accrued-spend cap is already tripped across live sh-* instances. Not launching another one. Run the instance-reaper workflow and reconcile the spend first." >&2
+            exit 1
+          fi
+          if (( rc != 0 )); then
+            echo "::error::gpuwatch exited $rc without tripping the spend cap — its inventory or a terminate call failed. Not launching until that is understood." >&2
+            exit 1
+          fi
+
+          if (( ORPHANS == 0 )); then
+            if (( LIVE > 0 )); then
+              # Not a leak by gpuwatch's rules: every live box is leased or running a harness
+              # process. Don't block on that — the concurrency group already serializes CI
+              # runs, and a human's held box is legitimate work. But say it out loud, because
+              # this run is about to add another billing instance alongside them.
+              echo "::warning::$LIVE sh-* instance(s) are already alive and the watchdog judges all of them busy (leased or running a job). Nothing to reap. This run adds another billing instance on top of them — see the gpuwatch table in the job summary."
+            fi
+            echo "==> nothing leaked; proceeding to launch"
+            exit 0
+          fi
+
+          if [[ "$REAP" != "true" ]]; then
+            echo "::error::$ORPHANS sh-* instance(s) are alive that the watchdog would terminate as leaked — a previous run's teardown did not finish, or a box was left idle. Not adding another billing instance on top of that. Read the gpuwatch table in this job's summary, then either re-dispatch with reap_orphans=true, run the instance-reaper workflow, or ./lambdactl down <id> by hand." >&2
+            exit 1
+          fi
+
+          echo "::warning::reap_orphans=true — terminating $ORPHANS leaked sh-* instance(s) before launch"
+          # A real pass, which re-probes and re-decides: a box that became busy between the
+          # two passes is kept. A non-zero exit here fails the step, and that is correct — a
+          # terminate that did not go through must not be followed by a launch.
+          ./gpuwatch
 
       - name: Bring GPU server up
         id: up
@@ -320,6 +427,29 @@ jobs:
         id: down
         shell: bash
         run: |
+          # Hand the box back to the watchdog BEFORE trying to kill it. "Ship repo to
+          # instance" claims a 12h lease and nothing in this workflow releases it; gpu-lease
+          # reports VERDICT=busy for as long as that lease is unexpired (cmd_status: an
+          # unexpired lease alone sets busy), and gpuwatch keeps anything it sees as busy.
+          # So if the terminate below fails to confirm, the surviving box would be immune to
+          # the idle rule for the rest of those 12 hours — the safety net switched off at the
+          # one moment it is the only thing left, leaving only gpuwatch's MAX_AGE_H cap (24h
+          # by default). Releasing costs one ssh and makes the leak reapable on the
+          # watchdog's next pass, and on the next run's pre-launch gate above.
+          #
+          # Deliberately NOT running gpuwatch here. It is the weaker tool at this point: this
+          # step knows the instance id and a name tag unique to this run attempt, while the
+          # watchdog works from heuristics over every sh-* box on the account — including
+          # boxes a human started while this job ran. And on this job's own instance it would
+          # do nothing anyway, for the reason just described. The reaper's value is BEFORE a
+          # launch (see the pre-launch gate above), not after one.
+          IP="${{ steps.up.outputs.ip }}"
+          if [[ -n "$IP" ]]; then
+            ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+                "ubuntu@$IP" 'cd ~/harness-repo && ./gpu-lease release' 2>/dev/null \
+              || echo "==> could not release the lease on $IP (box already gone, or unreachable)"
+          fi
+
           ID="${{ steps.up.outputs.id }}"
           # Primary: the id the launch step captured. Secondary: EVERY instance carrying this
           # job's name tag (unique per run attempt), which catches a launch that died before
