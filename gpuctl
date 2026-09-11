@@ -3,17 +3,22 @@
 #
 #   ./gpuctl up <model> [--hold 2h] [--serve]   launch the instance the model needs, lease it to
 #                                               you, (optionally) ship the repo and start vLLM
-#   ./gpuctl down [name | --all] [--yes]        terminate your instance(s); --all = every sh-*
+#   ./gpuctl down [name|--all] [--yes] [--force] terminate your instance(s); --all = every sh-*
+#                                               refuses while the box still holds a packaged
+#                                               result bundle nobody pulled; --force overrides
 #   ./gpuctl status                             what is alive, what it costs, busy or idle
 #   ./gpuctl hold <ttl> [name]                  "I'm working on it" — extend the lease
 #   ./gpuctl release [name]                     drop the lease so the watchdog may reap it
 #   ./gpuctl ssh [name]                         open a shell on it
-#   ./gpuctl reap                               run the watchdog now (what CI does every 15 min)
+#   ./gpuctl reap                               run the watchdog now (CI's own passes are hours apart)
 #
 # Safety model: an instance stays alive only while it is LEASED (a job claimed it, with an
-# expiry) or a harness process is running on it. `./gpuwatch` — run by CI every 15 minutes
-# — terminates anything else carrying this project's name prefix. `up` leases for --hold
-# (default 2h); when your session runs long, `hold` again. Forget, and it turns itself off.
+# expiry) or a harness process is running on it. `./gpuwatch` — run by CI on a cron set to
+# every 15 min, which GitHub in practice fires every ~1.6-4.9 h (measured; the run list is
+# in the header of .github/workflows/reaper.yml) — terminates anything else carrying this
+# project's name prefix. `up` leases for --hold (default 2h); when your session runs long,
+# `hold` again. Forget, and it turns itself off — but hours after the lease lapses, not
+# minutes, so `down` when you are done instead of leaving it to the watchdog.
 #
 # Names: manual instances are "sh-<user>-<model>", CI's are "sh-ci-<model>-<run>-<attempt>".
 # Only "sh-*" is ever touched by anything in this repo.
@@ -225,20 +230,98 @@ EOF
   echo "$id $ip"
 }
 
+unretrieved_bundles() { # ip -> one sealed bundle path per line; returns 1 = "could not tell"
+  # Does this box still hold results nobody has copied off it? `resultsctl package` writes
+  # <out>/dist/<run_id>.tar.gz, and both paths that package on an instance land that in
+  # ~/results/dist: RUNBOOK §1.4 runs the harness with `--out ~/results`, and
+  # .github/workflows/benchmark.yml passes `--dist ~/results/dist` explicitly. A bundle put
+  # somewhere else with --dist or RESULTS_DIST_DIR is NOT seen by this probe.
+  #
+  # The probe is never allowed to stop a teardown on its own. An unreachable box is often
+  # exactly WHY someone is running `down`, so every way of failing to get an answer — no
+  # ssh, connection refused, wrong key, timeout, a box already dying — returns 1 and the
+  # caller carries on as before. Only a probe that demonstrably ran, proven by the marker
+  # echoed after the ls, may hold anything up. ConnectTimeout bounds the handshake and
+  # ServerAliveInterval/CountMax bound a connection that goes silent — neither bounds a
+  # session that connects and then blocks inside the remote `ls`, because sshd answers
+  # keepalives at the protocol layer whatever the command is doing. A box wedged that far
+  # is exactly the box someone is trying to kill, so --force skips the probe entirely.
+  # timeout(1) would bound it but is absent from the macOS box this was written on
+  # (checked on 15.7). -n keeps ssh off the caller's stdin, a here-string of the targets.
+  local ip="$1" out mark="__gpuctl_probe_ok__"
+  out="$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+             -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
+             -n "$SSH_USER@$ip" \
+             'ls -1 "$HOME"/results/dist/*.tar.gz 2>/dev/null; echo '"$mark" 2>/dev/null)" || return 1
+  [[ "$out" == *"$mark"* ]] || return 1
+  grep -v -x -F -e "$mark" <<<"$out" | grep . || true
+}
+
 cmd_down() {
   need_key
-  local yes=0 all=0 name=""
-  for a in "$@"; do case "$a" in --yes|-y) yes=1 ;; --all) all=1 ;; *) name="$a" ;; esac; done
+  local yes=0 all=0 force=0 name=""
+  for a in "$@"; do case "$a" in --yes|-y) yes=1 ;; --all) all=1 ;; --force) force=1 ;; *) name="$a" ;; esac; done
   local targets
+  # Field 5 of `lambdactl ls` is the IP; it is carried along so the results probe below has
+  # somewhere to knock. It reads "-" for an instance with no IP yet, or one already going.
   if (( all )); then
-    targets="$("$HERE/lambdactl" ls | awk -v p="$PREFIX" '$2 ~ "^"p {print $1, $2}')"
+    targets="$("$HERE/lambdactl" ls | awk -v p="$PREFIX" '$2 ~ "^"p {print $1, $2, $5}')"
   elif [[ -n "$name" ]]; then
-    targets="$("$HERE/lambdactl" ls | awk -v n="$name" '$2==n {print $1, $2}')"
+    targets="$("$HERE/lambdactl" ls | awk -v n="$name" '$2==n {print $1, $2, $5}')"
   else
-    targets="$(mine | awk '{print $1, $2}')"
+    targets="$(mine)"
   fi
   [[ -n "$targets" ]] || { info "nothing to terminate"; return 0; }
-  echo "will terminate:" >&2; sed 's/^/   /' <<<"$targets" >&2
+  echo "will terminate:" >&2; awk '{print "   " $1 "  " $2}' <<<"$targets" >&2
+
+  # A sealed bundle exists ONLY on the instance until someone copies it off; terminating
+  # takes the tarball, its manifest and its checksums with it and the run has to be bought
+  # again. --yes does not override this. --yes answers "terminate these instances?", which
+  # is a different question from "destroy these results?", and the loss that put this guard
+  # here happened to an operator who had been asked only the first one.
+  if (( ! force )); then
+    local holding=0 pull_failed=0 dest tname tip bundles
+    while read -r _ tname tip; do
+      [[ -n "${tip:-}" && "$tip" != "-" ]] || continue
+      bundles="$(unretrieved_bundles "$tip" || true)"
+      [[ -n "$bundles" ]] || continue
+      if (( ! holding )); then
+        holding=1
+        echo >&2
+        echo "RESULTS NOT RETRIEVED — sealed run bundles are still on the instance:" >&2
+      fi
+      echo >&2
+      echo "   $tname ($tip)" >&2
+      sed 's/^/       /' <<<"$bundles" >&2
+      # RETRIEVE, rather than telling the operator to. `scp` copies; nothing in this repo
+      # deletes ~/results/dist (resultsctl has package/upload/index/verify/fetch/ls and no
+      # remove). So a guard that refuses and says "pull them and run this again" produces a
+      # byte-identical refusal the second time, and the only way past it is --force — which
+      # teaches the operator to make --force part of the incantation, the exact habit this
+      # guard exists to prevent. Pulling is cheap: a sealed bundle excludes trajectories and
+      # patches (CONTRACTS §7.4) and runs to tens of KB.
+      dest="results/pulled/$tname"
+      mkdir -p "$dest"
+      if scp -q -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 \
+             "$SSH_USER@$tip:results/dist/*" "$dest/" 2>/dev/null; then
+        echo "     retrieved -> $dest/" >&2
+      else
+        pull_failed=1
+        echo "     COULD NOT RETRIEVE -> $dest/" >&2
+      fi
+    done <<<"$targets"
+    if (( holding && pull_failed )); then
+      cat >&2 <<'EOF'
+
+Terminating destroys each bundle with its manifest and checksums, and at least one could
+not be copied off. Retry, copy it by hand, or — if it is already saved, or you mean to
+throw it away — say so with --force.
+EOF
+      die "refusing to terminate: results still on the instance and the pull failed (--force overrides)"
+    fi
+    if (( holding )); then info "results retrieved to results/pulled/ — continuing"; fi
+  fi
+
   if (( ! yes )); then read -r -p "proceed? [y/N] " ans; [[ "$ans" =~ ^[Yy]$ ]] || die "aborted"; fi
   while read -r id _; do [[ -n "$id" ]] && "$HERE/lambdactl" down "$id"; done <<<"$targets"
 }
@@ -256,7 +339,8 @@ cmd_hold() {
 cmd_release() {
   need_key; read -r _ name ip < <(pick "${1:-}")
   sshto "$ip" "~/harness-repo/gpu-lease release 2>/dev/null || ~/gpu-lease release"
-  info "$name released — the watchdog may terminate it within 15 minutes"
+  info "$name released — the watchdog reaps it on its next pass, typically 1.6-4.9 h away"
+  info "it is still billing until then; './gpuctl down $name' stops the meter now"
 }
 cmd_ssh() { need_key; read -r _ name ip < <(pick "${1:-}"); info "$name"; exec ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$ip"; }
 
@@ -268,5 +352,5 @@ case "${1:-}" in
   release) shift; cmd_release "$@" ;;
   ssh)     shift; cmd_ssh "$@" ;;
   reap)    cmd_reap ;;
-  *) sed -n '2,11p' "$0" >&2; exit 1 ;;
+  *) sed -n '2,13p' "$0" >&2; exit 1 ;;
 esac

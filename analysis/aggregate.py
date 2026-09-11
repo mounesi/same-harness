@@ -1242,6 +1242,33 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
             "cost fell back to summing per-attempt cost.usd for at least one run "
             "(under-counts idle instance time)"
         )
+    # PRICE EPOCH. A manifest records the price as it stood when the run happened — which is
+    # correct, it is a point-in-time record — so two runs on identical hardware can carry
+    # different rates if pricing/fallback-prices.json was refreshed between them. The
+    # 2026-09-09 refresh moved gpu_1x_h100_pcie 249 -> 329 c/h (+32%) and gpu_8x_b200_sxm6
+    # 3992 -> 5352 (+34%), so cost/resolved across that boundary is not comparable.
+    #
+    # Annotated, not blocking. The serving-stack fields (vllm_version, nvidia_driver,
+    # quantization) block because they can change WHETHER A TASK RESOLVED. A price cannot —
+    # it changes only the cost columns — so refusing to aggregate would be too strong, and
+    # would refuse a legitimate re-price of an unchanged run. This rides the existing
+    # cost_approximate channel, which is exactly what it is for: the science is intact, the
+    # cost attribution is not like-for-like.
+    #
+    # Runs with no captured_at (an unresolved price writes None) are not counted as a
+    # distinct epoch: absence is already reported by provenance_incomplete, and treating it
+    # as its own value would annotate every mixed-provenance group for the wrong reason.
+    price_epochs = sorted({
+        ep for ep in (dig(r, "manifest", "price", "captured_at", default=None) for r in runs)
+        if ep
+    })
+    if len(price_epochs) > 1:
+        cost_approximate_reasons.append(
+            "runs were priced from different price snapshots ("
+            + ", ".join(price_epochs)
+            + ") — cost columns are not comparable across that boundary; the resolve rates are"
+        )
+
     cost_approximate = bool(cost_approximate_reasons)
     if cost_approximate:
         diag.warn(

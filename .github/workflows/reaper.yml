@@ -1,6 +1,31 @@
-# The safety net. Every 15 minutes: terminate any instance of THIS project (name prefix
-# "sh-") that is not doing a job — no unexpired lease and no harness process on the box —
-# plus hard caps: older than 24 h, or total accrued spend over $500. See ./gpuwatch.
+# The safety net. Each pass: terminate any instance of THIS project (name prefix "sh-")
+# that is not doing a job — no unexpired lease and no harness process on the box — plus
+# hard caps: older than 24 h, or total accrued spend over $500. See ./gpuwatch.
+#
+# CADENCE — THE CONFIGURED INTERVAL IS NOT THE REAL ONE. The cron below asks for every
+# 15 minutes. GitHub delivers a small fraction of those firings. What is measured here is
+# the EFFECT — the observed gap between consecutive scheduled starts. The cause was not
+# instrumented, so no mechanism is asserted; the pattern is consistent with GitHub delaying
+# or dropping high-frequency schedules, but this repo has not established that.
+#
+# Measured 2026-09-10 with
+#     gh run list --workflow=reaper.yml --limit 15 --json createdAt,event,conclusion
+# All 15 runs were event=schedule and conclusion=success (so these are delivered passes,
+# not failures), spanning 2026-09-09T04:34Z → 2026-09-11T01:18Z. Gaps between consecutive
+# runs, in minutes, oldest → newest:
+#
+#     291  110  96  134  148  218  264  274  265  128  129  157  216  271
+#     min 96   median 186   mean 193   max 291        (configured: 15)
+#
+# So this is a ~1.6–4.9 hour backstop, not a 15-minute one. An instance whose lease has
+# lapsed waits somewhere inside one of those gaps before the first pass sees it, and the
+# $500 accrued cap cannot shorten that — gpuwatch only totals accrued spend DURING a pass.
+# Budget against BOTH: the lease ceiling AND the reaper gap that follows it (RUNBOOK §5).
+# For a CI box the 12 h lease dominates; for a manual box the 2 h default lease is SHORTER
+# than the median 3.1 h gap, so there the reaper lag is the larger term. Neither is small.
+#
+# Do NOT "fix" this by editing the cron: a shorter interval does not make GitHub honour it,
+# and a longer one would be a real reduction in protection.
 #
 # It is safe to have this ON before the secrets exist: with no LAMBDA_API_KEY there is
 # nothing to watch, and the job skips cleanly instead of failing.
