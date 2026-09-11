@@ -88,9 +88,17 @@ export PATH="$HOME/harness-venv/bin:$PATH" HARNESS_PYTHON="$HOME/harness-venv/bi
 ./resultsctl package ~/results/runs/<run_id>    # run_id is field 2 of the RUN line run.sh prints
 ./resultsctl upload dist/<run_id>.tar.gz && ./resultsctl index dist/<run_id>.tar.gz
 
-# your machine
+# your machine — PULL THE BUNDLE BACK FIRST. Until you do, it exists only on the instance.
+mkdir -p results/pulled && scp 'ubuntu@<ip>:results/dist/*' results/pulled/   # .tar.gz + .sha256 + .manifest.json
 ./gpuctl down
 ```
+
+`gpuctl down` now refuses to terminate an instance that still has a packaged bundle sitting
+in `~/results/dist`, and prints the paths and the `scp` line above. It asks the instance
+over ssh; a box it cannot reach, or one that answers with nothing, is torn down exactly as
+before — an unreachable instance is often precisely why you are running `down`. `--yes` does
+not override the refusal (it answers "terminate these instances?", not "destroy these
+results?"); `--force` does, for when you have already pulled or uploaded them.
 
 **"Command not found", and it is installed.** This is the project's most expensive
 recurring failure: the program is present, and invisible only because its directory is not
