@@ -109,16 +109,20 @@ ERROR_CODE_SET = frozenset(ERROR_CODES)
 # tables are authoritative and are what is implemented here; the prose count is off by one.
 assert len(ERROR_CODE_SET) == len(ERROR_CODES), "duplicate error code in the taxonomy"
 
-SUITES = ("swebench-verified", "swebench-pro", "agenttask")
+# Every suite the loop will execute. gamespec (greenfield build-a-game) is a valid suite
+# here and in harness/adapters; only run.sh's `--suite all` excludes it (CONTRACTS §1.2).
+SUITES = ("swebench-verified", "swebench-pro", "agenttask", "gamespec")
 SUITE_MODULES = {
     "swebench-verified": "swebench_verified",
     "swebench-pro": "swebench_pro",
     "agenttask": "agenttask",
+    "gamespec": "gamespec",
 }
 DEFAULT_SEED_FILES = {
     "swebench-verified": "suites/verified-100.json",
     "swebench-pro": "suites/pro-50.json",
     "agenttask": "suites/agenttask/seed.json",
+    "gamespec": "suites/gamespec/seed.json",
 }
 DEFAULT_ENDPOINT = "http://localhost:8000/v1"
 

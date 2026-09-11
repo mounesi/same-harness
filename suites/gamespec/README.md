@@ -1,6 +1,16 @@
 # gamespec — build-a-game suite, with a human judging channel
 
-**Status: one spec written and validated, floor check working. No adapter, nothing run.**
+**Status: one spec written and validated, floor check working, adapter wired in
+(`harness/adapters/gamespec.py`), smoke-tested against the mock endpoint. No model run yet.**
+
+Run it against a served model exactly like the other suites — `./harness/run.sh --model <m>
+--suite gamespec --passes 1 --out ~/results` — or, from a laptop with `LAMBDA_API_KEY`
+exported, as one command that brings a GPU up, runs it, pulls `game.html` back and tears
+the GPU down: `./suites/gamespec/demo.sh [model]` (default `shakedown-qwen30b`, the cheapest
+Qwen coder known to serve). `gamespec` is a valid single suite and deliberately **not** part
+of `--suite all`, which stays the three brownfield suites the headline table is built from.
+It carries its own `partitions.json` (the spec is `dev`, never Phase-2 training data) so
+`suites/partitions.json` stays frozen over the three SWE-bench-shaped suites only.
 
 A greenfield suite: give every model the same written specification and have it build a
 playable game. Two things make it worth having alongside the SWE-bench-shaped suites.
@@ -106,8 +116,11 @@ passes for the wrong reason is worse than no check: it reports coverage it does 
 
 ## What building the suite still needs
 
-1. **An adapter** implementing CONTRACTS.md §5, with `CONSENT_CLASS = "public"`, whose
-   `grade()` shells out to `floor_check.py --json`.
+1. ~~**An adapter**~~ — done: `harness/adapters/gamespec.py` (`CONSENT_CLASS = "public"`).
+   The workspace it lays down holds `SPEC.md`, a copy of `floor_check.py` and a README;
+   the model's `game.html` reaches `grade()` as a new-file diff, and `grade()` always runs
+   the **repo's** `floor_check.py`, never the workspace copy the model could have edited.
+   `resolved` = the floor passed in full; `fail_to_pass` is the single node `floor`.
 2. **More specs.** One spec is one task; the harness reports rates. Three or four specs at
    varying difficulty (racing, flight-over-city, a logistics sim to make the enterprise
    framing explicit) is the minimum for a meaningful comparison.

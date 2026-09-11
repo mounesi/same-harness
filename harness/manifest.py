@@ -42,6 +42,7 @@ SUITES = {
     "swebench-verified": ("harness/adapters/swebench_verified.py", "suites/verified-100.json", "public"),
     "swebench-pro": ("harness/adapters/swebench_pro.py", "suites/pro-50.json", "public"),
     "agenttask": ("harness/adapters/agenttask.py", "suites/agenttask/seed.json", "restricted"),
+    "gamespec": ("harness/adapters/gamespec.py", "suites/gamespec/seed.json", "public"),
 }
 
 # CONTRACTS.md §2.4 — skipped everywhere a directory digest is computed.
@@ -1278,12 +1279,14 @@ GRADING_DEPS = {
     "swebench-verified": {"binaries": ("docker",), "modules": ("swebench",)},
     "swebench-pro": {"binaries": ("docker",), "modules": ("swebench",)},
     "agenttask": {"binaries": ("git",), "modules": ()},
+    "gamespec": {"binaries": ("git", "node"), "modules": ()},
 }
 
 BINARY_HINTS = {
     "docker": "install Docker and make sure `docker version` succeeds as this user — the "
               "SWE-bench evaluation harness builds one container per instance",
     "git": "install git — the agenttask grader replays tests inside a git workspace",
+    "node": "install Node.js — suites/gamespec/floor_check.py drives SimCore headlessly in node",
 }
 MODULE_HINTS = {
     "swebench": "python3 -m pip install swebench   (the official evaluation harness)",

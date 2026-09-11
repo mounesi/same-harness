@@ -13,6 +13,8 @@ Scripted behaviour, chosen by $MOCK_MODE:
     solve   the model emits a tool call writing the correct fix, then stops    -> resolved
     noop    the model answers in prose and never edits anything               -> NO_PATCH
     flaky   fails with 503 twice, then behaves like `solve`     -> exercises the retry path
+    gamespec  reads SPEC.md, writes suites/gamespec/specs/racing-v1.reference.html as
+              game.html, runs the floor check, then stops          -> resolved (gamespec)
 
 Tool calling is OFF unless you launch it on, exactly as in vLLM. The agent loop sends
 `tool_choice: "auto"` on every call (harness/agent.py:_payload), and vLLM answers HTTP 400
@@ -68,6 +70,14 @@ _state = {"calls": 0, "fail_budget": 2}
 FIX_OLD = "    return a / b"
 FIX_NEW = "    if b == 0:\n        return None\n    return a / b"
 
+# The deliverable the "gamespec" mode writes: the suite's own reference implementation,
+# which floor_check.py is known to pass (ci.yml runs that check on every push). Read lazily
+# so the other modes never depend on the file.
+GAMESPEC_REFERENCE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..",
+    "suites", "gamespec", "specs", "racing-v1.reference.html",
+)
+
 
 def _tool_call(call_id: str, name: str, args: dict) -> dict:
     return {
@@ -83,6 +93,23 @@ def _reply(messages: list, tools_seen: bool) -> dict:
     tool_results = [m for m in messages if m.get("role") == "tool"]
     if MODE == "noop":
         return {"role": "assistant", "content": "I have reviewed the code and see no issue."}
+
+    if MODE == "gamespec":
+        # read the spec -> create game.html -> run the floor check -> submit-by-stopping
+        if not tool_results:
+            return {"role": "assistant", "content": None,
+                    "tool_calls": [_tool_call("call_1", "read_file", {"path": "SPEC.md"})]}
+        if len(tool_results) == 1:
+            with open(GAMESPEC_REFERENCE, encoding="utf-8") as fh:
+                html = fh.read()
+            return {"role": "assistant", "content": None,
+                    "tool_calls": [_tool_call("call_2", "create_file",
+                                              {"path": "game.html", "content": html})]}
+        if len(tool_results) == 2:
+            return {"role": "assistant", "content": None,
+                    "tool_calls": [_tool_call("call_3", "run_tests", {})]}
+        return {"role": "assistant",
+                "content": "Wrote game.html with a pure SimCore; the floor check passes."}
 
     if not tool_results:
         # First turn: read the file, so the transcript exercises a multi-turn loop.
