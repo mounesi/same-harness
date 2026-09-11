@@ -1,6 +1,29 @@
-# The safety net. Every 15 minutes: terminate any instance of THIS project (name prefix
-# "sh-") that is not doing a job — no unexpired lease and no harness process on the box —
-# plus hard caps: older than 24 h, or total accrued spend over $500. See ./gpuwatch.
+# The safety net. Each pass: terminate any instance of THIS project (name prefix "sh-")
+# that is not doing a job — no unexpired lease and no harness process on the box — plus
+# hard caps: older than 24 h, or total accrued spend over $500. See ./gpuwatch.
+#
+# CADENCE — THE CONFIGURED INTERVAL IS NOT THE REAL ONE. The cron below asks for every
+# 15 minutes. GitHub delivers a small fraction of those firings: scheduled workflows are
+# best-effort, and high-frequency crons are dropped silently. That is GitHub-side, not a
+# bug in this repo — what follows is the measured effect; the cause was not instrumented.
+#
+# Measured 2026-09-10 with
+#     gh run list --workflow=reaper.yml --limit 15 --json createdAt,event,conclusion
+# All 15 runs were event=schedule and conclusion=success (so these are delivered passes,
+# not failures), spanning 2026-09-09T04:34Z → 2026-09-11T01:18Z. Gaps between consecutive
+# runs, in minutes, oldest → newest:
+#
+#     275  271  216  157  129  128  265  274  264  218  148  134  96  110
+#     min 96   median 186.5   mean 192   max 275        (configured: 15)
+#
+# So this is a ~1.5–4.5 hour backstop, not a 15-minute one. An instance whose lease has
+# lapsed waits somewhere inside one of those gaps before the first pass sees it, and the
+# $500 accrued cap cannot shorten that — gpuwatch only totals accrued spend DURING a pass.
+# Budget against the measured lag (RUNBOOK.md §5) and treat the lease, not the reaper, as
+# the primary guard.
+#
+# Do NOT "fix" this by editing the cron: a shorter interval does not make GitHub honour it,
+# and a longer one would be a real reduction in protection.
 #
 # It is safe to have this ON before the secrets exist: with no LAMBDA_API_KEY there is
 # nothing to watch, and the job skips cleanly instead of failing.

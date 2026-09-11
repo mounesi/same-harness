@@ -126,9 +126,12 @@ jobs:
           tar -czf /tmp/repo.tgz --exclude=.github .
           scp -o StrictHostKeyChecking=accept-new /tmp/repo.tgz "ubuntu@$IP:~/"
           ssh "ubuntu@$IP" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo"
-          # Lease the box to this job for the job's own ceiling: from here on the 15-minute
-          # watchdog (reaper.yml -> ./gpuwatch) knows it is busy. If this workflow dies before
-          # its teardown, the lease expires with the job and the watchdog finishes the cleanup.
+          # Lease the box to this job for the job's own ceiling: from here on the watchdog
+          # (reaper.yml -> ./gpuwatch) knows it is busy. If this workflow dies before its
+          # teardown, the lease expires with the job and the watchdog finishes the cleanup —
+          # on its real cadence, which is hours apart, not the 15 min its cron asks for
+          # (measured; see the reaper.yml header). The teardown step below is what makes
+          # normal termination prompt; the watchdog is only the backstop.
           ssh "ubuntu@$IP" "cd ~/harness-repo && ./gpu-lease claim 12h 'ci:${{ inputs.model }}/${{ inputs.suite }}' github-actions"
 
       - name: Provision + serve model

@@ -8,12 +8,15 @@
 #   ./gpuctl hold <ttl> [name]                  "I'm working on it" — extend the lease
 #   ./gpuctl release [name]                     drop the lease so the watchdog may reap it
 #   ./gpuctl ssh [name]                         open a shell on it
-#   ./gpuctl reap                               run the watchdog now (what CI does every 15 min)
+#   ./gpuctl reap                               run the watchdog now (CI's own passes are hours apart)
 #
 # Safety model: an instance stays alive only while it is LEASED (a job claimed it, with an
-# expiry) or a harness process is running on it. `./gpuwatch` — run by CI every 15 minutes
-# — terminates anything else carrying this project's name prefix. `up` leases for --hold
-# (default 2h); when your session runs long, `hold` again. Forget, and it turns itself off.
+# expiry) or a harness process is running on it. `./gpuwatch` — run by CI on a cron set to
+# every 15 min, which GitHub in practice fires every ~1.5-4.5 h (measured; the run list is
+# in the header of .github/workflows/reaper.yml) — terminates anything else carrying this
+# project's name prefix. `up` leases for --hold (default 2h); when your session runs long,
+# `hold` again. Forget, and it turns itself off — but hours after the lease lapses, not
+# minutes, so `down` when you are done instead of leaving it to the watchdog.
 #
 # Names: manual instances are "sh-<user>-<model>", CI's are "sh-ci-<model>-<run>-<attempt>".
 # Only "sh-*" is ever touched by anything in this repo.
@@ -256,7 +259,8 @@ cmd_hold() {
 cmd_release() {
   need_key; read -r _ name ip < <(pick "${1:-}")
   sshto "$ip" "~/harness-repo/gpu-lease release 2>/dev/null || ~/gpu-lease release"
-  info "$name released — the watchdog may terminate it within 15 minutes"
+  info "$name released — the watchdog reaps it on its next pass, typically 1.5-4.5 h away"
+  info "it is still billing until then; './gpuctl down $name' stops the meter now"
 }
 cmd_ssh() { need_key; read -r _ name ip < <(pick "${1:-}"); info "$name"; exec ssh -o StrictHostKeyChecking=accept-new "$SSH_USER@$ip"; }
 

@@ -107,12 +107,19 @@ export LAMBDA_API_KEY=...
 ./gpuctl down                    # off
 ```
 
-**It turns itself off.** An instance stays alive only while it is *leased* (a job claimed it
-with an expiry) or a harness process is running on it. `./gpuwatch` — run by CI every
-15 minutes (`.github/workflows/reaper.yml`) — terminates anything else carrying this
-project's `sh-` name prefix, plus hard caps (older than 24 h, or more than $500 accrued
-across everything alive). `gpuctl up` leases for 2 h by default; a CI run leases for its
-own 12 h ceiling. Forget a box and it costs you at most the lease, not the night.
+**It turns itself off — eventually.** An instance stays alive only while it is *leased* (a
+job claimed it with an expiry) or a harness process is running on it. `./gpuwatch`
+(`.github/workflows/reaper.yml`) terminates anything else carrying this project's `sh-`
+name prefix, plus hard caps (older than 24 h, or more than $500 accrued across everything
+alive). `gpuctl up` leases for 2 h by default; a CI run leases for its own 12 h ceiling.
+
+**The reaper's cron asks for every 15 minutes; GitHub actually runs it every ~1.5–4.5 h.**
+Measured over the last 15 scheduled runs on 2026-09-10: gaps of min 96 / median 186.5 /
+max 275 minutes — the run list and the command that produced it are in the header of
+`.github/workflows/reaper.yml`. So forgetting a box costs you the lease *plus* hours of
+waiting for the next pass (at the median gap, ~$10 on 1× H100 PCIe, ~$166 on 8× B200 —
+RUNBOOK.md §5). The lease is the guard that bounds your bill; the reaper is the backstop
+behind it. Run `./gpuctl down` when you are done rather than leaving it to the watchdog.
 
 The watchdog only ever touches `sh-*` names. Nothing in this repo can terminate an instance
 that belongs to something else on the account.

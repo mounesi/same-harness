@@ -108,10 +108,12 @@ turns the whole check off if you need it). And the preflight proves only that pr
 *resolve* — GPU, driver/CUDA match and vLLM's own import are checked separately, by
 `./gpuctl up --serve`. Case notes and the functions: `lib/pathguard.sh`.
 
-**The instance turns itself off if you forget.** It lives only while leased or while a harness
-process is running; `./gpuwatch` (CI, every 15 min) terminates it otherwise. Running long?
-`./gpuctl hold 4h`. Want to see the meter? `./gpuctl status`. The low-level tools
-(`lambdactl`, `modelctl`) are still there underneath.
+**The instance turns itself off if you forget — but hours later, not minutes.** It lives only
+while leased or while a harness process is running; `./gpuwatch` terminates it otherwise, on
+CI's reaper cron — configured for every 15 min, measured at every ~1.5–4.5 h (§5). Done with
+the box? `./gpuctl down`, don't wait for the reaper. Running long? `./gpuctl hold 4h`. Want to
+see the meter? `./gpuctl status`. The low-level tools (`lambdactl`, `modelctl`) are still there
+underneath.
 
 `run.sh` prints exactly one machine-readable line per run on stdout —
 `RUN <run_id> <suite> <run_dir> <status>` — and everything human on stderr.
@@ -308,13 +310,41 @@ pocket**, billed per token and classified `per_token` by the aggregator automati
 
 | leak | guard |
 |---|---|
-| an instance left running | three layers: CI teardown is `if: always()` and **fails the step** if termination is unconfirmed; every instance is **leased** to its job (CI: 12 h, manual: 2 h default) and `./gpuwatch` terminates anything unleased with no harness process every 15 min; hard caps of 24 h age and $500 accrued spend on top. The reaper is safe to leave on before the secrets exist — it skips cleanly |
+| an instance left running | three layers: CI teardown is `if: always()` and **fails the step** if termination is unconfirmed; every instance is **leased** to its job (CI: 12 h, manual: 2 h default) and `./gpuwatch` terminates anything unleased with no harness process — but only on the reaper's real cadence, **every ~1.5–4.5 h, not the 15 min its cron asks for** (see below); hard caps of 24 h age and $500 accrued spend on top. The reaper is safe to leave on before the secrets exist — it skips cleanly |
 | discovering at the first `grade()` that the host cannot grade | grading preflight refuses before the first model call, naming the missing dependency |
 | hashing hundreds of GB of weights on every dispatch | the digest cache lives with the weights on the persistent FS; hashing is parallel |
 | rebuilding SWE-bench docker environments per grade | `--cache_level env` |
 | the GPU idling while attempts grade | grading runs on its own pool |
 | a job that cannot fit the 12 h ceiling | one suite per dispatch; the default is `swebench-verified` |
 | provisioning against unfrozen partitions | `benchmark.yml` refuses before launch |
+
+**How long the reaper actually takes.** `reaper.yml` declares `cron: "*/15 * * * *"`, but
+GitHub delivers only a fraction of a high-frequency schedule's firings. Measured 2026-09-10
+via `gh run list --workflow=reaper.yml --limit 15 --json createdAt,event,conclusion` — all 15
+`event=schedule`, all `conclusion=success`, spanning 2026-09-09T04:34Z → 2026-09-11T01:18Z —
+the gaps between consecutive passes, in minutes, oldest → newest were:
+
+    275  271  216  157  129  128  265  274  264  218  148  134  96  110
+    min 96   median 186.5   mean 192   max 275        (configured: 15)
+
+A box whose lease has lapsed sits inside one of those gaps before the first pass sees it, so
+the exposure after the lease expires is up to one full gap, not 15 minutes. At the list prices
+in `pricing/fallback-prices.json` (1× H100 PCIe $3.29/h, 8× B200 $53.52/h):
+
+| gap | 1× H100 PCIe | 8× B200 |
+|---|---|---|
+| 15 min (what the cron claims) | $0.82 | $13.38 |
+| 186.5 min (measured median) | ~$10 | ~$166 |
+| 275 min (measured worst) | ~$15 | ~$245 |
+
+The $500 accrued cap does not shorten this: `gpuwatch` totals accrued spend *during* a pass,
+so between passes nothing evaluates it. The practical consequences: **the lease ceiling, not
+the reaper, is what bounds a forgotten box's bill**; `./gpuctl down` explicitly when you are
+done rather than waiting for the reaper; and on B200-class hardware one unleased box eats
+~a third of the untouched $500 buffer in the budget table above during a single median-length
+gap (~half of it at the worst gap observed) — with the reaper behaving exactly as designed.
+Do not shorten the cron to compensate: GitHub will not honour it (see the header of
+`.github/workflows/reaper.yml`).
 
 The cut order if the schedule slips: Kimi K3 → the Pro suite. If Day 10 arrives short,
 publish the API baselines + Qwen alone. A narrow finished study beats a broad abandoned one.
