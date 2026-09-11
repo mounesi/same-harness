@@ -56,6 +56,15 @@ UP="$("$HERE/gpuctl" up "$MODEL" --serve --hold "$HOLD" | tail -n1)"
 IP="$(awk '{print $2}' <<<"$UP")"
 [[ -n "$IP" ]] || die "gpuctl up printed no IP: $UP"
 info "instance is up at $IP and serving $MODEL"
+# The harness must be told where the weights are, the same way benchmark.yml tells it:
+# run.sh defaults WEIGHTS_DIR to /persistent/models, else ~/models, and the persistent
+# filesystem is mounted at neither. Without this the manifest cannot resolve
+# model.weight_digest (REQUIRED) and refuses to start — the first demo lost ~10 min of
+# H100 to exactly that. Resolved from the API like gpuctl does, not guessed.
+MOUNT="$("$HERE/lambdactl" fs "$LAMBDA_FS" | awk '{print $3}')"
+[[ -n "$MOUNT" && "$MOUNT" != "-" ]] || die "filesystem '$LAMBDA_FS' reports no mount point"
+WEIGHTS_DIR="${WEIGHTS_DIR_OVERRIDE:-$MOUNT/models}"
+info "weights dir for the harness: $WEIGHTS_DIR"
 
 teardown() {
   if (( KEEP_UP )); then
@@ -73,8 +82,10 @@ sshto() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$I
 # Same PATH/HARNESS_PYTHON pair RUNBOOK §1.4 and benchmark.yml export: the venv is hermetic
 # and nothing is in the image's python3. node ships with the Lambda image; the grading
 # preflight (tier 3) refuses to start if it does not, before any GPU time is spent on the agent.
+# The first run also hashes the weights for model.weight_digest (31 GB for the default
+# model, a few minutes); the digest is cached next to the weights, so later runs skip it.
 info "running gamespec ($PASSES pass(es)) against the served model"
-RUN_LINE="$(sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" HARNESS_PYTHON=\"\$HOME/$VENV_NAME/bin/python\" \
+RUN_LINE="$(sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" HARNESS_PYTHON=\"\$HOME/$VENV_NAME/bin/python\" WEIGHTS_DIR='$WEIGHTS_DIR' \
   && ./harness/run.sh --model '$MODEL' --suite gamespec --passes '$PASSES' --out ~/results" | grep '^RUN ' | tail -n1)" \
   || die "run.sh failed on the instance (the box is still up until teardown; ./gpuctl ssh to inspect ~/results)"
 RUN_ID="$(awk '{print $2}' <<<"$RUN_LINE")"
