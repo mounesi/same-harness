@@ -881,6 +881,32 @@ PER_SUITE_KEYS = (
     ("suite.instance_ids_sha256", ("suite", "instance_ids_sha256"), False),
 )
 
+# Compared WITHIN one instance type. A list price is a fact about the day it was captured,
+# not about the run, so comparing it across ALL runs would report two different machines as
+# drift. Within one instance type it flags exactly the case that matters: the same hardware
+# billed at two rates because the runs were priced from two different snapshots. The field
+# compared is the PER-NODE list price, not price.effective_cents_per_hour, so a 1-node and a
+# 2-node run of the same type do not read as a conflict (manifest.py: effective = unit ×
+# node_count). harness/manifest.py resolve_price() keys the ladder on instance_type alone —
+# there is no region term in it — so two prices for one instance type are two price epochs.
+#
+# NON-BLOCKING, deliberately, unlike runtime.vllm_version or model.quantization:
+#   * Price decides no verdict. A record's `resolved` and `error_code` come from grading and
+#     the budget ceilings; the one price-derived field in results.jsonl is the per-attempt
+#     cost.usd (harness/agent.py: gpu_seconds/3600 × cents/100). In this file the manifest
+#     price reaches the arithmetic through run_price_cph() alone, called only from the
+#     instance-hours branch of compute_group. A mixed epoch moves dollars and nothing else.
+#   * The only switch that waives a blocking difference is --allow-mixed, and it waives ALL
+#     of them at once. Making price blocking would push an operator with two honest snapshots
+#     into passing a flag that also silently waives a mixed vLLM version. Buying a price
+#     guard by weakening the serving-stack guard would be a bad trade.
+# So it warns — and the cost columns it touches are annotated approximate (≈) through the
+# same path flags.provenance_incomplete already uses. cost/resolved is a headline column of
+# this study; a headline column summed over two price epochs must not render as exact.
+PER_INSTANCE_TYPE_KEYS = (
+    ("price.price_cents_per_hour", ("price", "price_cents_per_hour"), False),
+)
+
 
 _MISSING = object()
 
@@ -926,6 +952,105 @@ _COMPARABILITY_NORMALISERS = {
 }
 
 
+def run_instance_type(manifest: dict):
+    """The instance type a run was priced for, or None (API-baseline runs have none)."""
+    itype = dig(
+        manifest, "price", "instance_type",
+        default=dig(manifest, "hardware", "instance_type", default=None),
+    )
+    return str(itype) if itype else None
+
+
+PRICE_EPOCH_SCOPE_PREFIX = "instance type "
+
+
+def price_epoch_notes(runs: list[dict], comparability: dict, diag: Diagnostics) -> list[dict]:
+    """Elaborate every instance type whose list price is not constant across the included runs.
+
+    Detection is NOT repeated here — it is the PER_INSTANCE_TYPE_KEYS pass inside
+    comparability_report, read back off its `fields`. This adds the part a one-line drift
+    message cannot carry: which run carries which price, when that price was captured, and
+    from which rung of the ladder. It also tags the affected runs so compute_group annotates
+    their cost columns approximate, the same treatment flags.provenance_incomplete gets.
+    """
+    affected = [
+        entry["scope"][len(PRICE_EPOCH_SCOPE_PREFIX):]
+        for entry in comparability.get("fields", [])
+        if entry["field"] == "price.price_cents_per_hour"
+        and entry["scope"].startswith(PRICE_EPOCH_SCOPE_PREFIX)
+        and len(entry["values"]) > 1
+    ]
+    rows = []
+    for itype in affected:
+        members = []
+        for run in runs:
+            if run_instance_type(run["manifest"]) != itype:
+                continue
+            cents = dig(run["manifest"], "price", "price_cents_per_hour", default=None)
+            if not isinstance(cents, (int, float)):
+                continue
+            members.append(
+                {
+                    "run_id": run["run_id"],
+                    "cents_per_hour": float(cents),
+                    "captured_at": dig(run["manifest"], "price", "captured_at", default=None),
+                    "source": dig(run["manifest"], "price", "source", default=None),
+                    "_run": run,
+                }
+            )
+        prices = sorted({m["cents_per_hour"] for m in members})
+        if len(prices) < 2:  # defensive: the field pass already said they differ
+            continue
+        epochs: dict[tuple, dict] = {}
+        for m in members:
+            key = (m["cents_per_hour"], m["captured_at"], m["source"])
+            slot = epochs.setdefault(
+                key,
+                {
+                    "cents_per_hour": m["cents_per_hour"],
+                    "captured_at": m["captured_at"],
+                    "source": m["source"],
+                    "run_ids": [],
+                },
+            )
+            slot["run_ids"].append(m["run_id"])
+        spread = (prices[-1] - prices[0]) / prices[0] if prices[0] else None
+        row = {
+            "instance_type": itype,
+            "prices_cents_per_hour": prices,
+            "spread_over_cheapest": spread,
+            "epochs": sorted(epochs.values(), key=lambda e: e["cents_per_hour"]),
+            "run_ids": [m["run_id"] for m in members],
+        }
+        rows.append(row)
+        for m in members:
+            m["_run"]["price_epoch_conflict"] = {
+                "instance_type": itype,
+                "cents_per_hour": m["cents_per_hour"],
+                "captured_at": m["captured_at"],
+                "source": m["source"],
+                "other_prices": [p for p in prices if p != m["cents_per_hour"]],
+            }
+        described = "; ".join(
+            "{:g}¢ captured {}".format(e["cents_per_hour"], e["captured_at"] or "(not recorded)")
+            for e in row["epochs"]
+        )
+        diag.warn(
+            "price_epoch_mixed",
+            f"{itype}: included runs are priced at "
+            + ", ".join("{:g}".format(p) for p in prices)
+            + "¢ per node-hour"
+            + (f" — a {spread:.1%} spread over the cheapest" if spread is not None else "")
+            + f" ({described}). price.captured_at records when each snapshot was taken, so "
+            "this is what a price refresh between two runs looks like — not a harness "
+            "deviation and not a manifest to fix. Price decides no verdict, so resolve rates "
+            "and the failure taxonomy are unaffected; but cost and cost/resolved for these "
+            "runs are computed at different price epochs and are not comparable as dollars, "
+            "so their groups' cost columns are annotated approximate (≈).",
+        )
+    return rows
+
+
 def comparability_report(runs: list[dict], args, diag: Diagnostics) -> dict:
     """The study's central claim is that the harness is constant. Enforce it here."""
     blocking: list = []
@@ -969,6 +1094,15 @@ def comparability_report(runs: list[dict], args, diag: Diagnostics) -> dict:
     for suite in sorted(by_suite):
         for label, path, is_blocking in PER_SUITE_KEYS:
             examine(label, path, is_blocking, f"suite {suite}", by_suite[suite])
+
+    by_instance_type: dict[str, list] = {}
+    for run in runs:
+        itype = run_instance_type(run["manifest"])
+        if itype:  # absent for API-baseline runs, which are billed per token
+            by_instance_type.setdefault(itype, []).append(run)
+    for itype in sorted(by_instance_type):
+        for label, path, is_blocking in PER_INSTANCE_TYPE_KEYS:
+            examine(label, path, is_blocking, f"instance type {itype}", by_instance_type[itype])
 
     # Legacy views, kept because summary.json consumers and render_markdown read them.
     def vals(label):
@@ -1241,6 +1375,23 @@ def compute_group(model: str, suite: str, runs: list[dict], setup_costs: dict[st
         cost_approximate_reasons.append(
             "cost fell back to summing per-attempt cost.usd for at least one run "
             "(under-counts idle instance time)"
+        )
+    # A mixed price epoch does not make THIS group's arithmetic wrong — each run is costed at
+    # the price its manifest recorded. It makes the dollar columns non-comparable with the
+    # other rows of the same table, which is what ≈ is for.
+    for run in runs:
+        conflict = run.get("price_epoch_conflict")
+        if not conflict:
+            continue
+        cost_approximate_reasons.append(
+            "{}: priced at {:g}¢/node-hour (snapshot {}) while another included run on the same "
+            "instance type ({}) used {}¢ — mixed price epoch, dollars not comparable".format(
+                run["run_id"],
+                conflict["cents_per_hour"],
+                conflict["captured_at"] or "not recorded",
+                conflict["instance_type"],
+                "/".join("{:g}".format(p) for p in conflict["other_prices"]),
+            )
         )
     cost_approximate = bool(cost_approximate_reasons)
     if cost_approximate:
@@ -1646,6 +1797,43 @@ def render_markdown(report: dict) -> str:
             "excluded\"._\n"
         )
 
+    epochs = report.get("price_epochs") or []
+    if epochs:
+        a("### Mixed price epochs — the cost columns below are not comparable as dollars\n")
+        a(
+            "One instance type is billed here at more than one rate, because the runs were "
+            "priced from different snapshots. Nothing below is a manifest to fix: "
+            "`price.captured_at` is \"when the snapshot was taken\" (CONTRACTS.md §2.2), so "
+            "each run carries the price of the day it ran. Price decides no verdict, so "
+            "resolve rates, pass@k, the failure taxonomy and token counts are unaffected — "
+            "but `cost` and `cost / resolved` for the affected groups are computed at "
+            "different price epochs, so they carry ≈, and a difference between two of those "
+            "rows may be a price refresh rather than a difference between the models.\n"
+        )
+        epoch_rows = []
+        for row in epochs:
+            for ep in row["epochs"]:
+                epoch_rows.append(
+                    [
+                        row["instance_type"],
+                        "{:g}".format(ep["cents_per_hour"]),
+                        ep["captured_at"] or "—",
+                        ep["source"] or "—",
+                        ", ".join(ep["run_ids"]),
+                    ]
+                )
+        a(
+            md_table(
+                ["instance type", "¢/node-hour", "price captured at", "price source", "runs"],
+                epoch_rows,
+            )
+        )
+        a(
+            "_A like-for-like dollar comparison needs one price epoch: aggregate each epoch "
+            "separately, or restate the older runs at the newer price when you quote them. "
+            "The manifests keep the original snapshot either way._\n"
+        )
+
     # ---- resolution detail
     a("## Resolution rate — mean and range over passes\n")
     res_rows = []
@@ -1852,6 +2040,7 @@ def render_markdown(report: dict) -> str:
                 str(r["records"]),
                 fmt_num(r["wall_clock_h"], 2),
                 str(r["effective_cents_per_hour"] if r["effective_cents_per_hour"] is not None else "—"),
+                str(r["price_captured_at"] or "—"),
                 (r["weight_digest"] or "—")[:23],
                 r["checksums"],
                 "approx" if r["provenance_incomplete"] else "exact",
@@ -1860,7 +2049,7 @@ def render_markdown(report: dict) -> str:
     a(
         md_table(
             ["run_id", "model", "suite", "status", "passes", "records", "wall h", "¢/h",
-             "weight digest", "checksums", "provenance"],
+             "price epoch", "weight digest", "checksums", "provenance"],
             run_rows,
         )
     )
@@ -1978,7 +2167,8 @@ def csv_contamination(report: dict, path: Path) -> None:
 def csv_runs(report: dict, path: Path) -> None:
     headers = [
         "run_id", "model", "suite", "status", "passes", "records", "wall_clock_s",
-        "effective_cents_per_hour", "billing_mode", "harness_version", "prompt_dir_sha256",
+        "effective_cents_per_hour", "price_cents_per_hour", "price_captured_at",
+        "price_source", "billing_mode", "harness_version", "prompt_dir_sha256",
         "adapter_version", "weight_revision", "weight_digest", "repo_git_sha", "instance_type",
         "region", "lambda_instance_id", "consent_class", "nonconformant",
         "nonconformant_reasons", "provenance_incomplete", "provenance_incomplete_reasons",
@@ -1990,7 +2180,8 @@ def csv_runs(report: dict, path: Path) -> None:
         rows.append(
             [
                 r["run_id"], r["model"], r["suite"], r["status"], r["passes"], r["records"],
-                r["wall_clock_s"], r["effective_cents_per_hour"], r["billing_mode"],
+                r["wall_clock_s"], r["effective_cents_per_hour"], r["price_cents_per_hour"],
+                r["price_captured_at"], r["price_source"], r["billing_mode"],
                 r["harness_version"], r["prompt_dir_sha256"], r["adapter_version"],
                 r["weight_revision"], r["weight_digest"], r["repo_git_sha"], r["instance_type"],
                 r["region"], r["lambda_instance_id"], r["consent_class"], r["nonconformant"],
@@ -2018,6 +2209,11 @@ def run_summary_row(run: dict, api_pricing: dict, included: bool) -> dict:
         "wall_clock_s": wall,
         "wall_clock_h": (float(wall) / 3600.0) if isinstance(wall, (int, float)) else None,
         "effective_cents_per_hour": dig(m, "price", "effective_cents_per_hour", default=None),
+        "price_cents_per_hour": dig(m, "price", "price_cents_per_hour", default=None),
+        # The epoch the price came from. Two runs on one instance type with different
+        # captured_at values were billed under different list prices whenever the numbers
+        # differ, which is what the "Mixed price epochs" section reports.
+        "price_captured_at": dig(m, "price", "captured_at", default=None),
         "price_source": dig(m, "price", "source", default=None),
         "billing_mode": billing_mode_for(m, api_pricing),
         "harness_version": dig(m, "harness", "version", default=None),
@@ -2229,6 +2425,18 @@ def main(argv: list[str]) -> int:
             print(f"    {row['run_id']}: unresolved {unresolved}", file=sys.stderr)
 
     comparability = comparability_report(included, args, diag)
+    # Must run before compute_group: it tags the runs whose cost columns get the ≈.
+    price_epochs = price_epoch_notes(included, comparability, diag)
+    for row in price_epochs:
+        print(
+            "==> mixed price epoch for {}: {}¢/node-hour among included runs — cost columns "
+            "for the affected groups are APPROXIMATE (≈) and must not be compared as "
+            "dollars".format(
+                row["instance_type"],
+                "/".join("{:g}".format(p) for p in row["prices_cents_per_hour"]),
+            ),
+            file=sys.stderr,
+        )
     if diag.errors:
         for e in diag.errors:
             print(f"error: {e['message']}", file=sys.stderr)
@@ -2292,6 +2500,7 @@ def main(argv: list[str]) -> int:
             for r in excluded
         ],
         "provenance_incomplete_runs": provenance_rows,
+        "price_epochs": price_epochs,
         "by_model_suite": groups,
         "by_model": rollup_by_model(groups),
         "contamination": contamination_view(groups, args.contamination_threshold),
@@ -2327,9 +2536,15 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
     if any(g["cost_approximate"] for g in groups):
+        causes = []
+        if provenance_rows:
+            causes.append("provenance_incomplete runs, included by design")
+        if price_epochs:
+            causes.append("a mixed price epoch")
         print(
-            "==> cost columns marked ≈ are approximate (provenance_incomplete runs included by "
-            "design); resolve rates and token counts are exact",
+            "==> cost columns marked ≈ are approximate or not comparable"
+            + (" (" + "; ".join(causes) + ")" if causes else "")
+            + "; resolve rates and token counts are exact",
             file=sys.stderr,
         )
 
