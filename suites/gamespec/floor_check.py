@@ -86,6 +86,12 @@ if (!(typeof S.create === 'function' && typeof S.step === 'function' && typeof S
   console.log(JSON.stringify(results)); process.exit(0);
 }
 
+// Everything below CALLS the submission. A SimCore that throws — the first live run's
+// step() read a `config` that was not in scope — must come out as a failed check with the
+// message, not as a node stack trace and a bare "harness ran: false". Only calls inside
+// withTraps() were guarded before; the determinism and physics sections were not.
+try {
+
 const CONFIG = {
   seed: 12345,
   track: {width: 1000, height: 800, checkpoints: [
@@ -248,6 +254,10 @@ function tape(seed) {
   const s = S.create(other);
   const moved = S.step(s, {throttle: 1, brake: 0, steer: 0}, DT);
   ok('hash changes when the state changes', S.hash(s) !== S.hash(moved));
+}
+} catch (e) {
+  ok('SimCore ran every floor check without throwing', false,
+     String(e && e.stack ? e.stack.split('\n').slice(0, 2).join(' | ') : e).slice(0, 300));
 }
 
 console.log(JSON.stringify(results));

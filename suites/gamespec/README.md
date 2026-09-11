@@ -1,7 +1,11 @@
 # gamespec — build-a-game suite, with a human judging channel
 
 **Status: one spec written and validated, floor check working, adapter wired in
-(`harness/adapters/gamespec.py`), smoke-tested against the mock endpoint. No model run yet.**
+(`harness/adapters/gamespec.py`), smoke-tested against the mock endpoint, and run once for
+real (2026-09-11, `shakedown-qwen30b` on 1× H100 via `demo.sh`): the model produced a
+4.9 KB `game.html` in 137 s / 26 iterations and failed the floor — its `step()` read a
+`config` that was not in scope, so the first physics step threw. Pipeline proven; the
+one-spec, one-pass budget question in "What building the suite still needs" is now live.**
 
 Run it against a served model exactly like the other suites — `./harness/run.sh --model <m>
 --suite gamespec --passes 1 --out ~/results` — or, from a laptop with `LAMBDA_API_KEY`
