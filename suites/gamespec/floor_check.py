@@ -288,7 +288,18 @@ const TRACK = {width: 1000, height: 800, roadWidth: 120,
 const CARS = [{id: 'balanced', accel: 1.00, turn: 1.00, mass: 1.0},
               {id: 'sprint', accel: 1.15, turn: 0.90, mass: 0.8},
               {id: 'heavy', accel: 0.90, turn: 0.85, mass: 1.3}];
-const CONFIG = {seed: 12345, time: 60, car: 0, opponents: 2, track: TRACK};
+const CONFIG = {seed: 12345, car: 0, track: TRACK, level: 0, time: 60, opponents: 2, timeOfDay: 'day'};
+const LEVELS = [
+  {level: 1, time: 60, target: 40, opponents: 1, timeOfDay: 'day'},
+  {level: 2, time: 60, target: 60, opponents: 2, timeOfDay: 'day'},
+  {level: 3, time: 60, target: 80, opponents: 2, timeOfDay: 'dusk'},
+  {level: 4, time: 90, target: 120, opponents: 3, timeOfDay: 'night'},
+  {level: 5, time: 90, target: 150, opponents: 3, timeOfDay: 'dawn'},
+  {level: 6, time: 90, target: 180, opponents: 4, timeOfDay: 'day'},
+  {level: 7, time: 120, target: 240, opponents: 4, timeOfDay: 'dusk'},
+  {level: 8, time: 120, target: 300, opponents: 5, timeOfDay: 'night'},
+];
+const lvl = (n) => ({seed: 1, car: 0, track: JSON.parse(JSON.stringify(TRACK)), level: n});
 const cfg = (over) => JSON.parse(JSON.stringify(Object.assign({}, CONFIG, over || {})));
 const withTrack = (over) => cfg({track: Object.assign({}, TRACK, over)});
 const NO_INPUT = {throttle: 0, brake: 0, steer: 0, boost: 0};
@@ -332,6 +343,7 @@ const pure = withTraps(() => {
   S.presets();
   const s = S.create(cfg());
   V.project({x: 1, y: 2, z: 0}, {x: 0, y: 0, z: 10, yaw: 0.3, pitch: -0.3, fov: 1, width: 800, height: 600});
+  if (typeof V.scenery === 'function') V.scenery(JSON.parse(JSON.stringify(TRACK)), 12345);
   return S.hash(S.step(s, BOOST, DT));
 });
 ok('SimCore and View touch no browser globals or RNG', !pure.error,
@@ -343,6 +355,8 @@ ok('SimCore and View touch no browser globals or RNG', !pure.error,
   ok('presets() reports the cars table exactly', JSON.stringify(P.cars) === JSON.stringify(CARS),
      JSON.stringify(P.cars).slice(0, 200));
   ok('presets() reports times [30, 60, 120]', JSON.stringify(P.times) === '[30,60,120]', JSON.stringify(P.times));
+  ok('presets() reports the level table exactly (8 rows)', JSON.stringify(P.levels) === JSON.stringify(LEVELS),
+     JSON.stringify(P.levels).slice(0, 200));
   ok('presets() offers at least two maps', Array.isArray(P.tracks) && P.tracks.length >= 2,
      'tracks: ' + (Array.isArray(P.tracks) ? P.tracks.length : typeof P.tracks));
   let valid = true, why = '';
@@ -359,12 +373,17 @@ ok('SimCore and View touch no browser globals or RNG', !pure.error,
   let runs = true, rwhy = '';
   try {
     for (const t of (Array.isArray(P.tracks) ? P.tracks : [])) for (let c = 0; c < 3; c++) for (const tm of [30, 60, 120]) {
-      let s = S.create({seed: 1, time: tm, car: c, opponents: 2, track: JSON.parse(JSON.stringify(t.track))});
+      let s = S.create({seed: 1, car: c, track: JSON.parse(JSON.stringify(t.track)), level: 0, time: tm, opponents: 2, timeOfDay: 'day'});
       for (let i = 0; i < 60; i++) s = S.step(s, FULL, DT);
-      if (typeof s.score !== 'number' || s.timeLimit !== tm || s.player.car !== c) throw new Error('bad state on ' + t.name);
+      if (typeof s.score !== 'number' || s.timeLimit !== tm || s.player.car !== c) throw new Error('bad free-run state on ' + t.name);
+    }
+    for (const t of (Array.isArray(P.tracks) ? P.tracks : [])) for (let n = 1; n <= 8; n++) {
+      let s = S.create({seed: 1, car: 1, track: JSON.parse(JSON.stringify(t.track)), level: n});
+      for (let i = 0; i < 60; i++) s = S.step(s, FULL, DT);
+      if (s.level !== n || s.timeLimit !== LEVELS[n - 1].time) throw new Error('bad level-' + n + ' state on ' + t.name);
     }
   } catch (e) { runs = false; rwhy = String(e).slice(0, 160); }
-  ok('a run can be created and stepped on every preset map, car and time', runs, rwhy);
+  ok('a run can be created and stepped on every preset map, car, free-run time and level', runs, rwhy);
   ok('presets() is constant', JSON.stringify(P) === JSON.stringify(S.presets()));
 }
 
@@ -375,13 +394,15 @@ ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
   const s = a, p = s.player;
   ok('initial state carries the required fields',
      s.t === 0 && s.timeLimit === 60 && s.timeLeft === 60 && s.finished === false && s.score === 0 &&
+     s.level === 0 && s.target === null && s.timeOfDay === 'day' && s.outcome === null && s.campaignWon === false &&
      s.crashes === 0 && s.round === 0 && !!p && p.speed === 0 && p.car === 0 && p.boostCharge === 1 &&
      p.boostActive === 0 && Array.isArray(s.opponents) && s.opponents.length === 2 &&
      Array.isArray(s.pickups) && s.pickups.length === 8 && s.pickups.every(q => q.taken === false && q.value === 10 && q.r === 30) &&
      Array.isArray(s.ranking),
      JSON.stringify({t: s.t, timeLimit: s.timeLimit, timeLeft: s.timeLeft, finished: s.finished, score: s.score,
+                     level: s.level, target: s.target, timeOfDay: s.timeOfDay, outcome: s.outcome, campaignWon: s.campaignWon,
                      crashes: s.crashes, round: s.round, player: p, opponents: (s.opponents || []).length,
-                     pickups: (s.pickups || []).length}).slice(0, 220));
+                     pickups: (s.pickups || []).length}).slice(0, 260));
   ok('the player spawns at spawn, facing spawn.heading', near(p.x, 150) && near(p.y, 400) && near(p.heading, 0, 1e-9));
   ok('opponent i spawns 40*(i+1) units ahead along the spawn heading, facing the same way',
      s.opponents.every((o, i) => near(o.x, 150 + 40 * (i + 1), 1e-6) && near(o.y, 400, 1e-6) && near(o.heading, 0, 1e-9) &&
@@ -553,10 +574,71 @@ ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
   for (let i = 0; i < 1798; i++) s = S.step(s, NO_INPUT, DT);
   ok('not finished before the time limit', s.finished === false && s.timeLeft > 0, JSON.stringify({t: s.t, timeLeft: s.timeLeft}));
   for (let i = 0; i < 4; i++) s = S.step(s, NO_INPUT, DT);
-  ok('finished once t reaches the time limit, with timeLeft 0', s.finished === true && s.timeLeft === 0,
-     JSON.stringify({t: s.t, timeLeft: s.timeLeft, finished: s.finished}));
+  ok('free run: finished and outcome "done" once t reaches the time limit, with timeLeft 0',
+     s.finished === true && s.timeLeft === 0 && s.outcome === 'done' && s.campaignWon === false,
+     JSON.stringify({t: s.t, timeLeft: s.timeLeft, finished: s.finished, outcome: s.outcome}));
   const h = S.hash(s), g = S.step(s, BOOST, DT);
   ok('a finished state is frozen (step returns an identical state)', S.hash(g) === h && near(g.t, s.t, 1e-12));
+  ok('free run: timeOfDay comes from the config and defaults to day',
+     S.create(cfg({timeOfDay: 'night'})).timeOfDay === 'night' && S.create(cfg({timeOfDay: undefined})).timeOfDay === 'day');
+}
+
+// --- campaign levels -------------------------------------------------------------------------
+{
+  let rows = true, why = '';
+  for (let n = 1; n <= 8; n++) {
+    const s = S.create(lvl(n)), r = LEVELS[n - 1];
+    if (!(s.level === n && s.timeLimit === r.time && s.timeLeft === r.time && s.target === r.target &&
+          s.opponents.length === r.opponents && s.timeOfDay === r.timeOfDay && s.outcome === null && s.campaignWon === false)) {
+      rows = false; why = 'level ' + n + ': ' + JSON.stringify({timeLimit: s.timeLimit, target: s.target, opponents: (s.opponents || []).length, timeOfDay: s.timeOfDay}); break;
+    }
+  }
+  ok('each campaign level takes time, target, opponents and time of day from the table', rows, why);
+  const ign = S.create(Object.assign(lvl(3), {time: 30, opponents: 0, timeOfDay: 'night'}));
+  ok('a campaign level ignores time/opponents/timeOfDay in the config',
+     ign.timeLimit === 60 && ign.opponents.length === 2 && ign.timeOfDay === 'dusk');
+  const pk = TRACK.pickups;
+  let s1 = S.create(lvl(1));
+  for (let i = 0; i < 4; i++) { s1 = cp(s1); s1.player.x = pk[i].x; s1.player.y = pk[i].y; s1 = S.step(s1, NO_INPUT, DT); }
+  ok('level 1 is won the moment score reaches the target (40)',
+     s1.score >= 40 && s1.outcome === 'won' && s1.finished === true && s1.campaignWon === false,
+     JSON.stringify({score: s1.score, outcome: s1.outcome, finished: s1.finished, campaignWon: s1.campaignWon}));
+  const h1 = S.hash(s1);
+  ok('a won level is frozen', S.hash(S.step(s1, FULL, DT)) === h1);
+  let s3 = cp(S.create(lvl(1))); s3.player.x = pk[0].x; s3.player.y = pk[0].y; s3 = S.step(s3, NO_INPUT, DT);
+  ok('below the target the level continues', s3.score === 10 && s3.outcome === null && s3.finished === false);
+  let s8 = cp(S.create(lvl(8))); s8.score = 299; s8.player.x = pk[0].x; s8.player.y = pk[0].y; s8 = S.step(s8, NO_INPUT, DT);
+  ok('winning level 8 sets campaignWon', s8.outcome === 'won' && s8.campaignWon === true, JSON.stringify({score: s8.score, outcome: s8.outcome, campaignWon: s8.campaignWon}));
+  let tie = cp(S.create(lvl(1))); tie.t = 59.999; tie.score = 39; tie.player.x = pk[0].x; tie.player.y = pk[0].y; tie = S.step(tie, NO_INPUT, DT);
+  ok('reaching the target on the step the clock runs out counts as a win', tie.outcome === 'won', JSON.stringify({t: tie.t, score: tie.score, outcome: tie.outcome}));
+  let lost = S.create(lvl(1));
+  for (let i = 0; i < 3700; i++) lost = S.step(lost, NO_INPUT, DT);
+  ok('a level is lost when the clock runs out below the target',
+     lost.outcome === 'lost' && lost.finished === true && lost.campaignWon === false && lost.score < 40,
+     JSON.stringify({t: lost.t, score: lost.score, outcome: lost.outcome}));
+}
+
+// --- scenery ------------------------------------------------------------------------------------
+{
+  const maps = [{name: 'standard', track: TRACK}].concat(Array.isArray((S.presets() || {}).tracks) ? S.presets().tracks : []);
+  ok('View has scenery', typeof V.scenery === 'function');
+  if (typeof V.scenery === 'function') {
+    let allOk = true, why = '';
+    for (const m of maps) {
+      const tr = JSON.parse(JSON.stringify(m.track));
+      const sc = V.scenery(tr, 12345), sc2 = V.scenery(JSON.parse(JSON.stringify(m.track)), 12345);
+      if (!Array.isArray(sc)) { allOk = false; why = m.name + ': scenery is not an array'; break; }
+      if (JSON.stringify(sc) !== JSON.stringify(sc2)) { allOk = false; why = m.name + ': scenery is not deterministic'; break; }
+      const b = sc.filter(o => o && o.type === 'building');
+      if (b.length < 20) { allOk = false; why = m.name + ': ' + b.length + ' buildings (need >= 20)'; break; }
+      const bad = b.find(o => !(o.w > 0 && o.d > 0 && o.h > 0) ||
+        [[o.x, o.y], [o.x - o.w / 2, o.y - o.d / 2], [o.x + o.w / 2, o.y - o.d / 2], [o.x - o.w / 2, o.y + o.d / 2], [o.x + o.w / 2, o.y + o.d / 2]]
+          .some(([x, y]) => onRoad(tr, x, y) || x < 0 || x > tr.width || y < 0 || y > tr.height));
+      if (bad) { allOk = false; why = m.name + ': a building stands on the road or outside the world: ' + JSON.stringify(bad).slice(0, 120); break; }
+      if (new Set(b.map(o => o.h)).size < 3) { allOk = false; why = m.name + ': fewer than 3 distinct building heights'; break; }
+    }
+    ok('scenery: >= 20 buildings of >= 3 heights, every footprint off the road and inside the world, on every map', allOk, why);
+  }
 }
 
 // --- opponents --------------------------------------------------------------------------------
@@ -703,6 +785,11 @@ def main() -> int:
     code, problems = extract_inline_js(html)
     checks.append({"name": "inline <script> content is present and has no src=",
                    "ok": not problems, "detail": "; ".join(problems)})
+    if args.spec == "racing-v2":
+        # §5/§6.16: the music is procedural through the Web Audio API. The machine can only
+        # see that the API is used at all; whether the music is any good is for the judges.
+        checks.append({"name": "music: the file uses the Web Audio API (AudioContext)",
+                       "ok": "AudioContext" in html, "detail": ""})
 
     if code.strip():
         with tempfile.TemporaryDirectory() as td:

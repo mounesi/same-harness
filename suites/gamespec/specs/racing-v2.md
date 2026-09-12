@@ -1,4 +1,4 @@
-# racing-v2 — City Run: a timed 3D points race with traffic
+# racing-v2 — City Run: an 8-level 3D points race through a living city
 
 Build a playable 3D driving game as **one self-contained HTML file**.
 
@@ -27,29 +27,59 @@ want as a `data:` URI, or generate it procedurally.
 
 ### 1.1 The game in one paragraph
 
-You drive a car through a small city for a fixed time — 30 seconds, 60 seconds or
-2 minutes, chosen before the run. Scattered across the city is a set of **pickups**. Each
-one you reach is worth its point value; when the last one is taken they all reappear and
-the round counter goes up. Computer-driven cars are out there collecting the same pickups,
-and **every collision with another car costs you points**. Roads are fast; anything off the
-asphalt is slow. A boost gives a short burst of speed and then recharges. When the clock
-runs out, the run is over and the scores are ranked.
+You drive a car through a city. Scattered across it is a set of **pickups**. Each one you
+reach is worth its point value; when the last one is taken they all reappear and the round
+counter goes up. Computer-driven cars are out there collecting the same pickups, and
+**every collision with another car costs you points**. Roads are fast; anything off the
+asphalt is slow. A boost gives a short burst of speed and then recharges. The game is a
+**campaign of eight levels**: each level gives you a time limit and a target score; reach
+the target before the clock runs out and you move on to the next level, run out of time
+and you replay it, clear level 8 and you have finished the campaign. Levels get longer,
+harder and busier, and they move through the day: some are played in daylight, some at
+dusk or dawn, some at night. There is also a **free run**: one timed run of 30, 60 or
+120 seconds with no target, for practice. Music plays while you drive.
 
-### 1.2 The start screen — choosing the road, the car and the time
+### 1.2 The campaign — eight levels
 
-Before the run starts the player chooses three things, by keyboard:
+Exactly this table, in this order (§2.10 gives it as data). `time` is the limit in
+seconds, `target` the score that completes the level, `opponents` how many computer cars
+are on the road, `timeOfDay` the lighting the level is played in.
+
+| level | time | target | opponents | timeOfDay |
+|---|---|---|---|---|
+| 1 | 60 | 40 | 1 | `day` |
+| 2 | 60 | 60 | 2 | `day` |
+| 3 | 60 | 80 | 2 | `dusk` |
+| 4 | 90 | 120 | 3 | `night` |
+| 5 | 90 | 150 | 3 | `dawn` |
+| 6 | 90 | 180 | 4 | `day` |
+| 7 | 120 | 240 | 4 | `dusk` |
+| 8 | 120 | 300 | 5 | `night` |
+
+Each level is its own simulation: the game creates a new state (§2.2) with `level = n`,
+the road and car the player chose, and a seed of the game's choosing. The score starts at
+0 on every level. When a level's outcome is `won` and `n < 8`, the game continues with
+level `n + 1`; when it is `lost`, the same level is offered again; when level 8 is `won`,
+`campaignWon` is true and the game shows that the campaign is complete. Between levels
+the game may show whatever it likes — a summary, the next level's target and lighting —
+but a keyboard-only path from level 1 to level 8 must exist.
+
+### 1.3 The start screen — choosing the mode, the road, the car and the time
+
+Before playing, the player chooses, by keyboard:
 
 | choice | options | source |
 |---|---|---|
+| **the mode** | `campaign` (starts at level 1) or `free run` | — |
 | **the road** (which city map to drive) | at least two maps of your own design | `SimCore.presets().tracks` |
 | **the car** | exactly the three cars of §2.5 | `SimCore.presets().cars` |
-| **the time limit** | `30`, `60` or `120` seconds | `SimCore.presets().times` |
+| **the time limit** (free run only) | `30`, `60` or `120` seconds | `SimCore.presets().times` |
 
 How the screen looks is yours. What is graded is that these options exist, are the ones
 the pure `presets()` function reports (§2.6), and that a run can be started with any
-combination of them. During the run the HUD is expected to show at least the time left,
-the score and the position; when time is up, an end screen with the final score and
-position is expected. Both are judged by people, not by the machine.
+combination of them. During a run the HUD is expected to show at least the time left,
+the score, the target (in the campaign), the level and the position; at the end, a screen
+with the outcome, the final score and the position. Those are judged by people.
 
 ## 2. The simulation core (graded)
 
@@ -97,25 +127,35 @@ way. That places every car on the road, a car-length apart, with nobody overlapp
 
 ### 2.2 `create(config)`
 
-`config` is `{ seed, time, car, opponents, track }`.
+`config` is `{ seed, car, track, level }` for a campaign level, or
+`{ seed, car, track, level: 0, time, opponents, timeOfDay }` for a free run.
 
 - `seed` — a 32-bit unsigned integer. **All randomness must derive from it.** A call to
   `Math.random()` anywhere in `SimCore` is a defect.
-- `time` — the time limit in seconds: `30`, `60` or `120`.
 - `car` — the player's car, an index into the cars table of §2.5.
-- `opponents` — number of computer-driven cars, ≥ 0.
 - `track` — a map as in §2.1 (one of your presets, or any other valid map: the automated
   check hands in its own).
+- `level` — `1..8` selects a row of the level table (§1.2, §2.10): that row supplies the
+  time limit, the target, the number of opponents and the time of day, and any `time`,
+  `opponents` or `timeOfDay` in the config is ignored. `0` is a free run: then `time` is
+  the limit in seconds (`30`, `60` or `120`), `opponents` the number of computer cars
+  (≥ 0), `timeOfDay` one of `day`, `dusk`, `night`, `dawn` (optional, default `day`), and
+  there is no target.
 
 Returns a `state`. `state` must be JSON-serialisable — no functions, no `Map`, no `Set`,
 no cyclic references — and must contain **at least** these fields (add whatever else you
 need):
 
 ```
+level          copied from config (0 for a free run)
+target         the level's target score, or null for a free run
+timeOfDay      "day" | "dusk" | "night" | "dawn"
 t              seconds elapsed, starts 0
-timeLimit      copied from config.time
+timeLimit      the level's time, or config.time for a free run
 timeLeft       max(0, timeLimit - t)
-finished       false until t >= timeLimit
+finished       false until the run has an outcome
+outcome        null while running; then "won" | "lost" (campaign) or "done" (free run)
+campaignWon    true only when level 8 has been won
 score          the player's points, starts 0 (may go negative)
 crashes        how many collisions the player has had, starts 0
 round          how many times the whole pickup set has been cleared, starts 0
@@ -126,7 +166,8 @@ ranking        array of ids, best first: "player", "opp0", "opp1", …
 ```
 
 Every car starts with `speed = 0`. The player's `car` is `config.car`; each opponent's
-`car` is chosen from the seed (any of the three). `boostCharge` starts at `1`,
+`car` is chosen from the seed (any of the three). `outcome` starts `null`, `campaignWon`
+`false`. `boostCharge` starts at `1`,
 `boostActive` at `0`. Every pickup starts with `taken = false`.
 
 ### 2.3 `step(state, input, dt)` — movement
@@ -187,7 +228,11 @@ Per step, in this order. Steps 1–11 are the player; `carSpec` is the player's 
     never boosting, with the `input` your controller returns for it (§2.7)
 13. **collisions** (§2.4), over every pair of cars
 14. **pickups** (§2.4): the player first, then the opponents in index order
-15. `timeLeft = max(0, timeLimit - t)`; if `t >= timeLimit`, `finished = true`
+15. `timeLeft = max(0, timeLimit - t)`. Then the outcome, checked in this order:
+    in a campaign level, if `score >= target` → `outcome = "won"`, `finished = true`, and
+    `campaignWon = (level == 8)`; otherwise, if `t >= timeLimit` → `outcome = "lost"` in a
+    campaign level or `"done"` in a free run, and `finished = true`. Reaching the target
+    and the clock running out in the same step counts as a win.
 16. recompute `ranking` (§2.8)
 
 ### 2.4 Collisions and pickups
@@ -231,13 +276,15 @@ every car.
 
 ### 2.6 `presets()`
 
-Returns `{ tracks, cars, times }`, the same value every time, computed from nothing:
+Returns `{ tracks, cars, times, levels }`, the same value every time, computed from nothing:
 
 - `tracks` — at least **two** maps of your own design, each `{ name, track }` with `track`
   valid under §2.1 (≥ 1 street, ≥ 6 pickups, all pickups and the spawn on the road).
   These are the roads the start screen offers.
 - `cars` — the table of §2.5, as `[{ id, accel, turn, mass }, …]`, in order.
 - `times` — `[30, 60, 120]`.
+- `levels` — the table of §2.10, as `[{ level, time, target, opponents, timeOfDay }, …]`,
+  eight rows in order.
 
 ### 2.7 The opponents' controller
 
@@ -269,7 +316,26 @@ A stable string digest of the entire state. Requirements:
 - floats rounded to 6 decimal places before hashing, so that arithmetic that is
   mathematically equal but differs in the last bit still agrees
 
-## 3. The camera (graded)
+### 2.10 The level table
+
+```js
+[
+  { level: 1, time: 60,  target: 40,  opponents: 1, timeOfDay: "day"   },
+  { level: 2, time: 60,  target: 60,  opponents: 2, timeOfDay: "day"   },
+  { level: 3, time: 60,  target: 80,  opponents: 2, timeOfDay: "dusk"  },
+  { level: 4, time: 90,  target: 120, opponents: 3, timeOfDay: "night" },
+  { level: 5, time: 90,  target: 150, opponents: 3, timeOfDay: "dawn"  },
+  { level: 6, time: 90,  target: 180, opponents: 4, timeOfDay: "day"   },
+  { level: 7, time: 120, target: 240, opponents: 4, timeOfDay: "dusk"  },
+  { level: 8, time: 120, target: 300, opponents: 5, timeOfDay: "night" },
+]
+```
+
+Time of day changes nothing in the simulation — the same inputs give the same state at
+noon and at midnight. It changes what the player sees (§5): at night the city is dark and
+lit by its own lights, at dusk and dawn the light is low and coloured.
+
+## 3. The camera and the scenery (graded)
 
 The file MUST also define a global `View` with one pure function — no DOM, no clock, no
 `Math.random`:
@@ -308,6 +374,31 @@ Your renderer should use this function (it is how your 3D view becomes checkable
 what it draws with it — streets, kerbs, buildings, pickups, the other cars, a minimap, the
 sky — is yours.
 
+### 3.1 `View.scenery(track, seed)` — the city's buildings
+
+The city must look like a city: blocks of buildings between the streets, and street
+furniture along them. So that the machine can at least check that the buildings exist and
+stand where buildings stand, `View` also has:
+
+```js
+View.scenery(track, seed)   // -> array of { type, x, y, w, d, h, ... }
+```
+
+- pure and deterministic: no DOM, no clock, no `Math.random`; the same arguments give the
+  same array
+- `type` is a string of your choosing per object; **at least twenty objects with
+  `type == "building"`** on every preset map and on the standard map
+- a building is an axis-aligned block: centre `(x, y)`, footprint `w` by `d` (world units,
+  both > 0), height `h` > 0; **its whole footprint is off the road** (the centre and all
+  four corners of the footprint are off-road under §2.1) and inside the world rectangle
+- buildings come in **at least three distinct heights** on every map
+- add whatever else you like — trees, lamps, benches, parked cars, billboards — with any
+  extra fields; the checker only reads `type` and, for buildings, `x y w d h`
+
+What a building looks like is judged by people (§5): a facade with windows, a roof, a
+door, lit windows at night — a plain box is what the reference does, and what a good
+submission will beat.
+
 ## 4. Determinism (graded, and the hardest requirement here)
 
 Given the same `config` and the same sequence of inputs, `SimCore` must produce a
@@ -335,16 +426,34 @@ opponents 2, car 0 (balanced), time 60
 
 ## 5. The game (judged by people, not by machine)
 
-Beyond the above you decide everything: how the city looks in 3D, what tells asphalt from
-grass, how a pickup announces itself, how a crash feels and sounds, how the boost is shown,
-the start screen, the HUD, the end screen, a minimap, weather, music.
+Beyond the above you decide everything. These are the expectations the judges hold:
+
+- **A city, not a diagram.** Blocks of buildings between the streets with facades, windows,
+  roofs and doors; pavements or kerbs along the roads; road markings; trees, lamps, signs.
+  The scenery of §3.1 is what you draw; draw it as architecture, not as bare cubes.
+- **Day and night.** The level's `timeOfDay` must be visible: a bright sky and hard shadows
+  or bright colours by day; a low, coloured sky at dusk and dawn; darkness at night with
+  the city lit by its own lights — lit windows, street lamps, the cars' headlights and
+  tail lights, the pickups glowing. Night should be harder to read the road in, not
+  impossible.
+- **Music while playing.** Procedural music through the Web Audio API — no audio files —
+  that starts when a run starts (after the player's key press, as browsers require), keeps
+  time with the game, and stops or changes at the end screen. Bonus if it reacts: a
+  different mood per time of day, a rising pulse as the clock runs down.
+- **Sound.** Engine note, pickup chime, crash thud, boost whoosh.
+- **Feedback.** What tells asphalt from grass; how a pickup announces itself and where the
+  next ones are; how a crash feels; how the boost is shown; how much time and score are
+  left against the target.
+- **Flow.** A start screen, a level card between levels (level, target, time of day), a
+  HUD, an end screen, a campaign-complete screen. All reachable by keyboard.
 
 Controls must be discoverable without instructions. Arrow keys or WASD, plus one key for
-boost, are expected; the start screen should be navigable with the same keys plus Enter.
+boost, are expected; menus should be navigable with the same keys plus Enter.
 
-What people will be asked when they play it: *Was it clear where the roads are? Could I
-tell when I was off them? Did I know where the pickups were and how long I had left? Did
-a crash feel like a crash? Would I play another 60 seconds?*
+What people will be asked when they play it: *Does it look like a city? Could I tell day
+from night, and where the roads were at night? Did I know where the pickups were, what my
+target was and how long I had left? Did a crash feel like a crash? Did the music fit?
+Did I want to see level 4?*
 
 ## 6. What is checked automatically
 
@@ -352,10 +461,12 @@ The automated floor is pass/fail and only asks whether you built a working thing
 
 1. `game.html` exists, is under 256 KB, and references no external URL
 2. `SimCore` and `View` load in a bare JS context — no DOM, no browser globals
-3. `presets()` is pure and reports ≥ 2 valid maps, the exact cars table and `[30, 60, 120]`;
-   a run can be created and stepped on every preset map with every car and time
+3. `presets()` is pure and reports ≥ 2 valid maps, the exact cars table, `[30, 60, 120]`
+   and the exact level table; a run can be created and stepped on every preset map with
+   every car, every free-run time and every level
 4. `create()` is pure: same config twice → identical `hash`; the initial state has the
-   fields of §2.2, with every car spawned as §2.1 says
+   fields of §2.2, with every car spawned as §2.1 says; a campaign level takes its time,
+   target, opponents and time of day from the table, a free run from the config
 5. `step()` matches the specified physics on hand-computed cases: on the road, off the road,
    at the road's edge, in each car, boosting, and the boost's activation, duration and
    recharge rules; the speed clamp is actually reached; walls stop the car
@@ -365,14 +476,19 @@ The automated floor is pass/fail and only asks whether you built a working thing
    pair does not crash again on the next step
 8. pickups: reaching one scores its `value` once; when the set is cleared it resets and
    `round` increments
-9. the timer: `finished` flips exactly when `t` reaches the limit, `timeLeft` reaches 0,
-   and a finished state is frozen
+9. outcomes: a free run ends `done` exactly when `t` reaches the limit with `timeLeft` 0;
+   a campaign level ends `won` the moment `score >= target` and `lost` when the clock runs
+   out first; `campaignWon` is set only by winning level 8; a finished state is frozen
 10. opponents: the configured count; seeded; competent (a pickup within 30 s on the
     standard map); within the world; never above `MAX_SPEED`
 11. `ranking` is always a permutation, ordered by score with the tie rule
 12. determinism: the same 600-step input tape produces the same final hash, twice
 13. the state stays JSON-serialisable throughout
 14. `View.project` satisfies §3
+15. `View.scenery` is pure and, on the standard map and every preset, yields ≥ 20 buildings
+    of ≥ 3 distinct heights, every footprint off the road and inside the world
+16. the file uses the Web Audio API (`AudioContext`) — the machine can see that much of
+    the music; whether it is any good is for the judges
 
 Failing any of these means the submission does not enter human judging at all. Passing
 them says nothing about whether the game is any good — that is the other half, and it is

@@ -100,8 +100,8 @@ reaches for any of them is caught while the untouched renderer is not.
 |---|---|
 | `specs/racing-v1.md` | the brief handed to the model — precise on simulation, silent on look and feel |
 | `specs/racing-v1.reference.html` | reference implementation. Deliberately plain |
-| `specs/racing-v2.md` | the harder brief, "City Run": a timed run (30 / 60 / 120 s, chosen on a start screen with the road and the car) through a city of streets and off-road surfaces, points for reaching pickups, points lost for every crash into the seeded AI traffic, a boost, and a **3D** perspective view with a checkable `View.project` |
-| `specs/racing-v2.reference.html` | its reference: text start screen, two preset maps, software pinhole projection onto a 2D canvas, flat polygons, painter's order. Deliberately plain |
+| `specs/racing-v2.md` | the harder brief, "City Run": an 8-level campaign (fixed table of time / target / opponents / time of day, won by reaching the target before the clock runs out) plus a free run (30 / 60 / 120 s), through a city of streets and off-road surfaces; points for reaching pickups, points lost for every crash into the seeded AI traffic; a boost; day, dusk, night and dawn; procedural music; a **3D** perspective view with a checkable `View.project`, and a checkable `View.scenery` whose buildings must stand off the streets |
+| `specs/racing-v2.reference.html` | its reference: text start screen (mode, road, car, time), two preset maps, software pinhole projection onto a 2D canvas, buildings with window grids, lamps and trees, day/night palettes with headlights, a three-oscillator music loop. Deliberately plain |
 | `floor_check.py` | `python3 suites/gamespec/floor_check.py <game.html> [--json] [--spec racing-v2]` — one floor per spec, default `racing-v1` |
 
 ### The reference implementation is a spec-debugging tool, not a target
