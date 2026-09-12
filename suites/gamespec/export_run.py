@@ -74,16 +74,40 @@ def floor(game: Path, instance_id: str) -> dict | None:
 
 BADGE = """
 <!-- gamespec export badge: added at export time, not part of the graded submission -->
-<style>#gamespec-badge{position:fixed;left:8px;bottom:8px;z-index:2147483647;font:12px/1.35 system-ui,sans-serif;
-color:#fff;background:rgba(0,0,0,.62);padding:6px 9px;border-radius:6px;pointer-events:none;max-width:60vw;white-space:pre}</style>
-<div id="gamespec-badge">built by @model@  ·  @hf_repo@\n@spec@  ·  @started@  ·  floor @floor@\nrun @run_id@</div>
+<style>#gamespec-badge{position:fixed;left:8px;bottom:8px;z-index:2147483647;font:12px/1.4 system-ui,sans-serif;
+color:#fff;background:rgba(0,0,0,.7);padding:7px 10px;border-radius:6px;pointer-events:none;
+max-width:min(90vw,480px);white-space:pre-wrap;word-break:break-word}</style>
+<div id="gamespec-badge">built by @model@ | @hf_repo@&#10;@spec@ | @started@ | floor @floor@&#10;run @run_id@</div>
 """
+
+
+CHARSET_META = '<meta charset="utf-8">'
+
+
+def ensure_charset(html: str) -> str:
+    """A submission is not required to declare its own encoding, and a plain static server
+    (python -m http.server, a double-clicked file with no header at all) then leaves the
+    browser guessing — non-ASCII bytes anywhere on the page, including the badge below, can
+    render as mojibake. Force the issue by declaring UTF-8 as early as the parser allows."""
+    if "charset" in html[:2048].lower():
+        return html
+    i = html.lower().find("<head")
+    if i >= 0:
+        j = html.find(">", i)
+        if j >= 0:
+            return html[: j + 1] + CHARSET_META + html[j + 1 :]
+    i = html.lower().find("<html")
+    j = html.find(">", i) if i >= 0 else -1
+    if j >= 0:
+        return html[: j + 1] + "<head>" + CHARSET_META + "</head>" + html[j + 1 :]
+    return CHARSET_META + html
 
 
 def watermark(html: str, meta: dict, game: dict) -> str:
     """The exported copy carries a badge naming the model, run and date. The graded artifact
     is what the model wrote; this is for whoever plays the export later and asks 'which model
     made this?' (blind human judging uses the unmarked copy beside it)."""
+    html = ensure_charset(html)
     m = meta["manifest"]
     fr = game.get("floor") or {}
     checks = fr.get("checks") or []
