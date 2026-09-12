@@ -170,4 +170,4 @@ for diff in "$LOCAL"/patches/*/pass-*.diff; do
   fi
 done
 
-info "done. The run is laid out under output/runs/$MODEL/$RUN_ID/ once teardown completes (README.md there)."
+info "done. Browse it: ./suites/gamespec/serve.sh  (or open output/runs/$MODEL/$RUN_ID/index.html directly)"

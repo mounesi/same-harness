@@ -192,6 +192,112 @@ def readme(meta: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+HTML_HEAD = """<!doctype html><html><head><meta charset="utf-8">
+<title>{title}</title>
+<style>
+  body{{margin:0;padding:24px;background:#14161a;color:#e8e8ea;font:14px/1.5 system-ui,sans-serif}}
+  a{{color:#7ab8ff}} h1{{font-size:20px;margin:0 0 4px}} h2{{font-size:15px;color:#aab;margin:28px 0 8px}}
+  table{{border-collapse:collapse;width:100%;margin:8px 0}}
+  th,td{{border:1px solid #2c2f36;padding:6px 10px;text-align:left;font-size:13px;vertical-align:top}}
+  th{{background:#1c1f26;color:#aab}}
+  code{{background:#1c1f26;padding:1px 5px;border-radius:3px;font-size:12px}}
+  .pill{{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px}}
+  .pass{{background:#1c3a24;color:#7fe08a}} .fail{{background:#3a1c1c;color:#e07f7f}}
+  .btn{{display:inline-block;background:#2a5adf;color:#fff;padding:8px 16px;border-radius:6px;
+        text-decoration:none;font-weight:600;margin:4px 8px 4px 0}}
+  .btn.secondary{{background:#2c2f36}}
+  .muted{{color:#8a8f9a}}
+  iframe{{width:100%;height:600px;border:1px solid #2c2f36;border-radius:6px;background:#000}}
+  .cols{{display:flex;gap:12px;flex-wrap:wrap}} .col{{flex:1;min-width:320px}}
+</style></head><body>
+"""
+HTML_TAIL = "</body></html>\n"
+
+
+def esc(v) -> str:
+    return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def pill(ok: bool, text: str) -> str:
+    return f'<span class="pill {"pass" if ok else "fail"}">{esc(text)}</span>'
+
+
+def run_html(meta: dict) -> str:
+    """The per-run landing page: same facts as README.md, but clickable — a Play button per
+    game straight into the badged, exported game.html (works from a plain static server or
+    file://; the deliverable is self-contained by spec, §1)."""
+    m = meta["manifest"]
+    model, hw, rt, hs, inf, pr, tm, fl, su = (m.get(k, {}) for k in
+        ("model", "hardware", "runtime", "harness", "inference", "price", "timing", "flags", "suite"))
+    out = [HTML_HEAD.format(title=esc(meta["run_id"])),
+           f'<p class="muted"><a href="../../index.html">&larr; all runs</a></p>',
+           f'<h1>{esc(meta["run_id"])}</h1>',
+           f'<p class="muted">{esc(meta["model"])} &middot; {esc(meta.get("started_at"))} &middot; '
+           f'exported {esc(meta["exported_at"])}</p>']
+    out.append('<div>')
+    for g in meta["games"]:
+        if g.get("rebuilt"):
+            fr = g.get("floor") or {}
+            out.append(f'<a class="btn" href="{esc(g["path"])}">&#9654; play {esc(g["instance_id"])} '
+                       f'(pass {esc(g["pass"].split("-")[-1])})</a>')
+    out.append(f'<a class="btn secondary" href="code.zip">&#8681; code.zip</a>')
+    out.append(f'<a class="btn secondary" href="metadata.json">metadata.json</a>')
+    out.append(f'<a class="btn secondary" href="README.md">README.md</a>')
+    out.append('</div>')
+    out.append('<h2>Run configuration</h2><table>')
+    rows = [
+        ("model", f'<code>{esc(model.get("name"))}</code> &mdash; {esc(model.get("hf_repo"))} '
+                  f'@ <code>{esc(str(model.get("weight_revision", ""))[:12])}</code> '
+                  f'({esc(model.get("quantization") or "unquantised")}, '
+                  f'{(model.get("weight_bytes") or 0) / 1e9:.1f} GB)'),
+        ("suite / spec(s)", f'{esc(su.get("name"))}: {esc(", ".join(su.get("instance_ids") or []))}'),
+        ("started (UTC)", esc(tm.get("started_at") or m.get("created_at"))),
+        ("ended (UTC)", f'{esc(tm.get("ended_at"))} &mdash; {esc(fmt_dur(tm.get("wall_clock_s")))}'),
+        ("hardware", f'{esc(hw.get("gpu_count"))}&times; {esc(hw.get("gpu_model"))} '
+                     f'(<code>{esc(hw.get("instance_type"))}</code>), region {esc(hw.get("region") or "unknown")}'),
+        ("price", f'${(pr.get("effective_cents_per_hour") or 0) / 100:.2f}/h ({esc(pr.get("source"))})'),
+        ("serving", f'vLLM {esc(rt.get("vllm_version"))}, TP {esc(rt.get("tensor_parallel_size"))}, '
+                    f'max_model_len {esc(rt.get("max_model_len"))}'),
+        ("harness", f'v{esc(hs.get("version"))}, adapter v{esc(hs.get("adapter_version"))}, '
+                    f'repo <code>{esc(hs.get("repo_git_describe"))}</code>'),
+        ("inference", f'temperature {esc(inf.get("temperature"))}, max_iters {esc(inf.get("max_iters"))}, '
+                      f'seed {esc(inf.get("seed"))}, passes {esc(inf.get("passes"))}'),
+        ("status", pill(m.get("status") == "complete" and not fl.get("nonconformant"), esc(m.get("status")))
+                  + (' <span class="muted">nonconformant: ' + esc("; ".join(fl.get("nonconformant_reasons") or [])) + '</span>' if fl.get("nonconformant") else "")),
+    ]
+    for k, v in rows:
+        out.append(f"<tr><th>{esc(k)}</th><td>{v}</td></tr>")
+    out.append("</table>")
+
+    out.append("<h2>Attempts</h2><table><tr><th>instance</th><th>pass</th><th>verdict</th>"
+               "<th>error</th><th>iterations</th><th>tokens (prompt/completion)</th><th>wall clock</th><th>cost</th></tr>")
+    for a in meta["attempts"]:
+        t = a.get("tokens") or {}
+        out.append("<tr>"
+                   f"<td>{esc(a['instance_id'])}</td><td>{esc(a['pass_idx'])}</td>"
+                   f"<td>{pill(bool(a['resolved']), 'resolved' if a['resolved'] else 'not resolved')}</td>"
+                   f"<td>{esc(a['error_code'])}{esc(' — ' + a['error_detail']) if a.get('error_detail') else ''}</td>"
+                   f"<td>{esc(a.get('iterations'))}</td><td>{esc(t.get('prompt'))} / {esc(t.get('completion'))}</td>"
+                   f"<td>{esc(fmt_dur((a.get('wall_clock_ms') or 0) / 1000))}</td>"
+                   f"<td>${(a.get('cost') or {}).get('usd', 0) or 0:.3f}</td></tr>")
+    out.append("</table>")
+
+    out.append("<h2>Floor check (re-run at export time)</h2><table>"
+               "<tr><th>deliverable</th><th>result</th><th>failed checks</th></tr>")
+    for g in meta["games"]:
+        fr = g.get("floor") or {}
+        checks = fr.get("checks") or []
+        failed = [c["name"] for c in checks if not c.get("ok")]
+        out.append(f"<tr><td><code>{esc(g['path'])}</code></td>"
+                   f"<td>{pill(bool(fr.get('passed')), f'{len(checks) - len(failed)}/{len(checks)}')}</td>"
+                   f'<td class="muted">{esc("; ".join(failed[:6])) if failed else "&mdash;"}</td></tr>')
+    if not meta["games"]:
+        out.append("<tr><td colspan=3>no deliverable could be rebuilt from the patches</td></tr>")
+    out.append("</table>")
+    out.append(HTML_TAIL)
+    return "\n".join(out)
+
+
 def write_index(out_root: Path) -> None:
     rows = []
     for meta_path in sorted(out_root.glob("*/*/metadata.json")):
@@ -211,6 +317,31 @@ def write_index(out_root: Path) -> None:
     for r in sorted(rows, reverse=True):
         lines.append(f"| {r[0]} | {r[1]} | `{r[2]}` | {r[3]} | {r[4]} | {r[5]} | {r[6]} | [{r[7]}]({r[7]}/README.md) |")
     (out_root / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # index.html — the clickable entry point: one section per model, newest run first, a
+    # Play link straight through to each run's exported (badged) game. Open it with any
+    # static server (`python3 -m http.server -d output/runs`, or suites/gamespec/serve.sh)
+    # or straight from disk.
+    by_model: dict[str, list[tuple]] = {}
+    for r in rows:
+        by_model.setdefault(r[1] or "unknown", []).append(r)
+    html = [HTML_HEAD.format(title="Exported runs"),
+           "<h1>Exported runs</h1>",
+           '<p class="muted">One folder per model, one per run. suites/gamespec/compare_runs.py builds a '
+           'side-by-side page for any two.</p>']
+    for model in sorted(by_model):
+        html.append(f"<h2>{esc(model)}</h2><table><tr><th>started (UTC)</th><th>run id</th>"
+                    "<th>suite</th><th>instance</th><th>verdicts</th><th>floor</th><th></th></tr>")
+        for r in sorted(by_model[model], reverse=True):
+            folder = r[7]
+            html.append("<tr>"
+                        f"<td>{esc(r[0])}</td><td><code>{esc(r[2])}</code></td><td>{esc(r[3])}</td>"
+                        f"<td>{esc(r[4])}</td><td>{esc(r[5])}</td>"
+                        f"<td>{pill('PASS' in (r[6] or ''), r[6] or '-')}</td>"
+                        f'<td><a href="{esc(folder)}/index.html">open</a></td></tr>')
+        html.append("</table>")
+    html.append(HTML_TAIL)
+    (out_root / "index.html").write_text("\n".join(html), encoding="utf-8")
 
 
 def main() -> int:
@@ -308,6 +439,7 @@ def main() -> int:
     }
     (dest / "metadata.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (dest / "README.md").write_text(readme(meta), encoding="utf-8")
+    (dest / "index.html").write_text(run_html(meta), encoding="utf-8")
     write_index(out_root)
     print(dest)
     return 0
