@@ -535,6 +535,21 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
     return out;
   }
   var sceneryCache = {};
+  function paint(polys, cam) {                                        // project, painter's-sort, fill
+    var drawn = [];
+    for (var pi = 0; pi < polys.length; pi++) {
+      var pr = polys[pi].pts.map(function (pt) { return View.project(pt, cam); }), okp = true, d = 0;
+      for (var j = 0; j < pr.length; j++) { if (!(pr[j].depth > 1)) okp = false; d += pr[j].depth; }
+      if (okp) drawn.push({color: polys[pi].color, pr: pr, d: d / pr.length});
+    }
+    drawn.sort(function (a, b) { return b.d - a.d; });
+    for (var m = 0; m < drawn.length; m++) {
+      var dp = drawn[m];
+      ctx.beginPath(); ctx.moveTo(dp.pr[0].sx, dp.pr[0].sy);
+      for (var n = 1; n < dp.pr.length; n++) ctx.lineTo(dp.pr[n].sx, dp.pr[n].sy);
+      ctx.closePath(); ctx.fillStyle = dp.color; ctx.fill();
+    }
+  }
 
   function drawMenu() {
     buttons = [];
@@ -585,8 +600,12 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
     else if (state.timeOfDay !== 'day') { ctx.fillStyle = '#ffd27a'; ctx.beginPath(); ctx.arc(W * 0.3, hz * 0.9, 24, 0, Math.PI * 2); ctx.fill(); }
 
     var key = P.tracks[menu.track].name;
-    if (!sceneryCache[key]) sceneryCache[key] = {road: roadPieces(track, light.road), objs: View.scenery(track, cfgUsed.seed)};
-    var polys = roadPieces(track, light.road);
+    if (!sceneryCache[key]) sceneryCache[key] = {objs: View.scenery(track, cfgUsed.seed)};
+    // Two passes: the road surface (everything at ground level) first, then every object
+    // sorted by depth. A single painter's sort over both let a 25-unit road quad average
+    // nearer than the car standing on it and paint over the car.
+    paint(roadPieces(track, light.road), cam);
+    var polys = [];
     var objs = sceneryCache[key].objs;
     for (var i = 0; i < objs.length; i++) {
       var o = objs[i], dd = (o.x - cam.x) * (o.x - cam.x) + (o.y - cam.y) * (o.y - cam.y);
@@ -610,19 +629,7 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
       polys.push(quad({x: p.x + hx * 10 + rx * 5, y: p.y + hy * 10 + ry * 5, z: 0.3}, {x: p.x + hx * 10 - rx * 5, y: p.y + hy * 10 - ry * 5, z: 0.3},
                       {x: p.x + hx * 90 - rx * 26, y: p.y + hy * 90 - ry * 26, z: 0.3}, {x: p.x + hx * 90 + rx * 26, y: p.y + hy * 90 + ry * 26, z: 0.3}, 'rgba(255,245,200,0.35)'));
     }
-    var drawn = [];
-    for (var pi = 0; pi < polys.length; pi++) {
-      var pr = polys[pi].pts.map(function (pt) { return View.project(pt, cam); }), okp = true, d = 0;
-      for (var j = 0; j < pr.length; j++) { if (!(pr[j].depth > 1)) okp = false; d += pr[j].depth; }
-      if (okp) drawn.push({color: polys[pi].color, pr: pr, d: d / pr.length});
-    }
-    drawn.sort(function (a, b) { return b.d - a.d; });
-    for (var m = 0; m < drawn.length; m++) {
-      var dp = drawn[m];
-      ctx.beginPath(); ctx.moveTo(dp.pr[0].sx, dp.pr[0].sy);
-      for (var n = 1; n < dp.pr.length; n++) ctx.lineTo(dp.pr[n].sx, dp.pr[n].sy);
-      ctx.closePath(); ctx.fillStyle = dp.color; ctx.fill();
-    }
+    paint(polys, cam);
     if (state.timeOfDay === 'night') { ctx.fillStyle = 'rgba(0,0,20,0.18)'; ctx.fillRect(0, 0, W, H); }
     // HUD
     var pos = state.ranking.indexOf('player') + 1;
