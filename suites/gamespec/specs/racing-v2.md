@@ -20,7 +20,9 @@ A single file, `game.html`. It must:
 - render a **3D perspective view** (a chase camera behind the player's car, or a cockpit
   view) to a `<canvas>` — WebGL or your own software projection onto a 2D canvas are
   both fine; a top-down 2D view does not satisfy this spec
-- be playable with the keyboard, with a start screen (§1.2) reachable by keyboard alone
+- be playable with the keyboard, with a start screen (§1.3) reachable by keyboard alone
+  **and** operable with the mouse: every choice on it has on-screen buttons, there is a
+  Start button, and the screens between levels have Next level / Retry / Menu buttons
 
 Everything — markup, styles, code — lives in that one file. Embed any image or audio you
 want as a `data:` URI, or generate it procedurally.
@@ -73,11 +75,14 @@ Before playing, the player chooses, by keyboard:
 | **the mode** | `campaign` (starts at level 1) or `free run` | — |
 | **the road** (which city map to drive) | at least two maps of your own design | `SimCore.presets().tracks` |
 | **the car** | exactly the three cars of §2.5 | `SimCore.presets().cars` |
+| **the car's colour** | at least four colours (cosmetic — the simulation never sees it) | — |
 | **the time limit** (free run only) | `30`, `60` or `120` seconds | `SimCore.presets().times` |
 
-How the screen looks is yours. What is graded is that these options exist, are the ones
-the pure `presets()` function reports (§2.6), and that a run can be started with any
-combination of them. During a run the HUD is expected to show at least the time left,
+Every choice is changed by keyboard **and** by clicking on-screen buttons (arrows or
+swatches beside each row), and the run starts from a **Start** button as well as from
+Enter. How the screen looks is yours. What is graded is that the option sets exist, are
+the ones the pure `presets()` function reports (§2.6), and that a run can be started with
+any combination of them; the buttons themselves are judged by people. During a run the HUD is expected to show at least the time left,
 the score, the target (in the campaign), the level and the position; at the end, a screen
 with the outcome, the final score and the position. Those are judged by people.
 
@@ -431,6 +436,10 @@ Beyond the above you decide everything. These are the expectations the judges ho
 - **A city, not a diagram.** Blocks of buildings between the streets with facades, windows,
   roofs and doors; pavements or kerbs along the roads; road markings; trees, lamps, signs.
   The scenery of §3.1 is what you draw; draw it as architecture, not as bare cubes.
+- **Cars, not boxes.** Every car — the player's and the traffic — reads as a car: a body
+  with a cabin, four wheels that sit on the road, headlights and tail lights, a colour per
+  car type. The three car types of §2.5 should be told apart at a glance. A single box is
+  what the reference did first, and what a good submission will not do.
 - **Day and night.** The level's `timeOfDay` must be visible: a bright sky and hard shadows
   or bright colours by day; a low, coloured sky at dusk and dawn; darkness at night with
   the city lit by its own lights — lit windows, street lamps, the cars' headlights and
@@ -445,10 +454,13 @@ Beyond the above you decide everything. These are the expectations the judges ho
   next ones are; how a crash feels; how the boost is shown; how much time and score are
   left against the target.
 - **Flow.** A start screen, a level card between levels (level, target, time of day), a
-  HUD, an end screen, a campaign-complete screen. All reachable by keyboard.
+  HUD, an end screen, a campaign-complete screen. All reachable by keyboard, and all with
+  visible buttons for the mouse: Start, the option arrows and colour swatches, **Next
+  level**, **Retry**, **Menu**.
 
 Controls must be discoverable without instructions. Arrow keys or WASD, plus one key for
-boost, are expected; menus should be navigable with the same keys plus Enter.
+boost, are expected; menus should be navigable with the same keys plus Enter, and with
+the mouse.
 
 What people will be asked when they play it: *Does it look like a city? Could I tell day
 from night, and where the roads were at night? Did I know where the pickups were, what my

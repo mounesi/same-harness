@@ -333,7 +333,31 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
   var W = 960, H = 600, ctx = canvas.getContext('2d');   // fixed: canvas.width is a Proxy under the floor check
   canvas.width = W; canvas.height = H;
   var P = SimCore.presets();
-  var menu = {row: 0, mode: 0, track: 0, car: 0, time: 1}, phase = 'menu', state = null, cfgUsed = null, keys = {};
+  var COLOURS = ['#e44444', '#f0b429', '#3f9f5f', '#3f7fe0', '#c060d0', '#f5f5f5'];
+  var menu = {row: 0, mode: 0, track: 0, car: 0, colour: 0, time: 1}, phase = 'menu', state = null, cfgUsed = null, keys = {};
+  var buttons = [];                                                 // rebuilt on every draw: {x, y, w, h, act}
+  function button(x, y, w, h, label, act, hot) {
+    ctx.fillStyle = hot ? '#fc3' : '#3a3a3a'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#888'; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+    ctx.fillStyle = hot ? '#111' : '#eee'; ctx.font = '16px system-ui, sans-serif';
+    var tw = 0; try { tw = Number(ctx.measureText(label).width) || 0; } catch (e) { tw = 0; }   // a Proxy under the floor check
+    ctx.fillText(label, x + (w - tw) / 2, y + h / 2 + 6);
+    buttons.push({x: x, y: y, w: w, h: h, act: act});
+  }
+  canvas.addEventListener('click', function (e) {
+    var r = canvas.getBoundingClientRect(), x = (e.clientX - r.left) * W / r.width, y = (e.clientY - r.top) * H / r.height;
+    for (var i = buttons.length - 1; i >= 0; i--) {
+      var b = buttons[i];
+      if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) { audioOn(); b.act(); return; }
+    }
+  });
+  function menuRows() {
+    var rows = [['mode', 'mode', ['campaign (8 levels)', 'free run']], ['track', 'road', P.tracks.map(function (t) { return t.name; })],
+                ['car', 'car', P.cars.map(function (c) { return c.id; })], ['colour', 'colour', COLOURS]];
+    if (menu.mode === 1) rows.push(['time', 'time', P.times.map(function (t) { return t + ' s'; })]);
+    return rows;
+  }
+  function bump(key, n, dir) { menu[key] = (menu[key] + n + dir) % n; }
   var LIGHT = {                                                     // sky top, sky bottom, ground, ambient, lit windows
     day:   {sky: ['#4f86c6', '#a9c8ea'], ground: '#4a7a3a', road: '#5a5a5a', amb: 1.0,  lit: false},
     dusk:  {sky: ['#3a2a55', '#d9773a'], ground: '#3c4b2a', road: '#4a4646', amb: 0.62, lit: true},
@@ -393,21 +417,22 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
     if (e.key === ' ' || e.key.indexOf('Arrow') === 0) e.preventDefault();
     keys[e.key] = true;
     if (phase === 'menu') {
-      var rows = ['mode', 'track', 'car', 'time'], lens = [2, P.tracks.length, P.cars.length, P.times.length];
-      var nrows = menu.mode === 0 ? 3 : 4;
+      var rows = menuRows(), nrows = rows.length;
+      if (menu.row >= nrows) menu.row = nrows - 1;
       if (e.key === 'ArrowUp' || e.key === 'w') menu.row = (menu.row + nrows - 1) % nrows;
       if (e.key === 'ArrowDown' || e.key === 's') menu.row = (menu.row + 1) % nrows;
-      var k = rows[menu.row];
-      if (e.key === 'ArrowLeft' || e.key === 'a') menu[k] = (menu[k] + lens[menu.row] - 1) % lens[menu.row];
-      if (e.key === 'ArrowRight' || e.key === 'd') menu[k] = (menu[k] + 1) % lens[menu.row];
+      var row = rows[menu.row];
+      if (e.key === 'ArrowLeft' || e.key === 'a') bump(row[0], row[2].length, -1);
+      if (e.key === 'ArrowRight' || e.key === 'd') bump(row[0], row[2].length, 1);
       if (e.key === 'Enter') startRun(menu.mode === 0 ? 1 : 0);
-    } else if (phase === 'end' && e.key === 'Enter') {
-      if (state.level >= 1 && state.outcome === 'won' && !state.campaignWon) startRun(state.level + 1);
-      else if (state.level >= 1 && state.outcome === 'lost') startRun(state.level);
-      else phase = 'menu';
-    }
+    } else if (phase === 'end' && e.key === 'Enter') endAction();
   });
   addEventListener('keyup', function (e) { keys[e.key] = false; });
+  function endAction() {
+    if (state.level >= 1 && state.outcome === 'won' && !state.campaignWon) startRun(state.level + 1);
+    else if (state.level >= 1 && state.outcome === 'lost') startRun(state.level);
+    else phase = 'menu';
+  }
   function input() {
     var up = keys.ArrowUp || keys.w, down = keys.ArrowDown || keys.s;
     var left = keys.ArrowLeft || keys.a, right = keys.ArrowRight || keys.d;
@@ -453,6 +478,31 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
             quad(at(-l, -w, z0), at(-l, w, z0), at(-l, w, z1), at(-l, -w, z1), shade(color, 0.85 * amb))];
   }
   var TONES = ['#b9a48a', '#8d97a5', '#c98f6e'];
+  var CAR_LOOK = [{l: 10, w: 6, cab: 0.5, roof: 9},      // balanced: a saloon
+                  {l: 11, w: 5.2, cab: 0.4, roof: 7.5},  // sprint: low and long
+                  {l: 10, w: 7, cab: 0.7, roof: 11}];    // heavy: a tall van-like body
+  // A car: chassis, a cabin set back on it, four wheels at the corners, lights front and back.
+  function carModel(car, color, amb, lit) {
+    var k = CAR_LOOK[car.car] || CAR_LOOK[0], out = [], h = car.heading;
+    var c = Math.cos(h), s = Math.sin(h);
+    function at(a, b, z) { return {x: car.x + c * a - s * b, y: car.y + s * a + c * b, z: z}; }
+    out = out.concat(box(car.x, car.y, h, k.l, k.w, 2.5, 6.5, color, amb));                          // chassis
+    out = out.concat(box(car.x - c * k.l * 0.2, car.y - s * k.l * 0.2, h, k.l * k.cab, k.w * 0.85, 6.5, k.roof, color, amb * 0.95));   // cabin
+    out.push(quad(at(k.l * k.cab - k.l * 0.2, -k.w * 0.8, 6.6), at(k.l * k.cab - k.l * 0.2, k.w * 0.8, 6.6),
+                  at(k.l * k.cab * 0.4 - k.l * 0.2, k.w * 0.8, k.roof - 0.4), at(k.l * k.cab * 0.4 - k.l * 0.2, -k.w * 0.8, k.roof - 0.4), shade('#9fc3d9', amb)));   // windscreen
+    var wheels = [[k.l * 0.62, -k.w], [k.l * 0.62, k.w], [-k.l * 0.62, -k.w], [-k.l * 0.62, k.w]];
+    for (var i = 0; i < 4; i++) {
+      var wx = car.x + c * wheels[i][0] - s * wheels[i][1], wy = car.y + s * wheels[i][0] + c * wheels[i][1];
+      out = out.concat(box(wx, wy, h, 2.2, 1.1, 0, 4.4, '#1b1b1b', Math.max(0.5, amb)));           // tyres
+      out.push(quad(at(wheels[i][0] - 1, wheels[i][1] + (wheels[i][1] > 0 ? 0.6 : -0.6), 1), at(wheels[i][0] + 1, wheels[i][1] + (wheels[i][1] > 0 ? 0.6 : -0.6), 1),
+                    at(wheels[i][0] + 1, wheels[i][1] + (wheels[i][1] > 0 ? 0.6 : -0.6), 3.4), at(wheels[i][0] - 1, wheels[i][1] + (wheels[i][1] > 0 ? 0.6 : -0.6), 3.4), '#8a8a8a'));   // hub
+    }
+    out.push(quad(at(k.l + 0.2, -k.w * 0.8, 3.2), at(k.l + 0.2, -k.w * 0.4, 3.2), at(k.l + 0.2, -k.w * 0.4, 5), at(k.l + 0.2, -k.w * 0.8, 5), lit ? '#fff8d0' : '#e8e2b8'));   // headlights
+    out.push(quad(at(k.l + 0.2, k.w * 0.4, 3.2), at(k.l + 0.2, k.w * 0.8, 3.2), at(k.l + 0.2, k.w * 0.8, 5), at(k.l + 0.2, k.w * 0.4, 5), lit ? '#fff8d0' : '#e8e2b8'));
+    out.push(quad(at(-k.l - 0.2, -k.w * 0.8, 3.2), at(-k.l - 0.2, -k.w * 0.4, 3.2), at(-k.l - 0.2, -k.w * 0.4, 5), at(-k.l - 0.2, -k.w * 0.8, 5), lit ? '#ff3030' : '#9b1c1c'));   // tail lights
+    out.push(quad(at(-k.l - 0.2, k.w * 0.4, 3.2), at(-k.l - 0.2, k.w * 0.8, 3.2), at(-k.l - 0.2, k.w * 0.8, 5), at(-k.l - 0.2, k.w * 0.4, 5), lit ? '#ff3030' : '#9b1c1c'));
+    return out;
+  }
   function building(b, light, camx, camy) {
     var out = [], base = TONES[b.tone], amb = light.amb, hw = b.w / 2, hd = b.d / 2;
     var faces = [                                                     // walls: [corner a, corner b, shade, normal]
@@ -487,20 +537,40 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
   var sceneryCache = {};
 
   function drawMenu() {
+    buttons = [];
     ctx.fillStyle = '#1a1a1a'; ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = '#eee'; ctx.font = '28px system-ui, sans-serif';
-    ctx.fillText('CITY RUN — reference', 60, 80);
-    ctx.font = '18px system-ui, sans-serif';
-    var rows = [['mode', menu.mode === 0 ? 'campaign (8 levels)' : 'free run'], ['road', P.tracks[menu.track].name], ['car', P.cars[menu.car].id]];
-    if (menu.mode === 1) rows.push(['time', P.times[menu.time] + ' s']);
+    ctx.fillText('CITY RUN — reference', 60, 70);
+    var rows = menuRows();
+    if (menu.row >= rows.length) menu.row = rows.length - 1;
     for (var i = 0; i < rows.length; i++) {
-      ctx.fillStyle = (i === menu.row) ? '#fc3' : '#bbb';
-      ctx.fillText((i === menu.row ? '> ' : '  ') + rows[i][0] + ':   <  ' + rows[i][1] + '  >', 60, 150 + i * 40);
+      var key = rows[i][0], opts = rows[i][2], y = 110 + i * 52, hot = (i === menu.row);
+      ctx.fillStyle = hot ? '#fc3' : '#bbb'; ctx.font = '18px system-ui, sans-serif';
+      ctx.fillText(rows[i][1], 60, y + 24);
+      (function (k, n) {
+        button(170, y, 36, 36, '<', function () { bump(k, n, -1); }, false);
+        button(470, y, 36, 36, '>', function () { bump(k, n, 1); }, false);
+      })(key, opts.length);
+      if (key === 'colour') {
+        for (var c = 0; c < COLOURS.length; c++) {
+          (function (idx) {
+            var x = 220 + idx * 40;
+            ctx.fillStyle = COLOURS[idx]; ctx.fillRect(x, y + 4, 28, 28);
+            if (idx === menu.colour) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.strokeRect(x - 2, y + 2, 32, 32); ctx.lineWidth = 1; }
+            buttons.push({x: x, y: y + 4, w: 28, h: 28, act: function () { menu.colour = idx; }});
+          })(c);
+        }
+      } else {
+        ctx.fillStyle = hot ? '#fc3' : '#eee'; ctx.font = '18px system-ui, sans-serif';
+        ctx.fillText(opts[menu[key]], 220, y + 24);
+      }
     }
+    button(60, 110 + rows.length * 52 + 10, 200, 44, 'START', function () { startRun(menu.mode === 0 ? 1 : 0); }, true);
     ctx.fillStyle = '#888'; ctx.font = '14px system-ui, sans-serif';
-    ctx.fillText('up/down choose a row, left/right change it, Enter to start', 60, 340);
-    ctx.fillText('collect the pickups to reach the level target before the clock runs out; every crash into another car costs 25 points; grass is slow', 60, 364);
-    ctx.fillText('levels: ' + P.levels.map(function (l) { return l.level + ':' + l.target + 'pts/' + l.time + 's/' + l.timeOfDay; }).join('  '), 60, 388);
+    var ty = 110 + rows.length * 52 + 80;
+    ctx.fillText('click the arrows and START, or: up/down pick a row, left/right change it, Enter starts', 60, ty);
+    ctx.fillText('collect the pickups to reach the level target before the clock runs out; every crash into another car costs 25 points; grass is slow', 60, ty + 24);
+    ctx.fillText('levels: ' + P.levels.map(function (l) { return l.level + ':' + l.target + 'pts/' + l.time + 's/' + l.timeOfDay; }).join('  '), 60, ty + 48);
   }
 
   function drawRun() {
@@ -529,17 +599,16 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
       var q = state.pickups[k];
       if (!q.taken) polys = polys.concat(box(q.x, q.y, state.t * 2, 8, 8, 6, 22, light.lit ? '#ffe066' : '#f0b429', 1));
     }
+    var OPP_COLORS = ['#3f7fe0', '#e0a03f', '#6fbf6f'];             // by car type: balanced, sprint, heavy
     for (var oi = 0; oi < state.opponents.length; oi++) {
       var oc = state.opponents[oi];
-      polys = polys.concat(box(oc.x, oc.y, oc.heading, 10, 6, 0, 9, '#4488ee', light.amb));
-      if (light.lit) polys = polys.concat(box(oc.x + Math.cos(oc.heading) * 10, oc.y + Math.sin(oc.heading) * 10, oc.heading, 0.5, 5, 3, 5, '#fffbe0', 1));
+      polys = polys.concat(carModel(oc, OPP_COLORS[oc.car] || OPP_COLORS[0], light.amb, light.lit));
     }
-    polys = polys.concat(box(p.x, p.y, p.heading, 10, 6, 0, 9, '#e44444', light.amb));
-    if (light.lit) {                                                   // headlight cone on the ground, tail lights
+    polys = polys.concat(carModel(p, COLOURS[menu.colour], light.amb, light.lit));
+    if (light.lit) {                                                   // headlight cone on the ground
       var hx = Math.cos(p.heading), hy = Math.sin(p.heading), rx = -hy, ry = hx;
       polys.push(quad({x: p.x + hx * 10 + rx * 5, y: p.y + hy * 10 + ry * 5, z: 0.3}, {x: p.x + hx * 10 - rx * 5, y: p.y + hy * 10 - ry * 5, z: 0.3},
                       {x: p.x + hx * 90 - rx * 26, y: p.y + hy * 90 - ry * 26, z: 0.3}, {x: p.x + hx * 90 + rx * 26, y: p.y + hy * 90 + ry * 26, z: 0.3}, 'rgba(255,245,200,0.35)'));
-      polys = polys.concat(box(p.x - hx * 10, p.y - hy * 10, p.heading, 0.5, 5, 3, 5, '#ff3030', 1));
     }
     var drawn = [];
     for (var pi = 0; pi < polys.length; pi++) {
@@ -581,6 +650,7 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
 
   function drawEnd() {
     drawRun();
+    buttons = [];
     ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = '#fff'; ctx.font = '32px system-ui, sans-serif';
     var pos = state.ranking.indexOf('player') + 1, title;
@@ -588,16 +658,25 @@ function onRoad(track, x, y) { return roadDist(track, x, y) <= track.roadWidth /
     else if (state.outcome === 'won') title = 'LEVEL ' + state.level + ' COMPLETE — ' + state.score + ' / ' + state.target;
     else if (state.outcome === 'lost') title = 'TIME UP — ' + state.score + ' / ' + state.target + ' on level ' + state.level;
     else title = 'TIME — score ' + state.score + ', position ' + pos + '/' + state.ranking.length;
-    ctx.fillText(title, 60, H / 2 - 40);
+    ctx.fillText(title, 60, H / 2 - 60);
     ctx.font = '18px system-ui, sans-serif';
     for (var i = 0; i < state.ranking.length; i++) {
       var id = state.ranking[i], scv = id === 'player' ? state.score : state.opponents[parseInt(id.slice(3), 10)].score;
-      ctx.fillText((i + 1) + '. ' + id + '  ' + scv, 60, H / 2 + i * 26);
+      ctx.fillText((i + 1) + '. ' + id + '  ' + scv, 60, H / 2 - 20 + i * 26);
     }
-    ctx.fillStyle = '#bbb';
-    var next = state.campaignWon ? 'Enter for the start screen' : state.outcome === 'won' ? 'Enter for level ' + (state.level + 1) + ' (' + P.levels[state.level].timeOfDay + ', target ' + P.levels[state.level].target + ')'
-             : state.outcome === 'lost' ? 'Enter to retry level ' + state.level : 'Enter for the start screen';
-    ctx.fillText(next, 60, H / 2 + state.ranking.length * 26 + 10);
+    var by = H / 2 - 20 + state.ranking.length * 26 + 16;
+    if (state.campaignWon) button(60, by, 160, 44, 'MENU', function () { phase = 'menu'; }, true);
+    else if (state.outcome === 'won') {
+      var nx = P.levels[state.level];
+      button(60, by, 220, 44, 'NEXT LEVEL (' + nx.level + ')', function () { startRun(state.level + 1); }, true);
+      ctx.fillStyle = '#bbb'; ctx.font = '14px system-ui, sans-serif';
+      ctx.fillText('level ' + nx.level + ': target ' + nx.target + ' in ' + nx.time + ' s, ' + nx.timeOfDay + ', ' + nx.opponents + ' cars', 300, by + 28);
+    } else if (state.outcome === 'lost') {
+      button(60, by, 160, 44, 'RETRY', function () { startRun(state.level); }, true);
+      button(240, by, 160, 44, 'MENU', function () { phase = 'menu'; }, false);
+    } else button(60, by, 160, 44, 'MENU', function () { phase = 'menu'; }, true);
+    ctx.fillStyle = '#888'; ctx.font = '14px system-ui, sans-serif';
+    ctx.fillText('or press Enter', 60, by + 66);
   }
 
   var lastScore = 0, lastCrashes = 0;

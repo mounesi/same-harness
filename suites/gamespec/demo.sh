@@ -66,13 +66,27 @@ MOUNT="$("$HERE/lambdactl" fs "$LAMBDA_FS" | awk '{print $3}')"
 WEIGHTS_DIR="${WEIGHTS_DIR_OVERRIDE:-$MOUNT/models}"
 info "weights dir for the harness: $WEIGHTS_DIR"
 
+RUN_ID=""; LOCAL=""
+export_run() { # lay the run out under output/runs/<model>/<run_id>/ — README, metadata, game, zip
+  [[ -n "$RUN_ID" && -d "$LOCAL" && -f "$LOCAL/run-manifest.json" ]] || return 0
+  local bundle="$HERE/results/pulled/${PREFIX:-sh-}${GPU_USER:-${USER:-me}}-$MODEL"
+  local args=("$LOCAL"); [[ -d "$bundle" ]] && args+=(--bundle-dir "$bundle")
+  local dest
+  if dest="$(cd "$HERE" && "${HARNESS_PYTHON:-python3}" suites/gamespec/export_run.py "${args[@]}" 2>"$LOCAL/export.err")"; then
+    info "exported -> ${dest#$HERE/}  (see output/runs/index.md)"
+  else
+    echo "WARNING: export_run.py failed: $(tail -1 "$LOCAL/export.err")" >&2
+  fi
+}
 teardown() {
   if (( KEEP_UP )); then
     info "--keep-up: leaving the instance running. It is leased for $HOLD; ./gpuctl down when done."
+    export_run
     return
   fi
   info "tearing down (gpuctl down retrieves any sealed bundle first)"
   "$HERE/gpuctl" down --yes || echo "WARNING: gpuctl down failed — run ./gpuctl status and ./gpuctl down by hand" >&2
+  export_run
 }
 trap teardown EXIT
 
@@ -156,4 +170,4 @@ for diff in "$LOCAL"/patches/*/pass-*.diff; do
   fi
 done
 
-info "done. Open results/gamespec/$RUN_ID/built/racing-v1/pass-0/game.html in a browser to play it."
+info "done. The run is laid out under output/runs/$MODEL/$RUN_ID/ once teardown completes (README.md there)."
