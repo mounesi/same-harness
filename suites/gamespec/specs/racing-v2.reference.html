@@ -1,24 +1,24 @@
 <!DOCTYPE html>
 <!--
-  racing-v2 REFERENCE IMPLEMENTATION — not a submission, not a target to imitate.
+  racing-v2 (City Run) REFERENCE IMPLEMENTATION — not a submission, not a target to imitate.
 
   Same purpose as racing-v1.reference.html: prove the spec is implementable and unambiguous,
   and give floor_check.py --spec racing-v2 something that passes. Every place this file had
   to guess was pushed back into racing-v2.md before any model saw it.
 
-  Deliberately ugly: flat-shaded polygons, no textures, no sound. The 3D view is a software
-  pinhole projection onto a 2D canvas (View.project), drawn painter's-order, because that is
-  the least that satisfies "presented in 3D" — the human channel differentiates on the rest.
+  Deliberately ugly: flat-shaded polygons, a text start screen, no sound. The 3D view is a
+  software pinhole projection onto a 2D canvas (View.project), drawn painter's-order,
+  because that is the least that satisfies "presented in 3D".
 -->
 <html lang="en">
-<head><meta charset="utf-8"><title>racing-v2 reference</title>
+<head><meta charset="utf-8"><title>racing-v2 reference — City Run</title>
 <style>
   body { margin:0; background:#111; color:#ddd; font:14px system-ui, sans-serif; }
   canvas { display:block; margin:12px auto; background:#1a1a1a; border:1px solid #333; }
   #hud { text-align:center; }
 </style></head>
 <body>
-<div id="hud">arrows / WASD drive, shift or space = boost — reference implementation, deliberately plain</div>
+<div id="hud">start screen: up/down pick a row, left/right change it, Enter starts — then arrows / WASD drive, shift or space = boost</div>
 <canvas id="c" width="960" height="600"></canvas>
 <script>
 'use strict';
@@ -29,8 +29,30 @@
   var ACCEL = 220.0, BRAKE = 400.0, DRAG = 0.9, TURN_RATE = 2.6, MAX_SPEED = 320.0;
   var OFFROAD_ACCEL = 0.5, OFFROAD_DRAG = 0.35;
   var BOOST_MULT = 1.8, BOOST_MAX = 400.0, BOOST_DURATION = 2.0, BOOST_RECHARGE = 8.0;
+  var CAR_RADIUS = 10.0, CRASH_PENALTY = 25, CRASH_SLOWDOWN = 0.6;
+  var CARS = [
+    {id: 'balanced', accel: 1.00, turn: 1.00, mass: 1.0},
+    {id: 'sprint',   accel: 1.15, turn: 0.90, mass: 0.8},
+    {id: 'heavy',    accel: 0.90, turn: 0.85, mass: 1.3},
+  ];
+  var TIMES = [30, 60, 120];
+  function pk(list) { return list.map(function (p) { return {x: p[0], y: p[1], r: 30, value: 10}; }); }
+  var TRACKS = [
+    {name: 'Downtown', track: {width: 1000, height: 800, roadWidth: 120,
+      roads: [[{x: 150, y: 150}, {x: 850, y: 150}, {x: 850, y: 650}, {x: 150, y: 650}, {x: 150, y: 150}],
+              [{x: 500, y: 150}, {x: 500, y: 650}], [{x: 150, y: 400}, {x: 850, y: 400}]],
+      spawn: {x: 150, y: 400, heading: 0},
+      pickups: pk([[500, 400], [500, 150], [850, 400], [500, 650], [150, 150], [850, 150], [850, 650], [150, 650]])}},
+    {name: 'Harbour', track: {width: 1200, height: 900, roadWidth: 110,
+      roads: [[{x: 100, y: 100}, {x: 700, y: 100}, {x: 1100, y: 400}, {x: 1100, y: 800}, {x: 500, y: 800}, {x: 100, y: 500}, {x: 100, y: 100}],
+              [{x: 700, y: 100}, {x: 700, y: 500}, {x: 500, y: 800}]],
+      spawn: {x: 100, y: 300, heading: Math.PI / 2},
+      pickups: pk([[700, 100], [1100, 400], [1100, 800], [500, 800], [100, 500], [700, 500], [900, 250], [300, 100]])}},
+  ];
 
-  // mulberry32 — a tiny seeded PRNG; the ONLY source of randomness in the core.
+  function deep(v) { return JSON.parse(JSON.stringify(v)); }
+  function presets() { return deep({tracks: TRACKS, cars: CARS, times: TIMES}); }
+
   function mulberry32(a) {
     return function () {
       a |= 0; a = a + 0x6D2B79F5 | 0;
@@ -40,40 +62,41 @@
     };
   }
   function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
   function segDist2(px, py, ax, ay, bx, by) {
     var dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
-    var t = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0;
-    t = clamp(t, 0, 1);
+    var t = l2 > 0 ? clamp(((px - ax) * dx + (py - ay) * dy) / l2, 0, 1) : 0;
     var cx = ax + t * dx, cy = ay + t * dy;
     return (px - cx) * (px - cx) + (py - cy) * (py - cy);
   }
+  // §2.1: on the road iff within roadWidth/2 of the nearest segment of any street.
   function onRoad(track, x, y) {
-    var cl = track.centerline, best = Infinity;
-    for (var i = 0; i < cl.length; i++) {
-      var a = cl[i], b = cl[(i + 1) % cl.length];       // closed loop: last -> first
-      var d = segDist2(x, y, a.x, a.y, b.x, b.y);
-      if (d < best) best = d;
+    var best = Infinity;
+    for (var r = 0; r < track.roads.length; r++) {
+      var road = track.roads[r];
+      for (var i = 0; i + 1 < road.length; i++) {
+        var d = segDist2(x, y, road[i].x, road[i].y, road[i + 1].x, road[i + 1].y);
+        if (d < best) best = d;
+      }
     }
     var half = track.roadWidth / 2;
     return best <= half * half;
   }
 
-  function copyCar(c) {
-    return {x: c.x, y: c.y, heading: c.heading, speed: c.speed,
-            lap: c.lap, nextCheckpoint: c.nextCheckpoint, skill: c.skill};
+  function copyOpp(o) {
+    return {x: o.x, y: o.y, heading: o.heading, speed: o.speed, car: o.car,
+            score: o.score, crashes: o.crashes, skill: o.skill};
   }
   function clone(s) {
     var p = s.player;
     return {
-      seed: s.seed, laps: s.laps, t: s.t, finished: s.finished,
-      lap: s.lap, nextCheckpoint: s.nextCheckpoint, lapStart: s.lapStart,
-      lapTimes: s.lapTimes.slice(), bestLap: s.bestLap,
-      player: {x: p.x, y: p.y, heading: p.heading, speed: p.speed,
+      seed: s.seed, t: s.t, timeLimit: s.timeLimit, timeLeft: s.timeLeft, finished: s.finished,
+      score: s.score, crashes: s.crashes, round: s.round,
+      player: {x: p.x, y: p.y, heading: p.heading, speed: p.speed, car: p.car,
                boostCharge: p.boostCharge, boostActive: p.boostActive},
-      opponents: s.opponents.map(copyCar),
+      opponents: s.opponents.map(copyOpp),
+      pickups: s.pickups.map(function (q) { return {x: q.x, y: q.y, r: q.r, value: q.value, taken: q.taken}; }),
       ranking: s.ranking.slice(),
-      track: s.track,                                     // immutable; shared on purpose
+      track: s.track,                                  // immutable; shared on purpose
     };
   }
 
@@ -81,109 +104,126 @@
     var tr = config.track;
     var track = {
       width: tr.width, height: tr.height, roadWidth: tr.roadWidth,
-      centerline: tr.centerline.map(function (p) { return {x: p.x, y: p.y}; }),
-      checkpoints: tr.checkpoints.map(function (c) { return {x: c.x, y: c.y, r: c.r}; }),
+      roads: tr.roads.map(function (road) { return road.map(function (p) { return {x: p.x, y: p.y}; }); }),
+      spawn: {x: tr.spawn.x, y: tr.spawn.y, heading: tr.spawn.heading},
     };
-    var cps = track.checkpoints, start = cps[0], aim = cps[1 % cps.length];
-    var heading = Math.atan2(aim.y - start.y, aim.x - start.x);
-    var rnd = mulberry32(config.seed >>> 0), opps = [];
+    var sp = track.spawn, rnd = mulberry32(config.seed >>> 0), opps = [];
     for (var i = 0; i < (config.opponents | 0); i++) {
-      opps.push({x: start.x, y: start.y, heading: heading, speed: 0, lap: 0,
-                 nextCheckpoint: 1, skill: 0.7 + 0.3 * rnd()});   // seeded per-opponent skill
+      var ahead = 40 * (i + 1);
+      opps.push({x: sp.x + Math.cos(sp.heading) * ahead, y: sp.y + Math.sin(sp.heading) * ahead,
+                 heading: sp.heading, speed: 0, car: Math.floor(rnd() * 3), score: 0, crashes: 0,
+                 skill: 0.7 + 0.3 * rnd()});
     }
     var s = {
-      seed: config.seed >>> 0, laps: config.laps | 0, t: 0, finished: false,
-      lap: 0, nextCheckpoint: 1, lapStart: 0, lapTimes: [], bestLap: null,
-      player: {x: start.x, y: start.y, heading: heading, speed: 0, boostCharge: 1, boostActive: 0},
-      opponents: opps, ranking: [], track: track,
+      seed: config.seed >>> 0, t: 0, timeLimit: config.time, timeLeft: config.time, finished: false,
+      score: 0, crashes: 0, round: 0,
+      player: {x: sp.x, y: sp.y, heading: sp.heading, speed: 0, car: config.car | 0, boostCharge: 1, boostActive: 0},
+      opponents: opps,
+      pickups: tr.pickups.map(function (q) { return {x: q.x, y: q.y, r: q.r, value: q.value, taken: false}; }),
+      ranking: [], track: track,
     };
     s.ranking = rank(s);
     return s;
   }
 
-  // Rules 4-10 of §2.2, shared by the player and every opponent.
-  function drive(car, input, dt, track, road, boosting) {
+  // Rules 4-10, shared by the player and every opponent.
+  function drive(car, spec, input, dt, track, road, boosting) {
     var thr = clamp(input.throttle || 0, 0, 1), brk = clamp(input.brake || 0, 0, 1);
     var str = clamp(input.steer || 0, -1, 1);
-    var accel = ACCEL * (road ? 1 : OFFROAD_ACCEL) * (boosting ? BOOST_MULT : 1);
+    var accel = ACCEL * spec.accel * (road ? 1 : OFFROAD_ACCEL) * (boosting ? BOOST_MULT : 1);
     var drag = road ? DRAG : OFFROAD_DRAG, maxSpeed = boosting ? BOOST_MAX : MAX_SPEED;
-    car.speed += (accel * thr - BRAKE * brk) * dt;          // 5
-    car.speed *= Math.pow(drag, dt);                        // 6
-    if (car.speed < 0) car.speed = 0;                       // 7
+    car.speed += (accel * thr - BRAKE * brk) * dt;
+    car.speed *= Math.pow(drag, dt);
+    if (car.speed < 0) car.speed = 0;
     if (car.speed > maxSpeed) car.speed = maxSpeed;
-    car.heading += str * TURN_RATE * Math.min(1, car.speed / 60) * dt;   // 8
-    car.x += Math.cos(car.heading) * car.speed * dt;        // 9
+    car.heading += str * TURN_RATE * spec.turn * Math.min(1, car.speed / 60) * dt;
+    car.x += Math.cos(car.heading) * car.speed * dt;
     car.y += Math.sin(car.heading) * car.speed * dt;
-    var hit = false;                                        // 10
+    wall(car, track);
+  }
+  function wall(car, track) {
+    var hit = false;
     if (car.x < 0) { car.x = 0; hit = true; } else if (car.x > track.width) { car.x = track.width; hit = true; }
     if (car.y < 0) { car.y = 0; hit = true; } else if (car.y > track.height) { car.y = track.height; hit = true; }
     if (hit) car.speed = 0;
   }
-  // §2.3 for one car; returns true when a lap was completed.
-  function checkpoint(car, cps) {
-    var tgt = cps[car.nextCheckpoint], dx = car.x - tgt.x, dy = car.y - tgt.y;
-    if (dx * dx + dy * dy <= tgt.r * tgt.r) {
-      car.nextCheckpoint = (car.nextCheckpoint + 1) % cps.length;
-      if (car.nextCheckpoint === 0) { car.lap += 1; return true; }
-    }
-    return false;
-  }
-  // The opponent controller: a pure function of (state, index). Aim at the next
-  // checkpoint; throttle scaled by the seeded skill. Nothing clever — it only has to be
-  // deterministic and competent enough to lap the standard track.
+  // §2.7: aim at the nearest untaken pickup; throttle scaled by the seeded skill.
   function controller(s, i) {
-    var o = s.opponents[i], tgt = s.track.checkpoints[o.nextCheckpoint];
-    var want = Math.atan2(tgt.y - o.y, tgt.x - o.x), diff = want - o.heading;
+    var o = s.opponents[i], best = null, bd = Infinity;
+    for (var k = 0; k < s.pickups.length; k++) {
+      var q = s.pickups[k];
+      if (q.taken) continue;
+      var d = (q.x - o.x) * (q.x - o.x) + (q.y - o.y) * (q.y - o.y);
+      if (d < bd) { bd = d; best = q; }
+    }
+    if (!best) return {throttle: 0, brake: 0, steer: 0, boost: 0};
+    var want = Math.atan2(best.y - o.y, best.x - o.x), diff = want - o.heading;
     while (diff > Math.PI) diff -= 2 * Math.PI;
     while (diff < -Math.PI) diff += 2 * Math.PI;
     return {throttle: (Math.abs(diff) < 0.8 ? 1 : 0.4) * o.skill, brake: 0,
             steer: clamp(diff * 2, -1, 1), boost: 0};
   }
-  // §2.4
+  // §2.8
   function rank(s) {
-    var cps = s.track.checkpoints, n = cps.length, cars = [];
-    cars.push({id: 'player', x: s.player.x, y: s.player.y, lap: s.lap, nc: s.nextCheckpoint, idx: -1});
-    for (var i = 0; i < s.opponents.length; i++) {
-      var o = s.opponents[i];
-      cars.push({id: 'opp' + i, x: o.x, y: o.y, lap: o.lap, nc: o.nextCheckpoint, idx: i});
-    }
-    for (var k = 0; k < cars.length; k++) {
-      var c = cars[k], t = cps[c.nc];
-      c.passed = (c.nc - 1 + n) % n;
-      c.dist = Math.sqrt((c.x - t.x) * (c.x - t.x) + (c.y - t.y) * (c.y - t.y));
-    }
-    cars.sort(function (a, b) {
-      return (b.lap - a.lap) || (b.passed - a.passed) || (a.dist - b.dist) || (a.idx - b.idx);
-    });
+    var cars = [{id: 'player', score: s.score, idx: -1}];
+    for (var i = 0; i < s.opponents.length; i++) cars.push({id: 'opp' + i, score: s.opponents[i].score, idx: i});
+    cars.sort(function (a, b) { return (b.score - a.score) || (a.idx - b.idx); });
     return cars.map(function (c) { return c.id; });
   }
 
   function step(state, input, dt) {
-    if (state.finished) return clone(state);               // frozen
-    var s = clone(state), p = s.player, track = s.track, cps = track.checkpoints;
-    s.t += dt;                                              // 1
-    var road = onRoad(track, p.x, p.y);                     // 2 — position BEFORE the step
+    if (state.finished) return clone(state);
+    var s = clone(state), p = s.player, track = s.track;
+    s.t += dt;                                                            // 1
+    var road = onRoad(track, p.x, p.y);                                   // 2
     if ((input.boost | 0) === 1 && p.boostActive === 0 && p.boostCharge >= 1) {   // 3
       p.boostActive = BOOST_DURATION; p.boostCharge = 0;
     }
     var boosting = p.boostActive > 0;
-    drive(p, input, dt, track, road, boosting);             // 4-10
-    if (boosting) p.boostActive = Math.max(0, p.boostActive - dt);                // 11
+    drive(p, CARS[p.car], input, dt, track, road, boosting);              // 4-10
+    if (boosting) p.boostActive = Math.max(0, p.boostActive - dt);       // 11
     else p.boostCharge = Math.min(1, p.boostCharge + dt / BOOST_RECHARGE);
-    var pv = {x: p.x, y: p.y, nextCheckpoint: s.nextCheckpoint, lap: s.lap};      // 12
-    if (checkpoint(pv, cps)) {
-      s.lapTimes.push(s.t - s.lapStart);
-      s.bestLap = Math.min.apply(null, s.lapTimes);
-      s.lapStart = s.t;
-      if (pv.lap >= s.laps) s.finished = true;
+    for (var i = 0; i < s.opponents.length; i++) {                        // 12
+      var o = s.opponents[i];
+      drive(o, CARS[o.car], controller(state, i), dt, track, onRoad(track, o.x, o.y), false);
     }
-    s.nextCheckpoint = pv.nextCheckpoint; s.lap = pv.lap;
-    for (var i = 0; i < s.opponents.length; i++) {
-      var o = s.opponents[i], inp = controller(state, i);   // controller reads the OLD state
-      drive(o, inp, dt, track, onRoad(track, o.x, o.y), false);
-      checkpoint(o, cps);
+    // 13 — collisions, every pair once, fixed order
+    var cars = [p].concat(s.opponents);
+    for (var a = 0; a < cars.length; a++) {
+      for (var b = a + 1; b < cars.length; b++) {
+        var A = cars[a], B = cars[b], dx = B.x - A.x, dy = B.y - A.y, d = Math.sqrt(dx * dx + dy * dy);
+        if (d >= 2 * CAR_RADIUS) continue;
+        var nx, ny;
+        if (d > 0) { nx = dx / d; ny = dy / d; } else { nx = Math.cos(A.heading); ny = Math.sin(A.heading); }
+        var push = (2 * CAR_RADIUS - d) / 2;
+        A.x -= nx * push; A.y -= ny * push; B.x += nx * push; B.y += ny * push;
+        wall(A, track); wall(B, track);
+        var ma = CARS[A.car].mass, mb = CARS[B.car].mass;
+        A.speed *= 1 - CRASH_SLOWDOWN * mb / (ma + mb);
+        B.speed *= 1 - CRASH_SLOWDOWN * ma / (ma + mb);
+        if (a === 0) { s.score -= CRASH_PENALTY; s.crashes += 1; } else { A.score -= CRASH_PENALTY; A.crashes += 1; }
+        B.score -= CRASH_PENALTY; B.crashes += 1;
+      }
     }
-    s.ranking = rank(s);
+    // 14 — pickups, player first then opponents
+    for (var c = 0; c < cars.length; c++) {
+      var car = cars[c];
+      for (var k = 0; k < s.pickups.length; k++) {
+        var q = s.pickups[k];
+        if (q.taken) continue;
+        var qx = q.x - car.x, qy = q.y - car.y;
+        if (qx * qx + qy * qy <= q.r * q.r) {
+          q.taken = true;
+          if (c === 0) s.score += q.value; else car.score += q.value;
+        }
+      }
+    }
+    var allTaken = s.pickups.length > 0;
+    for (var m = 0; m < s.pickups.length; m++) if (!s.pickups[m].taken) { allTaken = false; break; }
+    if (allTaken) { for (var n = 0; n < s.pickups.length; n++) s.pickups[n].taken = false; s.round += 1; }
+    s.timeLeft = Math.max(0, s.timeLimit - s.t);                           // 15
+    if (s.t >= s.timeLimit) s.finished = true;
+    s.ranking = rank(s);                                                   // 16
     return s;
   }
 
@@ -207,7 +247,7 @@
     return ('00000000' + h1.toString(16)).slice(-8) + ('00000000' + h2.toString(16)).slice(-8);
   }
 
-  globalThis.SimCore = {create: create, step: step, hash: hash};
+  globalThis.SimCore = {presets: presets, create: create, step: step, hash: hash};
 })();
 
 // ---------------------------------------------------------------------------------------
@@ -217,11 +257,9 @@
   function project(pt, cam) {
     var dx = pt.x - cam.x, dy = pt.y - cam.y, dz = (pt.z || 0) - cam.z;
     var cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
-    var f = dx * cy + dy * sy;            // along the viewing direction in the plane
-    var r = -dx * sy + dy * cy;           // right-hand side = yaw + pi/2, like steer = +1
+    var f = dx * cy + dy * sy, r = -dx * sy + dy * cy;
     var cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-    var depth = f * cp + dz * sp;         // along the (pitched) viewing axis
-    var up = -f * sp + dz * cp;
+    var depth = f * cp + dz * sp, up = -f * sp + dz * cp;
     if (depth <= 1e-9) return {sx: cam.width / 2, sy: cam.height / 2, depth: depth};
     var focal = (cam.height / 2) / Math.tan(cam.fov / 2);
     return {sx: cam.width / 2 + r * focal / depth, sy: cam.height / 2 - up * focal / depth, depth: depth};
@@ -230,120 +268,156 @@
 })();
 
 // ---------------------------------------------------------------------------------------
-// Rendering + input. Free to use the DOM, timers, anything — it is never graded.
+// Rendering + input + start screen. Free to use the DOM, timers, anything — never graded.
 // ---------------------------------------------------------------------------------------
 (function () {
   if (typeof document === 'undefined' || !document.getElementById) return;
   var canvas = document.getElementById('c');
   if (!canvas || !canvas.getContext) return;
-  // Fixed viewport, not read back from the canvas: under floor_check's permissive stubs
-  // canvas.width is a Proxy, and arithmetic on it throws at load time.
-  var W = 960, H = 600, ctx = canvas.getContext('2d');
+  var W = 960, H = 600, ctx = canvas.getContext('2d');   // fixed: canvas.width is a Proxy under the floor check
   canvas.width = W; canvas.height = H;
-  var CFG = {seed: 7, laps: 3, opponents: 2, track: {
-    width: 1000, height: 800, roadWidth: 120,
-    centerline: [{x: 150, y: 150}, {x: 850, y: 150}, {x: 850, y: 650}, {x: 150, y: 650}],
-    checkpoints: [{x: 150, y: 400, r: 40}, {x: 500, y: 150, r: 40},
-                  {x: 850, y: 400, r: 40}, {x: 500, y: 650, r: 40}]}};
-  var state = SimCore.create(CFG), keys = {};
-  addEventListener('keydown', function (e) { keys[e.key] = true; if (e.key === ' ') e.preventDefault(); });
+  var P = SimCore.presets();
+  var menu = {row: 0, track: 0, car: 0, time: 1}, phase = 'menu', state = null, cfgUsed = null, keys = {};
+
+  addEventListener('keydown', function (e) {
+    if (e.key === ' ' || e.key.indexOf('Arrow') === 0) e.preventDefault();
+    keys[e.key] = true;
+    if (phase === 'menu') {
+      var rows = ['track', 'car', 'time'], lens = [P.tracks.length, P.cars.length, P.times.length];
+      if (e.key === 'ArrowUp' || e.key === 'w') menu.row = (menu.row + 2) % 3;
+      if (e.key === 'ArrowDown' || e.key === 's') menu.row = (menu.row + 1) % 3;
+      var k = rows[menu.row];
+      if (e.key === 'ArrowLeft' || e.key === 'a') menu[k] = (menu[k] + lens[menu.row] - 1) % lens[menu.row];
+      if (e.key === 'ArrowRight' || e.key === 'd') menu[k] = (menu[k] + 1) % lens[menu.row];
+      if (e.key === 'Enter') {
+        cfgUsed = {seed: 7, time: P.times[menu.time], car: menu.car, opponents: 2, track: P.tracks[menu.track].track};
+        state = SimCore.create(cfgUsed); phase = 'run';
+      }
+    } else if (phase === 'end' && e.key === 'Enter') { phase = 'menu'; }
+  });
   addEventListener('keyup', function (e) { keys[e.key] = false; });
 
   function input() {
     var up = keys.ArrowUp || keys.w, down = keys.ArrowDown || keys.s;
     var left = keys.ArrowLeft || keys.a, right = keys.ArrowRight || keys.d;
-    return {throttle: up ? 1 : 0, brake: down ? 1 : 0,
-            steer: (right ? 1 : 0) - (left ? 1 : 0),
+    return {throttle: up ? 1 : 0, brake: down ? 1 : 0, steer: (right ? 1 : 0) - (left ? 1 : 0),
             boost: (keys.Shift || keys[' ']) ? 1 : 0};
   }
 
-  // Road pieces are built once: quads along each centerline segment, ~25 units long.
-  var track = CFG.track, half = track.roadWidth / 2, pieces = [];
-  (function () {
-    var cl = track.centerline;
-    for (var i = 0; i < cl.length; i++) {
-      var a = cl[i], b = cl[(i + 1) % cl.length], dx = b.x - a.x, dy = b.y - a.y;
-      var len = Math.sqrt(dx * dx + dy * dy), nx = -dy / len * half, ny = dx / len * half;
-      var n = Math.max(1, Math.round(len / 25));
-      for (var k = 0; k < n; k++) {
-        var t0 = k / n, t1 = (k + 1) / n;
-        var p0 = {x: a.x + dx * t0, y: a.y + dy * t0}, p1 = {x: a.x + dx * t1, y: a.y + dy * t1};
-        pieces.push({dark: (k % 2) === 0, pts: [
-          {x: p0.x + nx, y: p0.y + ny, z: 0}, {x: p1.x + nx, y: p1.y + ny, z: 0},
-          {x: p1.x - nx, y: p1.y - ny, z: 0}, {x: p0.x - nx, y: p0.y - ny, z: 0}]});
+  function roadPieces(track) {
+    var half = track.roadWidth / 2, out = [];
+    for (var r = 0; r < track.roads.length; r++) {
+      var road = track.roads[r];
+      for (var i = 0; i + 1 < road.length; i++) {
+        var a = road[i], b = road[i + 1], dx = b.x - a.x, dy = b.y - a.y, len = Math.sqrt(dx * dx + dy * dy);
+        var nx = -dy / len * half, ny = dx / len * half, n = Math.max(1, Math.round(len / 25));
+        for (var k = 0; k < n; k++) {
+          var t0 = k / n, t1 = (k + 1) / n;
+          out.push({color: (k % 2) ? '#555' : '#4a4a4a', pts: [
+            {x: a.x + dx * t0 + nx, y: a.y + dy * t0 + ny, z: 0}, {x: a.x + dx * t1 + nx, y: a.y + dy * t1 + ny, z: 0},
+            {x: a.x + dx * t1 - nx, y: a.y + dy * t1 - ny, z: 0}, {x: a.x + dx * t0 - nx, y: a.y + dy * t0 - ny, z: 0}]});
+        }
       }
     }
-  })();
-
-  function carPolys(car, color) {
-    var c = Math.cos(car.heading), s = Math.sin(car.heading), out = [];
-    function at(l, w, z) { return {x: car.x + c * l - s * w, y: car.y + s * l + c * w, z: z}; }
-    out.push({color: color, pts: [at(-10, -6, 0), at(10, -6, 0), at(10, 6, 0), at(-10, 6, 0)]});
-    out.push({color: color, pts: [at(-6, -5, 9), at(5, -5, 9), at(5, 5, 9), at(-6, 5, 9)]});
-    out.push({color: '#222', pts: [at(-10, -6, 0), at(10, -6, 0), at(10, -6, 5), at(-10, -6, 5)]});
-    out.push({color: '#222', pts: [at(-10, 6, 0), at(10, 6, 0), at(10, 6, 5), at(-10, 6, 5)]});
     return out;
   }
+  var piecesCache = {};
+  function box(cx, cy, heading, l, w, z0, z1, color) {
+    var c = Math.cos(heading), s = Math.sin(heading);
+    function at(a, b, z) { return {x: cx + c * a - s * b, y: cy + s * a + c * b, z: z}; }
+    return [{color: color, pts: [at(-l, -w, z1), at(l, -w, z1), at(l, w, z1), at(-l, w, z1)]},
+            {color: '#222', pts: [at(-l, -w, z0), at(l, -w, z0), at(l, -w, z1), at(-l, -w, z1)]},
+            {color: '#222', pts: [at(-l, w, z0), at(l, w, z0), at(l, w, z1), at(-l, w, z1)]},
+            {color: color, pts: [at(l, -w, z0), at(l, w, z0), at(l, w, z1), at(l, -w, z1)]}];
+  }
 
-  function frame() {
-    state = SimCore.step(state, input(), 1 / 60);
-    var p = state.player;
+  function drawMenu() {
+    ctx.fillStyle = '#1a1a1a'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#eee'; ctx.font = '28px system-ui, sans-serif';
+    ctx.fillText('CITY RUN — reference', 60, 80);
+    ctx.font = '18px system-ui, sans-serif';
+    var rows = [['road', P.tracks[menu.track].name], ['car', P.cars[menu.car].id],
+                ['time', P.times[menu.time] + ' s']];
+    for (var i = 0; i < 3; i++) {
+      ctx.fillStyle = (i === menu.row) ? '#fc3' : '#bbb';
+      ctx.fillText((i === menu.row ? '> ' : '  ') + rows[i][0] + ':   <  ' + rows[i][1] + '  >', 60, 150 + i * 40);
+    }
+    ctx.fillStyle = '#888'; ctx.font = '14px system-ui, sans-serif';
+    ctx.fillText('up/down choose a row, left/right change it, Enter to start', 60, 300);
+    ctx.fillText('collect the pickups; every crash into another car costs 25 points; grass is slow', 60, 324);
+  }
+
+  function drawRun() {
+    var track = cfgUsed.track, p = state.player;
     var cam = {x: p.x - Math.cos(p.heading) * 150, y: p.y - Math.sin(p.heading) * 150, z: 70,
                yaw: p.heading, pitch: -0.32, fov: 1.15, width: W, height: H};
-    // sky / ground split at the horizon (a far point at camera height)
     var hz = View.project({x: cam.x + Math.cos(cam.yaw) * 1e6, y: cam.y + Math.sin(cam.yaw) * 1e6, z: cam.z}, cam).sy;
     ctx.fillStyle = '#25304a'; ctx.fillRect(0, 0, W, H);
     ctx.fillStyle = '#2d4a2a'; ctx.fillRect(0, hz, W, H - hz);
-
-    var polys = [];
-    for (var i = 0; i < pieces.length; i++) polys.push({color: pieces[i].dark ? '#4a4a4a' : '#555', pts: pieces[i].pts});
-    var cps = track.checkpoints;
-    for (var j = 0; j < cps.length; j++) {           // a checkpoint is a gate of two posts
-      var cpj = cps[j], color = (j === state.nextCheckpoint) ? '#6f6' : '#aa4';
-      for (var side = -1; side <= 1; side += 2) {
-        var gx = cpj.x, gy = cpj.y + side * cpj.r;
-        if (j === 0 || j === 2) { gx = cpj.x; gy = cpj.y + side * cpj.r; } else { gx = cpj.x + side * cpj.r; gy = cpj.y; }
-        polys.push({color: color, pts: [{x: gx - 3, y: gy - 3, z: 0}, {x: gx + 3, y: gy + 3, z: 0},
-                                        {x: gx + 3, y: gy + 3, z: 40}, {x: gx - 3, y: gy - 3, z: 40}]});
-      }
+    var key = P.tracks[menu.track].name;
+    if (!piecesCache[key]) piecesCache[key] = roadPieces(track);
+    var polys = piecesCache[key].slice();
+    for (var k = 0; k < state.pickups.length; k++) {
+      var q = state.pickups[k];
+      if (q.taken) continue;
+      polys = polys.concat(box(q.x, q.y, state.t * 2, 8, 8, 6, 22, '#fc3'));
     }
-    for (var o = 0; o < state.opponents.length; o++) polys = polys.concat(carPolys(state.opponents[o], '#48e'));
-    polys = polys.concat(carPolys(p, '#e44'));
-
+    for (var o = 0; o < state.opponents.length; o++) polys = polys.concat(box(state.opponents[o].x, state.opponents[o].y, state.opponents[o].heading, 10, 6, 0, 9, '#48e'));
+    polys = polys.concat(box(p.x, p.y, p.heading, 10, 6, 0, 9, '#e44'));
     var drawn = [];
-    for (var q = 0; q < polys.length; q++) {
-      var pr = polys[q].pts.map(function (pt) { return View.project(pt, cam); }), ok = true, d = 0;
-      for (var k = 0; k < pr.length; k++) { if (!(pr[k].depth > 1)) ok = false; d += pr[k].depth; }
-      if (ok) drawn.push({color: polys[q].color, pr: pr, d: d / pr.length});
+    for (var i = 0; i < polys.length; i++) {
+      var pr = polys[i].pts.map(function (pt) { return View.project(pt, cam); }), okp = true, d = 0;
+      for (var j = 0; j < pr.length; j++) { if (!(pr[j].depth > 1)) okp = false; d += pr[j].depth; }
+      if (okp) drawn.push({color: polys[i].color, pr: pr, d: d / pr.length});
     }
-    drawn.sort(function (a, b) { return b.d - a.d; });   // painter's order, far to near
+    drawn.sort(function (a, b) { return b.d - a.d; });
     for (var m = 0; m < drawn.length; m++) {
       var dp = drawn[m];
       ctx.beginPath(); ctx.moveTo(dp.pr[0].sx, dp.pr[0].sy);
       for (var n = 1; n < dp.pr.length; n++) ctx.lineTo(dp.pr[n].sx, dp.pr[n].sy);
       ctx.closePath(); ctx.fillStyle = dp.color; ctx.fill();
     }
-
     // HUD
     var pos = state.ranking.indexOf('player') + 1;
-    ctx.fillStyle = '#eee'; ctx.font = '14px system-ui, sans-serif';
-    ctx.fillText('lap ' + state.lap + '/' + state.laps + '   pos ' + pos + '/' + state.ranking.length +
-                 '   time ' + state.t.toFixed(1) + 's   best ' + (state.bestLap === null ? '-' : state.bestLap.toFixed(2) + 's') +
-                 '   speed ' + p.speed.toFixed(0) + (p.boostActive > 0 ? '  BOOST' : ''), 10, 20);
-    ctx.fillStyle = '#333'; ctx.fillRect(10, 30, 120, 8);
-    ctx.fillStyle = p.boostActive > 0 ? '#fc3' : '#3af'; ctx.fillRect(10, 30, 120 * p.boostCharge, 8);
-    if (state.finished) { ctx.font = '32px system-ui, sans-serif'; ctx.fillStyle = '#fff'; ctx.fillText('FINISHED — position ' + pos, W / 2 - 150, H / 2); }
-
+    ctx.fillStyle = '#eee'; ctx.font = '15px system-ui, sans-serif';
+    ctx.fillText('time ' + state.timeLeft.toFixed(1) + 's   score ' + state.score + '   pos ' + pos + '/' + state.ranking.length +
+                 '   crashes ' + state.crashes + '   round ' + state.round + '   speed ' + p.speed.toFixed(0) +
+                 (p.boostActive > 0 ? '  BOOST' : ''), 10, 22);
+    ctx.fillStyle = '#333'; ctx.fillRect(10, 32, 120, 8);
+    ctx.fillStyle = p.boostActive > 0 ? '#fc3' : '#3af'; ctx.fillRect(10, 32, 120 * p.boostCharge, 8);
     // minimap
-    var mx = W - 130, my = 10, sc = 0.12;
-    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(mx - 4, my - 4, 1000 * sc + 8, 800 * sc + 8);
-    ctx.strokeStyle = '#888'; ctx.lineWidth = track.roadWidth * sc; ctx.beginPath();
-    var cl = track.centerline;
-    for (var v = 0; v <= cl.length; v++) { var cv = cl[v % cl.length]; if (v === 0) ctx.moveTo(mx + cv.x * sc, my + cv.y * sc); else ctx.lineTo(mx + cv.x * sc, my + cv.y * sc); }
-    ctx.stroke(); ctx.lineWidth = 1;
+    var sc = 120 / Math.max(track.width, track.height), mx = W - track.width * sc - 10, my = 10;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(mx - 4, my - 4, track.width * sc + 8, track.height * sc + 8);
+    ctx.strokeStyle = '#888'; ctx.lineWidth = Math.max(1, track.roadWidth * sc);
+    for (var r = 0; r < track.roads.length; r++) {
+      ctx.beginPath();
+      for (var v = 0; v < track.roads[r].length; v++) { var cv = track.roads[r][v]; if (v === 0) ctx.moveTo(mx + cv.x * sc, my + cv.y * sc); else ctx.lineTo(mx + cv.x * sc, my + cv.y * sc); }
+      ctx.stroke();
+    }
+    ctx.lineWidth = 1;
+    for (var g = 0; g < state.pickups.length; g++) if (!state.pickups[g].taken) { ctx.fillStyle = '#fc3'; ctx.fillRect(mx + state.pickups[g].x * sc - 2, my + state.pickups[g].y * sc - 2, 4, 4); }
     for (var w = 0; w < state.opponents.length; w++) { ctx.fillStyle = '#48e'; ctx.fillRect(mx + state.opponents[w].x * sc - 2, my + state.opponents[w].y * sc - 2, 4, 4); }
     ctx.fillStyle = '#e44'; ctx.fillRect(mx + p.x * sc - 2, my + p.y * sc - 2, 4, 4);
+  }
 
+  function drawEnd() {
+    drawRun();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff'; ctx.font = '32px system-ui, sans-serif';
+    var pos = state.ranking.indexOf('player') + 1;
+    ctx.fillText('TIME — score ' + state.score + ', position ' + pos + '/' + state.ranking.length, 60, H / 2 - 20);
+    ctx.font = '18px system-ui, sans-serif';
+    for (var i = 0; i < state.ranking.length; i++) {
+      var id = state.ranking[i], sc = id === 'player' ? state.score : state.opponents[parseInt(id.slice(3), 10)].score;
+      ctx.fillText((i + 1) + '. ' + id + '  ' + sc, 60, H / 2 + 20 + i * 26);
+    }
+    ctx.fillStyle = '#bbb'; ctx.fillText('Enter for the start screen', 60, H / 2 + 20 + state.ranking.length * 26 + 10);
+  }
+
+  function frame() {
+    if (phase === 'menu') drawMenu();
+    else if (phase === 'run') { state = SimCore.step(state, input(), 1 / 60); drawRun(); if (state.finished) phase = 'end'; }
+    else drawEnd();
     requestAnimationFrame(frame);
   }
   frame();

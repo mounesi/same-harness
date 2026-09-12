@@ -266,23 +266,29 @@ function tape(seed) {
 console.log(JSON.stringify(results));
 """
 
-# racing-v2 — see specs/racing-v2.md §6. Every constant below is a spec constant.
+# racing-v2 (City Run) — see specs/racing-v2.md §6. Every constant below is a spec constant.
 HARNESS_V2_JS = r"""
 const S = globalThis.SimCore, V = globalThis.View;
 ok('SimCore global is defined', !!S);
 ok('View global is defined', !!V);
 if (!S || !V) { console.log(JSON.stringify(results)); process.exit(0); }
 const fns = (o, names) => names.every(n => typeof o[n] === 'function');
-ok('SimCore has create/step/hash', fns(S, ['create', 'step', 'hash']));
+ok('SimCore has presets/create/step/hash', fns(S, ['presets', 'create', 'step', 'hash']));
 ok('View has project', fns(V, ['project']));
-if (!fns(S, ['create', 'step', 'hash']) || !fns(V, ['project'])) {
+if (!fns(S, ['presets', 'create', 'step', 'hash']) || !fns(V, ['project'])) {
   console.log(JSON.stringify(results)); process.exit(0);
 }
 
 const TRACK = {width: 1000, height: 800, roadWidth: 120,
-  centerline: [{x: 150, y: 150}, {x: 850, y: 150}, {x: 850, y: 650}, {x: 150, y: 650}],
-  checkpoints: [{x: 150, y: 400, r: 40}, {x: 500, y: 150, r: 40}, {x: 850, y: 400, r: 40}, {x: 500, y: 650, r: 40}]};
-const CONFIG = {seed: 12345, laps: 3, opponents: 2, track: TRACK};
+  roads: [[{x: 150, y: 150}, {x: 850, y: 150}, {x: 850, y: 650}, {x: 150, y: 650}, {x: 150, y: 150}],
+          [{x: 500, y: 150}, {x: 500, y: 650}], [{x: 150, y: 400}, {x: 850, y: 400}]],
+  spawn: {x: 150, y: 400, heading: 0},
+  pickups: [[500, 400], [500, 150], [850, 400], [500, 650], [150, 150], [850, 150], [850, 650], [150, 650]]
+    .map(q => ({x: q[0], y: q[1], r: 30, value: 10}))};
+const CARS = [{id: 'balanced', accel: 1.00, turn: 1.00, mass: 1.0},
+              {id: 'sprint', accel: 1.15, turn: 0.90, mass: 0.8},
+              {id: 'heavy', accel: 0.90, turn: 0.85, mass: 1.3}];
+const CONFIG = {seed: 12345, time: 60, car: 0, opponents: 2, track: TRACK};
 const cfg = (over) => JSON.parse(JSON.stringify(Object.assign({}, CONFIG, over || {})));
 const withTrack = (over) => cfg({track: Object.assign({}, TRACK, over)});
 const NO_INPUT = {throttle: 0, brake: 0, steer: 0, boost: 0};
@@ -290,6 +296,20 @@ const FULL = {throttle: 1, brake: 0, steer: 0, boost: 0};
 const BOOST = {throttle: 1, brake: 0, steer: 0, boost: 1};
 const DT = 1 / 60;
 const cp = (s) => JSON.parse(JSON.stringify(s));
+const onWant = (accel) => (220.0 * accel * DT) * Math.pow(0.9, DT);
+
+// The harness's own road test, straight from §2.1, to validate preset maps.
+function segD2(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+  let t = l2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / l2 : 0; t = Math.max(0, Math.min(1, t));
+  const cx = ax + t * dx, cy = ay + t * dy; return (px - cx) ** 2 + (py - cy) ** 2;
+}
+function onRoad(track, x, y) {
+  let best = Infinity;
+  for (const road of track.roads) for (let i = 0; i + 1 < road.length; i++)
+    best = Math.min(best, segD2(x, y, road[i].x, road[i].y, road[i + 1].x, road[i + 1].y));
+  return best <= (track.roadWidth / 2) ** 2;
+}
 
 function withTraps(fn) {
   const savedRandom = Math.random, savedNow = Date.now;
@@ -309,6 +329,7 @@ function withTraps(fn) {
 
 try {
 const pure = withTraps(() => {
+  S.presets();
   const s = S.create(cfg());
   V.project({x: 1, y: 2, z: 0}, {x: 0, y: 0, z: 10, yaw: 0.3, pitch: -0.3, fov: 1, width: 800, height: 600});
   return S.hash(S.step(s, BOOST, DT));
@@ -316,22 +337,56 @@ const pure = withTraps(() => {
 ok('SimCore and View touch no browser globals or RNG', !pure.error,
    pure.error ? String(pure.error.message).slice(0, 160) : '');
 
-// --- create(): determinism, shape, serialisability, no mutation ------------------------
+// --- presets(): the start screen's options ----------------------------------------------
+{
+  const P = S.presets() || {};
+  ok('presets() reports the cars table exactly', JSON.stringify(P.cars) === JSON.stringify(CARS),
+     JSON.stringify(P.cars).slice(0, 200));
+  ok('presets() reports times [30, 60, 120]', JSON.stringify(P.times) === '[30,60,120]', JSON.stringify(P.times));
+  ok('presets() offers at least two maps', Array.isArray(P.tracks) && P.tracks.length >= 2,
+     'tracks: ' + (Array.isArray(P.tracks) ? P.tracks.length : typeof P.tracks));
+  let valid = true, why = '';
+  for (const [k, t] of (Array.isArray(P.tracks) ? P.tracks : []).entries()) {
+    const tr = t && t.track;
+    if (!tr || !t.name) { valid = false; why = 'entry ' + k + ' has no name/track'; break; }
+    if (!(tr.width > 0 && tr.height > 0 && tr.roadWidth > 0 && Array.isArray(tr.roads) && tr.roads.length >= 1 &&
+          tr.roads.every(r => Array.isArray(r) && r.length >= 2))) { valid = false; why = t.name + ': size/streets'; break; }
+    if (!(Array.isArray(tr.pickups) && tr.pickups.length >= 6 &&
+          tr.pickups.every(q => q.r > 0 && q.value >= 1 && onRoad(tr, q.x, q.y)))) { valid = false; why = t.name + ': needs >= 6 pickups, all on the road, r > 0, value >= 1'; break; }
+    if (!(tr.spawn && onRoad(tr, tr.spawn.x, tr.spawn.y))) { valid = false; why = t.name + ': spawn is off the road'; break; }
+  }
+  ok('every preset map is valid (streets, >= 6 pickups on the road, spawn on the road)', valid, why);
+  let runs = true, rwhy = '';
+  try {
+    for (const t of (Array.isArray(P.tracks) ? P.tracks : [])) for (let c = 0; c < 3; c++) for (const tm of [30, 60, 120]) {
+      let s = S.create({seed: 1, time: tm, car: c, opponents: 2, track: JSON.parse(JSON.stringify(t.track))});
+      for (let i = 0; i < 60; i++) s = S.step(s, FULL, DT);
+      if (typeof s.score !== 'number' || s.timeLimit !== tm || s.player.car !== c) throw new Error('bad state on ' + t.name);
+    }
+  } catch (e) { runs = false; rwhy = String(e).slice(0, 160); }
+  ok('a run can be created and stepped on every preset map, car and time', runs, rwhy);
+  ok('presets() is constant', JSON.stringify(P) === JSON.stringify(S.presets()));
+}
+
+// --- create(): determinism, shape, spawn, serialisability, no mutation ------------------
 const a = S.create(cfg()), b = S.create(cfg());
 ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
 {
   const s = a, p = s.player;
   ok('initial state carries the required fields',
-     s.t === 0 && s.laps === 3 && s.finished === false && s.lap === 0 && s.nextCheckpoint === 1 &&
-     s.lapStart === 0 && Array.isArray(s.lapTimes) && s.lapTimes.length === 0 && s.bestLap === null &&
-     !!p && p.speed === 0 && p.boostCharge === 1 && p.boostActive === 0 &&
-     Array.isArray(s.opponents) && s.opponents.length === 2 && Array.isArray(s.ranking),
-     JSON.stringify({t: s.t, laps: s.laps, finished: s.finished, lap: s.lap, nextCheckpoint: s.nextCheckpoint,
-                     lapStart: s.lapStart, lapTimes: s.lapTimes, bestLap: s.bestLap, player: p,
-                     opponents: (s.opponents || []).length, ranking: s.ranking}).slice(0, 200));
-  ok('every car starts at checkpoint 0 with speed 0, heading toward checkpoint 1',
-     near(p.x, 150) && near(p.y, 400) && near(p.heading, Math.atan2(150 - 400, 500 - 150), 1e-9) &&
-     s.opponents.every(o => near(o.x, 150) && near(o.y, 400) && o.speed === 0 && o.lap === 0 && o.nextCheckpoint === 1));
+     s.t === 0 && s.timeLimit === 60 && s.timeLeft === 60 && s.finished === false && s.score === 0 &&
+     s.crashes === 0 && s.round === 0 && !!p && p.speed === 0 && p.car === 0 && p.boostCharge === 1 &&
+     p.boostActive === 0 && Array.isArray(s.opponents) && s.opponents.length === 2 &&
+     Array.isArray(s.pickups) && s.pickups.length === 8 && s.pickups.every(q => q.taken === false && q.value === 10 && q.r === 30) &&
+     Array.isArray(s.ranking),
+     JSON.stringify({t: s.t, timeLimit: s.timeLimit, timeLeft: s.timeLeft, finished: s.finished, score: s.score,
+                     crashes: s.crashes, round: s.round, player: p, opponents: (s.opponents || []).length,
+                     pickups: (s.pickups || []).length}).slice(0, 220));
+  ok('the player spawns at spawn, facing spawn.heading', near(p.x, 150) && near(p.y, 400) && near(p.heading, 0, 1e-9));
+  ok('opponent i spawns 40*(i+1) units ahead along the spawn heading, facing the same way',
+     s.opponents.every((o, i) => near(o.x, 150 + 40 * (i + 1), 1e-6) && near(o.y, 400, 1e-6) && near(o.heading, 0, 1e-9) &&
+                                 o.speed === 0 && o.score === 0 && o.crashes === 0 && [0, 1, 2].includes(o.car)),
+     JSON.stringify(s.opponents.map(o => [o.x, o.y, o.heading, o.car])));
 }
 {
   let ser = true, detail = '';
@@ -348,35 +403,43 @@ ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
 // --- physics, hand-computed from the spec -----------------------------------------------
 {
   const s1 = S.step(S.create(cfg()), FULL, DT);
-  const want = (220.0 * DT) * Math.pow(0.9, DT);
-  ok('on the road: speed after one full-throttle step matches the spec',
-     near(s1.player.speed, want, 1e-4), 'want ' + want.toFixed(6) + ', got ' + String(s1.player.speed));
+  ok('on the road: speed after one full-throttle step matches the spec (balanced)',
+     near(s1.player.speed, onWant(1), 1e-4), 'want ' + onWant(1).toFixed(6) + ', got ' + String(s1.player.speed));
   ok('t advances by dt each step', near(s1.t, DT, 1e-12), 'got ' + String(s1.t));
+  const s2 = S.step(S.create(cfg({car: 1})), FULL, DT);
+  ok('the sprint car accelerates 1.15x', near(s2.player.speed, onWant(1.15), 1e-4), 'want ' + onWant(1.15).toFixed(6) + ', got ' + String(s2.player.speed));
+  const s3 = S.step(S.create(cfg({car: 2})), FULL, DT);
+  ok('the heavy car accelerates 0.9x', near(s3.player.speed, onWant(0.9), 1e-4), 'want ' + onWant(0.9).toFixed(6) + ', got ' + String(s3.player.speed));
+  // turn multiplier: at speed >= 60 the heading changes by steer * TURN_RATE * turn * dt
+  const turnOf = (car) => { const s = cp(S.create(cfg({car, opponents: 0}))); s.player.speed = 100; const n = S.step(s, {throttle: 0, brake: 0, steer: 1, boost: 0}, DT); return n.player.heading - s.player.heading; };
+  ok('the heavy car turns 0.85x, the sprint car 0.9x',
+     near(turnOf(0), 2.6 * DT, 1e-9) && near(turnOf(1), 2.6 * 0.9 * DT, 1e-9) && near(turnOf(2), 2.6 * 0.85 * DT, 1e-9),
+     JSON.stringify([turnOf(0), turnOf(1), turnOf(2)]));
 }
 {
-  // The road is elsewhere: the car at checkpoint 0 starts off-road.
-  const off = withTrack({centerline: [{x: 600, y: 100}, {x: 900, y: 100}, {x: 900, y: 300}, {x: 600, y: 300}]});
+  // Streets elsewhere: the car spawns off the road.
+  const off = withTrack({roads: [[{x: 600, y: 100}, {x: 900, y: 100}, {x: 900, y: 300}]]});
   const s1 = S.step(S.create(off), FULL, DT);
   const want = (220.0 * 0.5 * DT) * Math.pow(0.35, DT);
-  ok('off the road: ACCEL is halved and OFFROAD_DRAG applies',
+  ok('off the road: acceleration is halved and OFFROAD_DRAG applies',
      near(s1.player.speed, want, 1e-4), 'want ' + want.toFixed(6) + ', got ' + String(s1.player.speed));
-}
-{
-  // Exactly roadWidth/2 from a vertical segment: on the road (<=). Half a unit further: off.
-  const edgeOn = withTrack({centerline: [{x: 210, y: 100}, {x: 210, y: 700}, {x: 900, y: 700}, {x: 900, y: 100}]});
-  const edgeOff = withTrack({centerline: [{x: 210.5, y: 100}, {x: 210.5, y: 700}, {x: 900, y: 700}, {x: 900, y: 100}]});
-  const onWant = (220.0 * DT) * Math.pow(0.9, DT), offWant = (110.0 * DT) * Math.pow(0.35, DT);
+  // Exactly roadWidth/2 from a street: on the road (<=). Half a unit further: off.
+  const edgeOn = withTrack({roads: [[{x: 210, y: 100}, {x: 210, y: 700}]]});
+  const edgeOff = withTrack({roads: [[{x: 210.5, y: 100}, {x: 210.5, y: 700}]]});
+  const offWant = (110.0 * DT) * Math.pow(0.35, DT);
   ok('the road edge is inclusive (distance == roadWidth/2 is on the road)',
-     near(S.step(S.create(edgeOn), FULL, DT).player.speed, onWant, 1e-4));
+     near(S.step(S.create(edgeOn), FULL, DT).player.speed, onWant(1), 1e-4));
   ok('just past the road edge is off the road',
      near(S.step(S.create(edgeOff), FULL, DT).player.speed, offWant, 1e-4));
-  // The closing segment (last -> first) is part of the road too.
-  const closing = withTrack({centerline: [{x: 150, y: 100}, {x: 900, y: 100}, {x: 900, y: 700}, {x: 150, y: 700}]});
-  ok('the closing segment of the centerline counts as road',
-     near(S.step(S.create(closing), FULL, DT).player.speed, onWant, 1e-4));
+  // Street ends are rounded: 50 past an endpoint is still road, 65 is not.
+  const endOn = withTrack({roads: [[{x: 200, y: 400}, {x: 100, y: 400}]], spawn: {x: 250, y: 400, heading: 0}});
+  const endOff = withTrack({roads: [[{x: 200, y: 400}, {x: 100, y: 400}]], spawn: {x: 265, y: 400, heading: 0}});
+  ok('street ends are rounded (within roadWidth/2 of an endpoint is road)',
+     near(S.step(S.create(endOn), FULL, DT).player.speed, onWant(1), 1e-4) &&
+     near(S.step(S.create(endOff), FULL, DT).player.speed, offWant, 1e-4));
 }
 {
-  let s = S.create(cfg());
+  let s = S.create(cfg({opponents: 0}));
   for (let i = 0; i < 60; i++) s = S.step(s, FULL, DT);
   const fast = s.player.speed;
   for (let i = 0; i < 60; i++) s = S.step(s, NO_INPUT, DT);
@@ -390,8 +453,8 @@ ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
 {
   // Huge, all-road world so the clamp is reached rather than a wall.
   const big = cfg({opponents: 0, track: {width: 1e9, height: 1e9, roadWidth: 4e9,
-    centerline: [{x: 0, y: 0}, {x: 1e9, y: 0}, {x: 1e9, y: 1e9}, {x: 0, y: 1e9}],
-    checkpoints: [{x: 5e8, y: 5e8, r: 40}, {x: 5e8 + 1e6, y: 5e8, r: 40}, {x: 5e8, y: 5e8 + 1e6, r: 40}]}});
+    roads: [[{x: 0, y: 5e8}, {x: 1e9, y: 5e8}]], spawn: {x: 5e8, y: 5e8, heading: 0},
+    pickups: [1, 2, 3, 4, 5, 6].map(i => ({x: 5e8 + i * 1e7, y: 5e8, r: 30, value: 10}))}});
   let s = S.create(big);
   for (let i = 0; i < 3600; i++) s = S.step(s, FULL, DT);
   ok('speed is clamped to MAX_SPEED and actually reaches it',
@@ -402,11 +465,9 @@ ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
      peak > 320 && peak <= 400 + 1e-6, 'peak ' + peak.toFixed(3));
 }
 {
-  // Aimed at the left wall from 30 units away: clamp to x = 0 and stop.
-  const wall = cfg({opponents: 0, track: {width: 1000, height: 800, roadWidth: 120,
-    centerline: [{x: 0, y: 380}, {x: 200, y: 380}, {x: 200, y: 420}, {x: 0, y: 420}],
-    checkpoints: [{x: 30, y: 400, r: 10}, {x: 5, y: 400, r: 1}, {x: 300, y: 400, r: 10}]}});
-  let s = S.create(wall);
+  // Facing the left wall from 30 units away: clamp to x = 0 and stop.
+  const wall = withTrack({roads: [[{x: 0, y: 400}, {x: 300, y: 400}]], spawn: {x: 30, y: 400, heading: Math.PI}});
+  let s = S.create(cfg({opponents: 0, track: wall.track}));
   for (let i = 0; i < 120; i++) s = S.step(s, FULL, DT);
   ok('walls clamp the position and zero the speed', s.player.x === 0 && s.player.speed === 0,
      'x ' + s.player.x + ' speed ' + s.player.speed);
@@ -436,41 +497,73 @@ ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
   ok('boost: re-activates once the charge is full', s3.player.boostActive > 0 && s3.player.boostCharge === 0);
 }
 
-// --- checkpoints, laps, finish ------------------------------------------------------------
+// --- collisions ----------------------------------------------------------------------------
 {
-  const cps = TRACK.checkpoints;
-  const s0 = S.create(cfg({opponents: 0}));
-  const cheat = cp(s0); cheat.player.x = cps[3].x; cheat.player.y = cps[3].y;
-  const after = S.step(cheat, NO_INPUT, DT);
-  ok('out-of-order checkpoint contact is ignored', after.nextCheckpoint === 1 && after.lap === 0);
-  const legit = cp(s0); legit.player.x = cps[1].x; legit.player.y = cps[1].y;
-  ok('in-order checkpoint contact advances exactly one', S.step(legit, NO_INPUT, DT).nextCheckpoint === 2);
-  // Touching the LAST checkpoint wraps nextCheckpoint to 0 and credits the lap (§2.3);
-  // the start/finish circle is then simply the next target.
-  const circuit = (start, idxs) => {
-    let s = start;
-    for (const idx of idxs) { s = cp(s); s.player.x = cps[idx].x; s.player.y = cps[idx].y; s = S.step(s, NO_INPUT, DT); }
+  const base = S.create(cfg({opponents: 1}));
+  const place = (px, py, ox, oy) => {
+    const s = cp(base);
+    s.player.x = px; s.player.y = py; s.player.heading = 0; s.player.speed = 100;
+    s.opponents[0].x = ox; s.opponents[0].y = oy; s.opponents[0].heading = 0; s.opponents[0].speed = 0;
     return s;
   };
-  const s3 = circuit(s0, [1, 2, 3]);
-  ok('one full ordered circuit increments lap exactly once', s3.lap === 1 && s3.nextCheckpoint === 0, 'lap ' + s3.lap + ' next ' + s3.nextCheckpoint);
-  ok('a completed lap records its time, bestLap and lapStart',
-     s3.lapTimes.length === 1 && near(s3.lapTimes[0], 3 * DT, 1e-6) && near(s3.bestLap, s3.lapTimes[0], 1e-9) && near(s3.lapStart, s3.t, 1e-9),
-     JSON.stringify({lapTimes: s3.lapTimes, bestLap: s3.bestLap, lapStart: s3.lapStart, t: s3.t}));
-  const s = circuit(s3, [0]);
-  ok('passing the start/finish circle again does not count a second lap', s.lap === 1 && s.nextCheckpoint === 1 && s.lapTimes.length === 1);
-  ok('not finished before `laps` laps', s.finished === false);
-  const f = circuit(S.create(cfg({laps: 1, opponents: 0})), [1, 2, 3]);
-  ok('finished once `laps` laps are complete', f.finished === true);
-  const h = S.hash(f), g = S.step(f, BOOST, DT);
-  ok('a finished state is frozen (step returns an identical state)', S.hash(g) === h && near(g.t, f.t, 1e-12));
+  const hit = S.step(place(400, 400, 412, 400), NO_INPUT, DT);      // will overlap after moving
+  const freeP = S.step(place(400, 400, 900, 620), NO_INPUT, DT);    // the player, undisturbed
+  const freeO = S.step(place(400, 700, 412, 400), NO_INPUT, DT);    // the opponent, undisturbed
+  const mo = CARS[base.opponents[0].car].mass, mp = CARS[0].mass;
+  const fp = 1 - 0.6 * mo / (mp + mo), fo = 1 - 0.6 * mp / (mp + mo);
+  const d = Math.hypot(hit.player.x - hit.opponents[0].x, hit.player.y - hit.opponents[0].y);
+  ok('collision: overlapping cars are pushed to exactly 2 * CAR_RADIUS apart', near(d, 20, 1e-6), 'distance ' + d);
+  ok('collision: both cars slow by the mass rule',
+     near(hit.player.speed, freeP.player.speed * fp, 1e-6) && near(hit.opponents[0].speed, freeO.opponents[0].speed * fo, 1e-6),
+     JSON.stringify({player: [hit.player.speed, freeP.player.speed * fp], opponent: [hit.opponents[0].speed, freeO.opponents[0].speed * fo], mo}));
+  ok('collision: both cars lose CRASH_PENALTY and count a crash',
+     hit.score === -25 && hit.crashes === 1 && hit.opponents[0].score === -25 && hit.opponents[0].crashes === 1,
+     JSON.stringify({score: hit.score, crashes: hit.crashes, opp: [hit.opponents[0].score, hit.opponents[0].crashes]}));
+  ok('no collision when the cars are apart', freeP.score === 0 && freeP.crashes === 0);
+  const rest = cp(hit); rest.player.speed = 0;
+  const again = S.step(rest, NO_INPUT, DT);
+  ok('a touching pair does not crash again unless it closes in', again.crashes === 1 && again.score === -25,
+     JSON.stringify({crashes: again.crashes, score: again.score}));
 }
 
-// --- opponents ----------------------------------------------------------------------------
+// --- pickups ----------------------------------------------------------------------------------
+{
+  const pk = TRACK.pickups;
+  let s = cp(S.create(cfg({opponents: 0})));
+  s.player.x = pk[0].x; s.player.y = pk[0].y; s = S.step(s, NO_INPUT, DT);
+  ok('reaching a pickup scores its value and marks it taken', s.score === 10 && s.pickups[0].taken === true,
+     JSON.stringify({score: s.score, taken: s.pickups[0].taken}));
+  s = S.step(s, NO_INPUT, DT);
+  ok('a taken pickup does not score again', s.score === 10, 'score ' + s.score);
+  for (let i = 1; i < pk.length; i++) { s = cp(s); s.player.x = pk[i].x; s.player.y = pk[i].y; s = S.step(s, NO_INPUT, DT); }
+  ok('clearing the set resets every pickup and increments round',
+     s.score === 80 && s.round === 1 && s.pickups.every(q => q.taken === false),
+     JSON.stringify({score: s.score, round: s.round, taken: s.pickups.map(q => q.taken)}));
+  s = S.step(s, NO_INPUT, DT);
+  ok('after the reset the pickup under the car scores again', s.score === 90, 'score ' + s.score);
+  const near1 = cp(S.create(cfg({opponents: 0}))); near1.player.x = pk[0].x + 29; near1.player.y = pk[0].y;
+  const far1 = cp(S.create(cfg({opponents: 0}))); far1.player.x = pk[0].x + 31; far1.player.y = pk[0].y;
+  ok('a pickup counts within r and not beyond it',
+     S.step(near1, NO_INPUT, DT).score === 10 && S.step(far1, NO_INPUT, DT).score === 0);
+}
+
+// --- the timer ------------------------------------------------------------------------------
+{
+  let s = S.create(cfg({time: 30, opponents: 0}));
+  for (let i = 0; i < 1798; i++) s = S.step(s, NO_INPUT, DT);
+  ok('not finished before the time limit', s.finished === false && s.timeLeft > 0, JSON.stringify({t: s.t, timeLeft: s.timeLeft}));
+  for (let i = 0; i < 4; i++) s = S.step(s, NO_INPUT, DT);
+  ok('finished once t reaches the time limit, with timeLeft 0', s.finished === true && s.timeLeft === 0,
+     JSON.stringify({t: s.t, timeLeft: s.timeLeft, finished: s.finished}));
+  const h = S.hash(s), g = S.step(s, BOOST, DT);
+  ok('a finished state is frozen (step returns an identical state)', S.hash(g) === h && near(g.t, s.t, 1e-12));
+}
+
+// --- opponents --------------------------------------------------------------------------------
 {
   let s = S.create(cfg()), inWorld = true, underCap = true, perm = true;
   const ids = ['player', 'opp0', 'opp1'];
-  for (let i = 0; i < 3600; i++) {
+  for (let i = 0; i < 1800; i++) {
     s = S.step(s, NO_INPUT, DT);
     for (const o of s.opponents) {
       if (!(o.x >= 0 && o.x <= 1000 && o.y >= 0 && o.y <= 800)) inWorld = false;
@@ -484,20 +577,29 @@ ok('create() is deterministic for one config', S.hash(a) === S.hash(b));
   ok('opponents: the configured count', s.opponents.length === 2);
   ok('opponents stay inside the world', inWorld);
   ok('opponents never exceed MAX_SPEED (no boost for the AI)', underCap);
-  const best = Math.max(...s.opponents.map(o => o.lap | 0));
-  ok('opponents are competent: a lap within 60 s on the standard track', best >= 1, 'best opponent lap ' + best);
+  ok('opponents are competent: a pickup within 30 s on the standard map',
+     s.round > 0 || s.pickups.some(q => q.taken), JSON.stringify({round: s.round, taken: s.pickups.filter(q => q.taken).length, scores: s.opponents.map(o => o.score)}));
   ok('ranking is always a permutation of the car ids', perm);
   const run = (seed) => { let x = S.create(cfg({seed})); for (let i = 0; i < 600; i++) x = S.step(x, NO_INPUT, DT); return S.hash(x); };
   ok('opponents are seeded: a different seed changes the state', run(12345) !== run(54321));
   const q = S.create(cfg()), q2 = cp(q); q2.opponents[0].x += 1;
   ok('hash changes when an opponent moves', S.hash(q) !== S.hash(q2));
-  const l1 = cp(q); l1.lap = 5;
-  ok('a car with more laps ranks first (player)', S.step(l1, NO_INPUT, DT).ranking[0] === 'player');
-  const l2 = cp(q); l2.opponents[1].lap = 5;
-  ok('a car with more laps ranks first (opponent)', S.step(l2, NO_INPUT, DT).ranking[0] === 'opp1');
+  const q3 = cp(q); q3.pickups[2].taken = true;
+  ok('hash changes when a pickup is taken', S.hash(q) !== S.hash(q3));
 }
 
-// --- determinism over a long input tape ------------------------------------------------
+// --- ranking ------------------------------------------------------------------------------------
+{
+  const q = S.create(cfg());
+  ok('ranking: on a full tie the player is first, then opponents by index',
+     JSON.stringify(S.step(q, NO_INPUT, DT).ranking) === JSON.stringify(['player', 'opp0', 'opp1']), JSON.stringify(q.ranking));
+  const r1 = cp(q); r1.opponents[1].score = 50;
+  ok('ranking: the highest score ranks first', S.step(r1, NO_INPUT, DT).ranking[0] === 'opp1');
+  const r2 = cp(q); r2.opponents[0].score = 50; r2.opponents[1].score = 50;
+  ok('ranking: tied opponents keep index order', JSON.stringify(S.step(r2, NO_INPUT, DT).ranking) === JSON.stringify(['opp0', 'opp1', 'player']));
+}
+
+// --- determinism over a long input tape --------------------------------------------------
 function tape(seed) {
   let x = seed >>> 0;
   const next = () => (x = (x * 1664525 + 1013904223) >>> 0) / 4294967296;
@@ -536,7 +638,7 @@ function tape(seed) {
   const c2 = V.project({x: 0, y: 100, z: 0}, Object.assign({}, cam, {yaw: Math.PI / 2}));
   ok('View: yaw follows the heading convention', near(c2.sx, 400, 1e-6) && near(c2.sy, 300, 1e-6) && c2.depth > 0, JSON.stringify(c2));
   const d = V.project({x: 100, y: 0, z: 0}, Object.assign({}, cam, {pitch: -0.3}));
-  ok('View: negative pitch looks down (a point ahead on the plane rises on screen)', d.sy < 300 && d.depth > 0, JSON.stringify(d));
+  ok('View: negative pitch looks down (a point ahead on the ground rises on screen)', d.sy < 300 && d.depth > 0, JSON.stringify(d));
   const up = V.project({x: 100, y: 0, z: 20}, cam);
   ok('View: +z is up on screen', up.sy < 300, 'sy ' + up.sy);
 }
