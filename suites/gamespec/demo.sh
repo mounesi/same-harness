@@ -163,8 +163,16 @@ for diff in "$LOCAL"/patches/*/pass-*.diff; do
   out="$LOCAL/built/$iid/$pass"; rm -rf "$out"
   if game="$(cd "$HERE" && "$REBUILD_PY" -m harness.adapters.gamespec rebuild "$iid" "$diff" "$out" 2>"$LOCAL/rebuild-$iid-$pass.err")"; then
     info "$iid $pass: rebuilt -> $game"
-    spec_flag=(); [[ "$iid" == "racing-v1" ]] || spec_flag=(--spec "$iid")
-    "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" "${spec_flag[@]}" || true
+    # Not an array: bash 3.2 (macOS's default /bin/bash) treats "${arr[@]}" on an EMPTY
+    # array as an unbound-variable error under `set -u`, which aborts the whole script —
+    # observed live (AI-3240, 2026-09-12): racing-v1 rebuilt, then this line killed the
+    # loop before racing-v2 was even attempted. Instance ids are ^[A-Za-z0-9._-]+$
+    # (CONTRACTS §5.1), so unquoted word-splitting below can never do anything surprising.
+    if [[ "$iid" == "racing-v1" ]]; then
+      "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" || true
+    else
+      "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" --spec "$iid" || true
+    fi
   else
     info "$iid $pass: could not rebuild the deliverable: $(tail -1 "$LOCAL/rebuild-$iid-$pass.err")"
   fi
