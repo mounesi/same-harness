@@ -1,24 +1,25 @@
 {
-  "count": 1,
-  "frozen_at": "2026-09-11T00:00:00Z",
+  "count": 2,
+  "frozen_at": "2026-09-11T13:30:00Z",
   "instance_ids": [
-    "racing-v1"
+    "racing-v1",
+    "racing-v2"
   ],
-  "instance_ids_sha256": "c4f4599e7eb16529daedab6ce0865f742cb7e1dfbbc6b0dc9cc43e04d81e315d",
+  "instance_ids_sha256": "ee7f2f64967f98f1bdd3c48d886b9d1b4fd4636d6adac9e6d29df3a39eb3aa19",
   "schema": "suite-seed/v1",
   "selection": {
     "algorithm": "sorted(p.stem for p in Path('suites/gamespec/specs').glob('*.md'))  # every spec, no sampling",
     "method": "full-enumeration",
     "seed": 20260830,
-    "selected_at": "2026-09-11T00:00:00Z",
-    "selector": "by hand (one spec exists)",
+    "selected_at": "2026-09-11T13:30:00Z",
+    "selector": "by hand (two specs exist)",
     "selector_version": "1.0.0",
     "stratified_by": null
   },
   "source": {
     "dataset": "suites/gamespec/specs",
     "population_ids_sha256": null,
-    "population_size": 1,
+    "population_size": 2,
     "revision": "in-tree (spec sha256 recorded per task in metadata.spec_sha256)",
     "split": "specs"
   },

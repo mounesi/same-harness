@@ -36,3 +36,7 @@ venv/
 # "Every model declares a tool-call parser" guard — and it leaves the tree dirty, which
 # marks any run made from this checkout flags.nonconformant.
 models.d/smoke-model.env
+
+# working folder of exported runs (suites/gamespec/export_run.py); raw results stay out of git
+output/*
+!output/README.md

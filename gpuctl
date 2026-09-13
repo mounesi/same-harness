@@ -165,6 +165,35 @@ assert_weights_mounted() { # ip dir — refuse to download onto ephemeral disk
   sshto "$ip" "mkdir -p '$dir'"
 }
 
+ship_repo_tarball() { # <out.tgz> — the checkout as the instance must see it: WITH a real .git
+  # A linked worktree (`git worktree add`, which is what a Claude Code session checks out)
+  # has no .git DIRECTORY: .git is a one-line pointer file into the main checkout's
+  # .git/worktrees/<name>. Shipped as-is, the instance sees a dangling pointer, `git
+  # rev-parse` answers "not a git work tree", and run.sh refuses to start — harness.
+  # repo_git_sha is REQUIRED provenance (CONTRACTS.md §2). Observed on the first gamespec
+  # demo (AI-3230, 2026-09-11): vLLM up, endpoint matched, manifest build exit 3, ~10 min
+  # of H100 for nothing. So when .git is a file, clone the worktree into a staging dir —
+  # a clone from a linked worktree yields a real repository at the same HEAD — and lay the
+  # working tree over it so uncommitted edits travel exactly as they do from a normal
+  # checkout (run.sh then records them as `dirty`, which is the truth).
+  local out="$1" src="$HERE" stage=""
+  if [[ -f "$HERE/.git" ]]; then
+    stage="$(mktemp -d "${TMPDIR:-/tmp}/gpuctl-stage-XXXXXX")"
+    info "checkout is a linked worktree — staging a real repository for the instance"
+    git clone -q --no-hardlinks "$HERE" "$stage/repo" \
+      || die "could not clone the worktree to stage a shippable repository"
+    tar --no-xattrs -cf - -C "$HERE" --exclude=.git --exclude=.github --exclude=.state . \
+      | tar -xf - -C "$stage/repo"
+    src="$stage/repo"
+  fi
+  # --no-xattrs: bsdtar on macOS records com.apple.provenance as an extended-header
+  # keyword, and GNU tar on the instance prints a warning line for EVERY file it does
+  # not recognise — ~30 lines that bury anything real in the upload output.
+  tar --no-xattrs -czf "$out" -C "$src" --exclude=.github --exclude=.state .
+  [[ -n "$stage" ]] && rm -rf "$stage"
+  return 0
+}
+
 cmd_up() {
   need_key
   local model="" hold="2h" serve=0
@@ -194,10 +223,7 @@ cmd_up() {
     local weights_dir; weights_dir="$(weights_dir_for_fs)"
     info "weights dir: $weights_dir"
     info "shipping the repo and starting vLLM (this is the slow part — weights download on first use)"
-    # --no-xattrs: bsdtar on macOS records com.apple.provenance as an extended-header
-    # keyword, and GNU tar on the instance prints a warning line for EVERY file it does
-    # not recognise — ~30 lines that bury anything real in the upload output.
-    # .git SHIPS. harness/manifest.py resolves harness.repo_git_sha with `git rev-parse
+    # .git SHIPS (a REAL one — see ship_repo_tarball for the linked-worktree case). harness/manifest.py resolves harness.repo_git_sha with `git rev-parse
     # HEAD`, and that field is REQUIRED provenance (CONTRACTS.md §2) — not merely nice to
     # have. Without it run.sh does not produce a nonconformant run, it refuses to start:
     #     error: manifest: REQUIRED provenance could not be resolved: harness.repo_git_sha
@@ -208,7 +234,7 @@ cmd_up() {
     # shipped the whole checkout for precisely this reason, with a comment saying so; the
     # two paths simply disagreed, and only the CI one was ever exercised.
     # It costs 2.5 MB.
-    tar --no-xattrs -czf /tmp/gpuctl-repo.tgz -C "$HERE" --exclude=.github --exclude=.state .
+    ship_repo_tarball /tmp/gpuctl-repo.tgz
     scp -q /tmp/gpuctl-repo.tgz "$SSH_USER@$ip:~/"
     sshto "$ip" "mkdir -p ~/harness-repo && tar -xzf ~/repo.tgz -C ~/harness-repo 2>/dev/null || tar -xzf ~/gpuctl-repo.tgz -C ~/harness-repo"
     assert_weights_mounted "$ip" "$weights_dir"

@@ -520,21 +520,22 @@ run_dir = pathlib.Path(sys.argv[1])
 recs = [json.loads(l) for l in (run_dir / "results.jsonl").read_text().splitlines() if l.strip()]
 def die(m):
     print("  \033[31mFAIL\033[0m " + m); sys.exit(1)
-if len(recs) != 1:
-    die("expected exactly 1 gamespec record, got %d" % len(recs))
-r = recs[0]
-if r.get("instance_id") != "racing-v1":
-    die("record is for %r, not racing-v1" % r.get("instance_id"))
-g = r.get("grade") or {}
-if g.get("grader") != "gamespec-floor":
-    die("grader is %r, expected gamespec-floor" % g.get("grader"))
-if r.get("resolved") is not True:
-    die("reference game.html did not clear the floor: %s / %s" % (r.get("error_code"), g.get("detail")))
-patch = run_dir / "patches" / "racing-v1" / "pass-0.diff"
-if not patch.is_file() or "game.html" not in patch.read_text():
-    die("the captured patch does not contain game.html")
-print("  \033[32mok\033[0m   racing-v1 graded resolved=true by gamespec-floor (fail_to_pass %s)" % g.get("fail_to_pass"))
-print("  \033[32mok\033[0m   patches/racing-v1/pass-0.diff carries game.html")
+want = {"racing-v1", "racing-v2"}
+got = {r.get("instance_id") for r in recs}
+if len(recs) != 2 or got != want:
+    die("expected one record per spec %s, got %s" % (sorted(want), sorted(got)))
+for r in recs:
+    g = r.get("grade") or {}
+    if g.get("grader") != "gamespec-floor":
+        die("%s: grader is %r, expected gamespec-floor" % (r.get("instance_id"), g.get("grader")))
+    if r.get("resolved") is not True:
+        die("%s: the reference game.html did not clear its floor: %s / %s"
+            % (r.get("instance_id"), r.get("error_code"), r.get("error_detail")))
+    patch = run_dir / "patches" / r["instance_id"] / "pass-0.diff"
+    if not patch.is_file() or "game.html" not in patch.read_text():
+        die("%s: the captured patch does not contain game.html" % r.get("instance_id"))
+    print("  \033[32mok\033[0m   %s graded resolved=true by gamespec-floor (fail_to_pass %s); patch carries game.html"
+          % (r["instance_id"], g.get("fail_to_pass")))
 PYGS
 fi
 

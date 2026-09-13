@@ -1,7 +1,11 @@
 # gamespec — build-a-game suite, with a human judging channel
 
 **Status: one spec written and validated, floor check working, adapter wired in
-(`harness/adapters/gamespec.py`), smoke-tested against the mock endpoint. No model run yet.**
+(`harness/adapters/gamespec.py`), smoke-tested against the mock endpoint, and run once for
+real (2026-09-11, `shakedown-qwen30b` on 1× H100 via `demo.sh`): the model produced a
+4.9 KB `game.html` in 137 s / 26 iterations and failed the floor — its `step()` read a
+`config` that was not in scope, so the first physics step threw. Pipeline proven; the
+one-spec, one-pass budget question in "What building the suite still needs" is now live.**
 
 Run it against a served model exactly like the other suites — `./harness/run.sh --model <m>
 --suite gamespec --passes 1 --out ~/results` — or, from a laptop with `LAMBDA_API_KEY`
@@ -96,7 +100,9 @@ reaches for any of them is caught while the untouched renderer is not.
 |---|---|
 | `specs/racing-v1.md` | the brief handed to the model — precise on simulation, silent on look and feel |
 | `specs/racing-v1.reference.html` | reference implementation. Deliberately plain |
-| `floor_check.py` | `python3 suites/gamespec/floor_check.py <game.html> [--json]` |
+| `specs/racing-v2.md` | the harder brief, "City Run": an 8-level campaign (fixed table of time / target / opponents / time of day, won by reaching the target before the clock runs out) plus a free run (30 / 60 / 120 s), through a city of streets and off-road surfaces; points for reaching pickups, points lost for every crash into the seeded AI traffic; a boost; day, dusk, night and dawn; procedural music; a **3D** perspective view with a checkable `View.project`, and a checkable `View.scenery` whose buildings must stand off the streets |
+| `specs/racing-v2.reference.html` | its reference: text start screen (mode, road, car, time), two preset maps, software pinhole projection onto a 2D canvas, buildings with window grids, lamps and trees, day/night palettes with headlights, a three-oscillator music loop. Deliberately plain |
+| `floor_check.py` | `python3 suites/gamespec/floor_check.py <game.html> [--json] [--spec racing-v2]` — one floor per spec, default `racing-v1` |
 
 ### The reference implementation is a spec-debugging tool, not a target
 
@@ -121,7 +127,7 @@ passes for the wrong reason is worse than no check: it reports coverage it does 
    the model's `game.html` reaches `grade()` as a new-file diff, and `grade()` always runs
    the **repo's** `floor_check.py`, never the workspace copy the model could have edited.
    `resolved` = the floor passed in full; `fail_to_pass` is the single node `floor`.
-2. **More specs.** One spec is one task; the harness reports rates. Three or four specs at
+2. ~~**More specs.**~~ — two now (`racing-v1`, `racing-v2`); a non-racing one (flight-over-city, a logistics sim) is still the next step. **More specs.** One spec is one task; the harness reports rates. Three or four specs at
    varying difficulty (racing, flight-over-city, a logistics sim to make the enterprise
    framing explicit) is the minimum for a meaningful comparison.
 3. **The judging harness** — serve two builds side by side, randomise order, record votes

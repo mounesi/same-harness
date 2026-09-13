@@ -13,8 +13,8 @@ Scripted behaviour, chosen by $MOCK_MODE:
     solve   the model emits a tool call writing the correct fix, then stops    -> resolved
     noop    the model answers in prose and never edits anything               -> NO_PATCH
     flaky   fails with 503 twice, then behaves like `solve`     -> exercises the retry path
-    gamespec  reads SPEC.md, writes suites/gamespec/specs/racing-v1.reference.html as
-              game.html, runs the floor check, then stops          -> resolved (gamespec)
+    gamespec  reads SPEC.md, writes the matching suites/gamespec/specs/<spec>.reference.html
+              as game.html, runs the floor check, then stops        -> resolved (gamespec)
 
 Tool calling is OFF unless you launch it on, exactly as in vLLM. The agent loop sends
 `tool_choice: "auto"` on every call (harness/agent.py:_payload), and vLLM answers HTTP 400
@@ -73,10 +73,16 @@ FIX_NEW = "    if b == 0:\n        return None\n    return a / b"
 # The deliverable the "gamespec" mode writes: the suite's own reference implementation,
 # which floor_check.py is known to pass (ci.yml runs that check on every push). Read lazily
 # so the other modes never depend on the file.
-GAMESPEC_REFERENCE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..",
-    "suites", "gamespec", "specs", "racing-v1.reference.html",
-)
+GAMESPEC_SPECS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "suites", "gamespec", "specs")
+
+
+def _gamespec_reference(tool_results: list) -> str:
+    """The reference for whichever spec SPEC.md turned out to be (racing-v1 by default)."""
+    text = " ".join(str(m.get("content") or "") for m in tool_results)
+    for name in ("racing-v2",):
+        if "# " + name in text:
+            return os.path.join(GAMESPEC_SPECS_DIR, name + ".reference.html")
+    return os.path.join(GAMESPEC_SPECS_DIR, "racing-v1.reference.html")
 
 
 def _tool_call(call_id: str, name: str, args: dict) -> dict:
@@ -100,7 +106,7 @@ def _reply(messages: list, tools_seen: bool) -> dict:
             return {"role": "assistant", "content": None,
                     "tool_calls": [_tool_call("call_1", "read_file", {"path": "SPEC.md"})]}
         if len(tool_results) == 1:
-            with open(GAMESPEC_REFERENCE, encoding="utf-8") as fh:
+            with open(_gamespec_reference(tool_results), encoding="utf-8") as fh:
                 html = fh.read()
             return {"role": "assistant", "content": None,
                     "tool_calls": [_tool_call("call_2", "create_file",
