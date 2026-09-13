@@ -310,10 +310,10 @@ def write_index(out_root: Path) -> None:
                              for a in meta.get("attempts", []))
         floors = ", ".join(("PASS" if (g.get("floor") or {}).get("passed") else "FAIL") for g in meta.get("games", [])) or "-"
         rows.append((meta.get("started_at") or "", meta.get("model"), meta["run_id"],
-                     m.get("suite", {}).get("name"), m.get("hardware", {}).get("instance_type"),
+                     m.get("suite", {}).get("name"), ", ".join(meta.get("instances") or []),
                      verdicts, floors, meta_path.parent.relative_to(out_root).as_posix()))
     lines = ["# Exported runs", "", "One folder per model, one per run. Newest first.", "",
-             "| started (UTC) | model | run id | suite | instance | verdicts | floor | folder |", "|---|---|---|---|---|---|---|---|"]
+             "| started (UTC) | model | run id | suite | spec instance(s) | verdicts | floor | folder |", "|---|---|---|---|---|---|---|---|"]
     for r in sorted(rows, reverse=True):
         lines.append(f"| {r[0]} | {r[1]} | `{r[2]}` | {r[3]} | {r[4]} | {r[5]} | {r[6]} | [{r[7]}]({r[7]}/README.md) |")
     (out_root / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -331,7 +331,7 @@ def write_index(out_root: Path) -> None:
            'side-by-side page for any two.</p>']
     for model in sorted(by_model):
         html.append(f"<h2>{esc(model)}</h2><table><tr><th>started (UTC)</th><th>run id</th>"
-                    "<th>suite</th><th>instance</th><th>verdicts</th><th>floor</th><th></th></tr>")
+                    "<th>suite</th><th>spec instance(s)</th><th>verdicts</th><th>floor</th><th></th></tr>")
         for r in sorted(by_model[model], reverse=True):
             folder = r[7]
             html.append("<tr>"
