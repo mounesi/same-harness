@@ -56,25 +56,67 @@ UP="$("$HERE/gpuctl" up "$MODEL" --serve --hold "$HOLD" | tail -n1)"
 IP="$(awk '{print $2}' <<<"$UP")"
 [[ -n "$IP" ]] || die "gpuctl up printed no IP: $UP"
 info "instance is up at $IP and serving $MODEL"
+# The harness must be told where the weights are, the same way benchmark.yml tells it:
+# run.sh defaults WEIGHTS_DIR to /persistent/models, else ~/models, and the persistent
+# filesystem is mounted at neither. Without this the manifest cannot resolve
+# model.weight_digest (REQUIRED) and refuses to start — the first demo lost ~10 min of
+# H100 to exactly that. Resolved from the API like gpuctl does, not guessed.
+MOUNT="$("$HERE/lambdactl" fs "$LAMBDA_FS" | awk '{print $3}')"
+[[ -n "$MOUNT" && "$MOUNT" != "-" ]] || die "filesystem '$LAMBDA_FS' reports no mount point"
+WEIGHTS_DIR="${WEIGHTS_DIR_OVERRIDE:-$MOUNT/models}"
+info "weights dir for the harness: $WEIGHTS_DIR"
 
+RUN_ID=""; LOCAL=""
+export_run() { # lay the run out under output/runs/<model>/<run_id>/ — README, metadata, game, zip
+  [[ -n "$RUN_ID" && -d "$LOCAL" && -f "$LOCAL/run-manifest.json" ]] || return 0
+  local bundle="$HERE/results/pulled/${PREFIX:-sh-}${GPU_USER:-${USER:-me}}-$MODEL"
+  local args=("$LOCAL"); [[ -d "$bundle" ]] && args+=(--bundle-dir "$bundle")
+  local dest
+  if dest="$(cd "$HERE" && "${HARNESS_PYTHON:-python3}" suites/gamespec/export_run.py "${args[@]}" 2>"$LOCAL/export.err")"; then
+    info "exported -> ${dest#$HERE/}  (see output/runs/index.md)"
+  else
+    echo "WARNING: export_run.py failed: $(tail -1 "$LOCAL/export.err")" >&2
+  fi
+}
 teardown() {
   if (( KEEP_UP )); then
     info "--keep-up: leaving the instance running. It is leased for $HOLD; ./gpuctl down when done."
+    export_run
     return
   fi
   info "tearing down (gpuctl down retrieves any sealed bundle first)"
   "$HERE/gpuctl" down --yes || echo "WARNING: gpuctl down failed — run ./gpuctl status and ./gpuctl down by hand" >&2
+  export_run
 }
 trap teardown EXIT
 
 sshto() { ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$SSH_USER@$IP" "$@"; }
 
+# ---- 1b. node — the one grading dependency the Lambda image does NOT carry -----------
+# suites/gamespec/floor_check.py drives SimCore headlessly in node, and grading preflight
+# (tier 3) refuses to start a run on a host without it — which is exactly what the second
+# demo hit, after vLLM was already serving (~17 min of H100). A pinned LTS tarball goes into
+# the venv's own bin/, the directory the harness step already puts first on PATH, so no
+# sudo, no apt, and the version is the same on every box.
+NODE_VERSION="${NODE_VERSION:-22.12.0}"
+NODE_SHA256="${NODE_SHA256:-22982235e1b71fa8850f82edd09cdae7e3f32df1764a9ec298c72d25ef2c164f}"
+info "ensuring node $NODE_VERSION is in ~/$VENV_NAME/bin"
+sshto "set -e
+if ~/$VENV_NAME/bin/node --version 2>/dev/null | grep -qx 'v$NODE_VERSION'; then echo 'node already present'; exit 0; fi
+cd /tmp && curl -fsSLO 'https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.xz'
+echo '$NODE_SHA256  node-v$NODE_VERSION-linux-x64.tar.xz' | sha256sum -c - >/dev/null
+tar -xJf node-v$NODE_VERSION-linux-x64.tar.xz -C ~/$VENV_NAME --strip-components=1 --exclude='*/share' --exclude='*/include' --exclude='CHANGELOG.md' --exclude='README.md' --exclude='LICENSE'
+rm -f node-v$NODE_VERSION-linux-x64.tar.xz
+~/$VENV_NAME/bin/node --version" || die "could not install node into the venv on the instance"
+
 # ---- 2. run the suite -----------------------------------------------------------------
 # Same PATH/HARNESS_PYTHON pair RUNBOOK §1.4 and benchmark.yml export: the venv is hermetic
-# and nothing is in the image's python3. node ships with the Lambda image; the grading
-# preflight (tier 3) refuses to start if it does not, before any GPU time is spent on the agent.
+# and nothing is in the image's python3. node is installed into
+# the same venv bin/ above; grading preflight (tier 3) refuses to start if it is missing.
+# The first run also hashes the weights for model.weight_digest (31 GB for the default
+# model, a few minutes); the digest is cached next to the weights, so later runs skip it.
 info "running gamespec ($PASSES pass(es)) against the served model"
-RUN_LINE="$(sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" HARNESS_PYTHON=\"\$HOME/$VENV_NAME/bin/python\" \
+RUN_LINE="$(sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" HARNESS_PYTHON=\"\$HOME/$VENV_NAME/bin/python\" WEIGHTS_DIR='$WEIGHTS_DIR' \
   && ./harness/run.sh --model '$MODEL' --suite gamespec --passes '$PASSES' --out ~/results" | grep '^RUN ' | tail -n1)" \
   || die "run.sh failed on the instance (the box is still up until teardown; ./gpuctl ssh to inspect ~/results)"
 RUN_ID="$(awk '{print $2}' <<<"$RUN_LINE")"
@@ -88,12 +130,16 @@ sshto "cd ~/harness-repo && export PATH=\"\$HOME/$VENV_NAME/bin:\$PATH\" && ./re
   || echo "WARNING: resultsctl package failed; the raw run dir is still pulled below" >&2
 
 # ---- 4. pull the artifact we actually came for ---------------------------------------
-# A sealed bundle deliberately EXCLUDES patches/ (CONTRACTS §7.4). The game lives in the
-# patch, so copy the run's patches and results by hand, before teardown.
+# A sealed bundle deliberately EXCLUDES patches/ and trajectories/ (CONTRACTS §7.4). The
+# game lives in the patch and the model's reasoning in the trajectory, so copy both by
+# hand, before teardown — the first live run pulled only patches, and the one question
+# worth asking afterwards ("what did it do for 26 iterations?") had left with the box.
+# gamespec is CONSENT_CLASS public, so trajectories may sit in results/ (git-ignored).
 LOCAL="$HERE/results/gamespec/$RUN_ID"
 mkdir -p "$LOCAL"
 scp -q -r -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-  "$SSH_USER@$IP:$RUN_DIR/patches" "$SSH_USER@$IP:$RUN_DIR/results.jsonl" "$SSH_USER@$IP:$RUN_DIR/run-manifest.json" "$LOCAL/" \
+  "$SSH_USER@$IP:$RUN_DIR/patches" "$SSH_USER@$IP:$RUN_DIR/trajectories" "$SSH_USER@$IP:$RUN_DIR/logs" \
+  "$SSH_USER@$IP:$RUN_DIR/results.jsonl" "$SSH_USER@$IP:$RUN_DIR/run-manifest.json" "$LOCAL/" \
   || die "could not copy the run back — the box is still up until teardown; ./gpuctl ssh and copy $RUN_DIR by hand"
 info "pulled patches + results to $LOCAL"
 
@@ -107,17 +153,29 @@ for r in recs:
         r.get("instance_id"), r.get("pass_idx"), r.get("resolved"), r.get("error_code"),
         (r.get("grade") or {}).get("fail_to_pass")))
 PY
+# The diff is against the adapter's base tree (SPEC.md, floor_check.py, README, .gitignore),
+# not an empty directory, so rebuild through the adapter — it lays the base down and applies
+# the diff exactly the way grade() does. Needs a Python >= 3.11 locally, like the harness.
+REBUILD_PY="${HARNESS_PYTHON:-python3}"
 for diff in "$LOCAL"/patches/*/pass-*.diff; do
   [[ -f "$diff" ]] || continue
   iid="$(basename "$(dirname "$diff")")"; pass="$(basename "$diff" .diff)"
-  out="$LOCAL/built/$iid/$pass"; rm -rf "$out"; mkdir -p "$out"
-  ( cd "$out" && git init -q . && git apply -p1 "$diff" 2>/dev/null ) || { info "$iid $pass: diff did not apply cleanly"; continue; }
-  if [[ -f "$out/game.html" ]]; then
-    info "$iid $pass: game.html rebuilt -> $out/game.html"
-    python3 "$HERE/suites/gamespec/floor_check.py" "$out/game.html" || true
+  out="$LOCAL/built/$iid/$pass"; rm -rf "$out"
+  if game="$(cd "$HERE" && "$REBUILD_PY" -m harness.adapters.gamespec rebuild "$iid" "$diff" "$out" 2>"$LOCAL/rebuild-$iid-$pass.err")"; then
+    info "$iid $pass: rebuilt -> $game"
+    # Not an array: bash 3.2 (macOS's default /bin/bash) treats "${arr[@]}" on an EMPTY
+    # array as an unbound-variable error under `set -u`, which aborts the whole script —
+    # observed live (AI-3240, 2026-09-12): racing-v1 rebuilt, then this line killed the
+    # loop before racing-v2 was even attempted. Instance ids are ^[A-Za-z0-9._-]+$
+    # (CONTRACTS §5.1), so unquoted word-splitting below can never do anything surprising.
+    if [[ "$iid" == "racing-v1" ]]; then
+      "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" || true
+    else
+      "$REBUILD_PY" "$HERE/suites/gamespec/floor_check.py" "$game" --spec "$iid" || true
+    fi
   else
-    info "$iid $pass: the patch contains no game.html"
+    info "$iid $pass: could not rebuild the deliverable: $(tail -1 "$LOCAL/rebuild-$iid-$pass.err")"
   fi
 done
 
-info "done. Open results/gamespec/$RUN_ID/built/racing-v1/pass-0/game.html in a browser to play it."
+info "done. Browse it: ./suites/gamespec/serve.sh  (or open output/runs/$MODEL/$RUN_ID/index.html directly)"

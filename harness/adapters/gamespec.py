@@ -14,6 +14,9 @@ three files the model may read but has no reason to change:
     SPEC.md          the same text as the prompt's problem statement, for `read_file`
     floor_check.py   a copy of the floor check, so `run_tests` really runs it
     README.md        one paragraph: build game.html here, run the floor check
+    .gitignore       __pycache__/ and *.pyc — running the floor check writes a pycache into
+                     the workspace, and without this it lands in the captured diff as a
+                     binary hunk that `git apply` then refuses (first live run, AI-3230)
 
 grade() never uses the workspace copy of floor_check.py — a model could edit it. It always
 runs the repo's own `suites/gamespec/floor_check.py`, and environment_digest() hashes that
@@ -55,7 +58,7 @@ from harness.types import (  # noqa: E402
 )
 
 SUITE_NAME = "gamespec"
-ADAPTER_VERSION = "1.0.0"
+ADAPTER_VERSION = "1.2.0"
 CONSENT_CLASS = "public"
 
 GRADER = "gamespec-floor"
@@ -79,6 +82,15 @@ DELIVERABLE = "game.html"
 # (AI-3155): preflight probes the interpreter the SHELL resolves, not sys.executable.
 GRADER_PYTHON = "python3"
 DEFAULT_TEST_CMD = GRADER_PYTHON + " floor_check.py " + DELIVERABLE
+# floor_check.py applies one spec's floor; its default is racing-v1, so the first spec's
+# command stays byte-identical to what its recorded run used, and every later spec names
+# itself. test_cmd varies per TASK here, never per model — the harness-constant invariant
+# is about the template, and the template is unchanged.
+FIRST_SPEC = "racing-v1"
+
+
+def test_cmd_for(instance_id: str) -> str:
+    return DEFAULT_TEST_CMD if instance_id == FIRST_SPEC else DEFAULT_TEST_CMD + " --spec " + instance_id
 FLOOR_TIMEOUT_S = 180
 DETAIL_MAX = 512
 
@@ -102,6 +114,12 @@ The automated floor is `floor_check.py` (also quoted in SPEC.md §5); the test c
 
 It exits 0 when every check passes. Only `{deliverable}` is graded.
 """
+
+
+# Keeps the model's own test runs out of its patch. Only the deliverable is graded, so
+# nothing legitimate is lost; what IS lost is a binary hunk that broke `git apply` on the
+# first live run.
+WORKSPACE_GITIGNORE = "__pycache__/\n*.pyc\n"
 
 
 class GameSpecDataError(RuntimeError):
@@ -255,7 +273,7 @@ def _build_task(iid: str, part: Mapping[str, str]) -> Task:
         environment={
             "image": "",
             "setup_cmds": [],
-            "test_cmd": DEFAULT_TEST_CMD,
+            "test_cmd": test_cmd_for(iid),
             "deliverable": DELIVERABLE,
         },
         partition=part.get(qid, "unpartitioned"),
@@ -304,6 +322,7 @@ def materialize(task: Task, dest: Path, *, include_hidden_tests: bool = False) -
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "SPEC.md").write_text(task.problem_statement, encoding="utf-8")
     shutil.copyfile(FLOOR_CHECK, dest / "floor_check.py")
+    (dest / ".gitignore").write_text(WORKSPACE_GITIGNORE, encoding="utf-8")
     (dest / "README.md").write_text(
         WORKSPACE_README.format(
             iid=task.instance_id,
@@ -350,7 +369,7 @@ def _grade_in(tmp: Path, task: Task, patch: str) -> Verdict:
             {"deliverable_present": False}, f2p={"passed": 0, "total": 1},
         )
 
-    report = _run_floor(deliverable)
+    report = _run_floor(deliverable, task.instance_id)
     checks = report.get("checks") or []
     failed = [c for c in checks if not c.get("ok")]
     passed = bool(report.get("passed")) and not failed
@@ -370,9 +389,10 @@ def _grade_in(tmp: Path, task: Task, patch: str) -> Verdict:
     )
 
 
-def _run_floor(deliverable: Path) -> dict:
+def _run_floor(deliverable: Path, instance_id: str) -> dict:
     """The repo's floor_check.py, never the workspace copy. Exit 2 = grader broken."""
-    cmd = "%s %s %s --json" % (GRADER_PYTHON, _shq(str(FLOOR_CHECK)), _shq(str(deliverable)))
+    spec = "" if instance_id == FIRST_SPEC else " --spec " + _shq(instance_id)
+    cmd = "%s %s %s --json%s" % (GRADER_PYTHON, _shq(str(FLOOR_CHECK)), _shq(str(deliverable)), spec)
     try:
         proc = subprocess.run(
             cmd, shell=True, cwd=str(deliverable.parent),
@@ -526,6 +546,10 @@ def main(argv: list[str] | None = None) -> int:
     gr.add_argument("instance_id")
     gr.add_argument("patch", help="path to a unified diff, or - for stdin")
     dg = sub.add_parser("digest")
+    rb = sub.add_parser("rebuild", help="lay down the base tree, apply a diff, print the deliverable path")
+    rb.add_argument("instance_id")
+    rb.add_argument("patch", help="path to a unified diff")
+    rb.add_argument("out_dir", help="directory to build into (must not exist or be empty)")
     args = ap.parse_args(argv)
     if args.cmd == "tasks":
         for t in load_tasks(Path(args.seed_file)):
@@ -540,6 +564,21 @@ def main(argv: list[str] | None = None) -> int:
         print("unknown instance %r; have %s" % (args.instance_id, sorted(tasks)), file=sys.stderr)
         return 2
     patch = sys.stdin.read() if args.patch == "-" else Path(args.patch).read_text(encoding="utf-8")
+    if args.cmd == "rebuild":
+        out = Path(args.out_dir)
+        materialize(task, out)
+        _git_base(out)
+        with tempfile.TemporaryDirectory(prefix="gamespec-rebuild-") as tmp:
+            applied, how = _apply_patch(out, patch, Path(tmp))
+        if not applied:
+            print("patch did not apply (%s)" % how, file=sys.stderr)
+            return 1
+        deliverable = out / task.environment.get("deliverable", DELIVERABLE)
+        if not deliverable.is_file():
+            print("patch applied (%s) but produced no %s" % (how, deliverable.name), file=sys.stderr)
+            return 1
+        print(deliverable)
+        return 0
     v = grade(task, patch)
     print(json.dumps({"resolved": v.resolved, "error_code": v.error_code, "detail": v.detail,
                       "fail_to_pass": v.fail_to_pass}, indent=2))

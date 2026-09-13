@@ -120,7 +120,9 @@ jobs:
       # every push is the cheapest way to keep it honest — and the reference is also what
       # keeps the SPEC honest, since a spec no one has implemented is a spec with holes.
       - name: gamespec floor check (reference implementation)
-        run: python3 suites/gamespec/floor_check.py suites/gamespec/specs/racing-v1.reference.html
+        run: |
+          python3 suites/gamespec/floor_check.py suites/gamespec/specs/racing-v1.reference.html
+          python3 suites/gamespec/floor_check.py suites/gamespec/specs/racing-v2.reference.html --spec racing-v2
 
       # AI-3159 regression guard. The harness agent loop sends tool_choice:"auto" on every
       # call; vLLM answers HTTP 400 unless the server was started with BOTH
